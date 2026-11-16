@@ -90,14 +90,20 @@ pub struct ClusterFile {
 
 pub async fn client_from(path: &PathBuf) -> Result<std::sync::Arc<MeshClient>> {
     let c: ClusterFile = serde_json::from_slice(&std::fs::read(path)?)?;
-    let addrs = c.nodes.iter().map(|s| s.parse()).collect::<Result<Vec<Addr>>>()?;
+    let addrs = c
+        .nodes
+        .iter()
+        .map(|s| s.parse())
+        .collect::<Result<Vec<Addr>>>()?;
     MeshClient::new(addrs, c.token).await
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
     let threads = match &cli.cmd {
         Cmd::Serve { threads, .. } => *threads,
@@ -113,10 +119,18 @@ fn main() -> Result<()> {
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Serve { config, .. } => {
-            let cfg: NodeConfig = serde_json::from_slice(&std::fs::read(&config).context("read config")?)?;
+            let cfg: NodeConfig =
+                serde_json::from_slice(&std::fs::read(&config).context("read config")?)?;
             Node::run(cfg).await
         }
-        Cmd::Init { nodes, dir, transport, base_port, no_sync, rpc_timeout_ms } => {
+        Cmd::Init {
+            nodes,
+            dir,
+            transport,
+            base_port,
+            no_sync,
+            rpc_timeout_ms,
+        } => {
             std::fs::create_dir_all(&dir)?;
             let token = precog_mesh::proto::hex_encode(&rand::random::<[u8; 16]>());
             let mut addrs = Vec::new();
@@ -148,45 +162,99 @@ async fn run(cmd: Cmd) -> Result<()> {
                     iroh_relay: false,
                     peers: (0..nodes)
                         .filter(|&j| j != i)
-                        .map(|j| PeerConfig { id: j, domain: format!("domain-{j}"), addr: addrs[j as usize].clone() })
+                        .map(|j| PeerConfig {
+                            id: j,
+                            domain: format!("domain-{j}"),
+                            addr: addrs[j as usize].clone(),
+                        })
                         .collect(),
                     target_copies: 3,
                     rpc_timeout_ms,
                     repair_interval_ms: 1000,
                 };
-                std::fs::write(dir.join(format!("node-{i}.json")), serde_json::to_vec_pretty(&cfg)?)?;
+                std::fs::write(
+                    dir.join(format!("node-{i}.json")),
+                    serde_json::to_vec_pretty(&cfg)?,
+                )?;
             }
-            let cluster = ClusterFile { token, nodes: addrs };
-            std::fs::write(dir.join("cluster.json"), serde_json::to_vec_pretty(&cluster)?)?;
-            println!("wrote {} node configs and cluster.json to {}", nodes, dir.display());
+            let cluster = ClusterFile {
+                token,
+                nodes: addrs,
+            };
+            std::fs::write(
+                dir.join("cluster.json"),
+                serde_json::to_vec_pretty(&cluster)?,
+            )?;
+            println!(
+                "wrote {} node configs and cluster.json to {}",
+                nodes,
+                dir.display()
+            );
             Ok(())
         }
         Cmd::Status { cluster, node } => {
             let c = client_from(&cluster).await?;
-            println!("{}", serde_json::to_string_pretty(&c.control(node, &Control::Status).await?)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&c.control(node, &Control::Status).await?)?
+            );
             Ok(())
         }
         Cmd::Repair { cluster, node } => {
             let c = client_from(&cluster).await?;
-            println!("{}", serde_json::to_string_pretty(&c.control(node, &Control::Repair).await?)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&c.control(node, &Control::Repair).await?)?
+            );
             Ok(())
         }
-        Cmd::Read { cluster, stream, node, limit } => {
+        Cmd::Read {
+            cluster,
+            stream,
+            node,
+            limit,
+        } => {
             let c = client_from(&cluster).await?;
-            let r = c.control(node, &Control::Read { stream, from_time_us: 0, limit }).await?;
+            let r = c
+                .control(
+                    node,
+                    &Control::Read {
+                        stream,
+                        from_time_us: 0,
+                        limit,
+                    },
+                )
+                .await?;
             println!("{}", serde_json::to_string_pretty(&r)?);
             Ok(())
         }
-        Cmd::Demo { cluster, count, copies, stream, writer, node } => {
+        Cmd::Demo {
+            cluster,
+            count,
+            copies,
+            stream,
+            writer,
+            node,
+        } => {
             let c = client_from(&cluster).await?;
-            let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
             let mut w = Writer::new(c, &stream, &writer, epoch, node, copies);
             for i in 0..count {
                 let payload = format!("event {i}");
                 // Event time runs backwards to show that read order is event
                 // time, not writer sequence.
-                let r = w.append(&[(1_000_000 - i * 1000, payload.as_bytes())]).await?;
-                println!("seq {} -> node {} copies {} nodes {:#b}", w.next_seq - 1, r.node, r.ack.copies, r.ack.nodes);
+                let r = w
+                    .append(&[(1_000_000 - i * 1000, payload.as_bytes())])
+                    .await?;
+                println!(
+                    "seq {} -> node {} copies {} nodes {:#b}",
+                    w.next_seq - 1,
+                    r.node,
+                    r.ack.copies,
+                    r.ack.nodes
+                );
             }
             Ok(())
         }

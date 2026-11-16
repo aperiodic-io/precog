@@ -74,7 +74,9 @@ impl Wal {
         let recovered = recover(&mut file, &path)?;
         let stats = Arc::new(WalStats::default());
         stats.bytes.store(file.metadata()?.len(), Ordering::Relaxed);
-        stats.records.store(recovered.batches.len() as u64, Ordering::Relaxed);
+        stats
+            .records
+            .store(recovered.batches.len() as u64, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel::<Req>();
         let fenced = Arc::new(AtomicBool::new(false));
         {
@@ -144,7 +146,9 @@ fn writer_loop(
         match res {
             Ok(()) => {
                 stats.bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
-                stats.records.fetch_add(group.len() as u64, Ordering::Relaxed);
+                stats
+                    .records
+                    .fetch_add(group.len() as u64, Ordering::Relaxed);
                 if sync {
                     stats.syncs.fetch_add(1, Ordering::Relaxed);
                 }
@@ -173,7 +177,10 @@ fn recover(file: &mut File, path: &PathBuf) -> Result<Recovered> {
     if data.is_empty() {
         file.write_all(MAGIC)?;
         file.sync_all()?;
-        return Ok(Recovered { batches: vec![], truncated_bytes: 0 });
+        return Ok(Recovered {
+            batches: vec![],
+            truncated_bytes: 0,
+        });
     }
     if data.len() < MAGIC.len() {
         // A crash while writing the header of a fresh file.
@@ -182,7 +189,10 @@ fn recover(file: &mut File, path: &PathBuf) -> Result<Recovered> {
             file.seek(SeekFrom::Start(0))?;
             file.write_all(MAGIC)?;
             file.sync_all()?;
-            return Ok(Recovered { batches: vec![], truncated_bytes: data.len() as u64 });
+            return Ok(Recovered {
+                batches: vec![],
+                truncated_bytes: data.len() as u64,
+            });
         }
         bail!("{}: not a WAL file", path.display());
     }
@@ -231,7 +241,10 @@ fn recover(file: &mut File, path: &PathBuf) -> Result<Recovered> {
     // Recovered-but-maybe-unsynced records become durable now, so a retry of a
     // batch whose earlier outcome was unknown can be answered as a duplicate.
     file.sync_all()?;
-    Ok(Recovered { batches, truncated_bytes: truncated })
+    Ok(Recovered {
+        batches,
+        truncated_bytes: truncated,
+    })
 }
 
 #[cfg(test)]
@@ -240,7 +253,11 @@ mod tests {
     use crate::proto::LogId;
 
     fn batch(seq: u64) -> Bytes {
-        let log = LogId { stream: "s".into(), writer: "w".into(), epoch: 1 };
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
         Batch::encode(&log, seq, &[(seq, b"payload")]).unwrap()
     }
 
@@ -269,7 +286,10 @@ mod tests {
     }
 
     fn write_raw(dir: &Path, tail: &[u8]) {
-        let mut f = OpenOptions::new().append(true).open(dir.join("wal.log")).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.join("wal.log"))
+            .unwrap();
         f.write_all(tail).unwrap();
     }
 
@@ -292,7 +312,10 @@ mod tests {
             let (_w, rec) = Wal::open(dir.path(), true).unwrap();
             assert_eq!(rec.batches.len(), 3);
             assert_eq!(rec.truncated_bytes, tail.len() as u64);
-            assert_eq!(std::fs::metadata(dir.path().join("wal.log")).unwrap().len(), before);
+            assert_eq!(
+                std::fs::metadata(dir.path().join("wal.log")).unwrap().len(),
+                before
+            );
         }
     }
 

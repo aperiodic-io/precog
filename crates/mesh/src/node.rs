@@ -107,7 +107,12 @@ impl Node {
         let (wal, rec) = Wal::open(&cfg.data_dir, cfg.sync)?;
         let n = rec.batches.len();
         let store = Store::load(rec.batches)?;
-        tracing::info!(node = cfg.id, batches = n, truncated = rec.truncated_bytes, "recovered WAL");
+        tracing::info!(
+            node = cfg.id,
+            batches = n,
+            truncated = rec.truncated_bytes,
+            "recovered WAL"
+        );
         let endpoint = match cfg.listen_iroh {
             Some(bind) => {
                 let sk = load_or_create_secret(&cfg.data_dir.join("iroh.secret"))?;
@@ -137,7 +142,9 @@ impl Node {
             cfg,
             store,
             wal,
-            dialer: Dialer { iroh: endpoint.clone() },
+            dialer: Dialer {
+                iroh: endpoint.clone(),
+            },
             peers,
             iroh_peers,
             repair_cursor: Default::default(),
@@ -168,16 +175,22 @@ impl Node {
 
     pub async fn spawn_listeners(self: &Arc<Self>, endpoint: Option<iroh::Endpoint>) -> Result<()> {
         if let Some(addr) = self.cfg.listen_tcp {
-            let l = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
+            let l = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind {addr}"))?;
             tracing::info!(node = self.cfg.id, "tcp listening on {addr}");
             let node = self.clone();
             tokio::spawn(async move {
                 loop {
-                    let Ok((s, _)) = l.accept().await else { continue };
+                    let Ok((s, _)) = l.accept().await else {
+                        continue;
+                    };
                     let _ = s.set_nodelay(true);
                     let (r, w) = s.into_split();
                     let node = node.clone();
-                    tokio::spawn(async move { node.serve_conn(Box::new(r), Box::new(w), None).await });
+                    tokio::spawn(
+                        async move { node.serve_conn(Box::new(r), Box::new(w), None).await },
+                    );
                 }
             });
         }
@@ -195,7 +208,8 @@ impl Node {
                         while let Ok((send, recv)) = conn.accept_bi().await {
                             let node = node.clone();
                             tokio::spawn(async move {
-                                node.serve_conn(Box::new(recv), Box::new(send), Some(remote)).await
+                                node.serve_conn(Box::new(recv), Box::new(send), Some(remote))
+                                    .await
                             });
                         }
                     });
@@ -205,9 +219,16 @@ impl Node {
         Ok(())
     }
 
-    async fn serve_conn(self: Arc<Self>, mut r: BoxRead, w: BoxWrite, iroh_remote: Option<iroh::EndpointId>) {
+    async fn serve_conn(
+        self: Arc<Self>,
+        mut r: BoxRead,
+        w: BoxWrite,
+        iroh_remote: Option<iroh::EndpointId>,
+    ) {
         let mut buf = BytesMut::new();
-        let hello = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut r, &mut buf)).await {
+        let hello = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut r, &mut buf))
+            .await
+        {
             Ok(Ok(Some(f))) if f.kind == Kind::Hello => f,
             _ => return,
         };
@@ -222,14 +243,18 @@ impl Node {
         tokio::spawn(async move {
             let _ = write_loop(w, rx).await;
         });
-        let _ = tx.send(Frame::new(Kind::Ack, hello.req_id, Bytes::new())).await;
+        let _ = tx
+            .send(Frame::new(Kind::Ack, hello.req_id, Bytes::new()))
+            .await;
         let per_conn = Arc::new(Semaphore::new(4096));
         loop {
             let f = match read_frame(&mut r, &mut buf).await {
                 Ok(Some(f)) => f,
                 _ => break,
             };
-            let Ok(permit) = per_conn.clone().acquire_owned().await else { break };
+            let Ok(permit) = per_conn.clone().acquire_owned().await else {
+                break;
+            };
             let node = self.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -260,7 +285,10 @@ impl Node {
             }
             (Some(id), None) => {
                 // TCP test transport: a token holder may claim any peer id.
-                anyhow::ensure!(self.peers.iter().any(|p| p.cfg.id == id), "unknown peer {id}");
+                anyhow::ensure!(
+                    self.peers.iter().any(|p| p.cfg.id == id),
+                    "unknown peer {id}"
+                );
                 Ok(Ident::Peer(id))
             }
         }
@@ -275,9 +303,14 @@ impl Node {
                 Ok(Frame::new(Kind::Ack, id, ack.encode()))
             }
             Kind::Replicate => {
-                let Ident::Peer(pid) = ident else { bail!("replicate from non-peer connection") };
+                let Ident::Peer(pid) = ident else {
+                    bail!("replicate from non-peer connection")
+                };
                 let (origin, batch) = decode_replicate(f.body)?;
-                anyhow::ensure!(origin == pid, "replicate origin {origin} != authenticated peer {pid}");
+                anyhow::ensure!(
+                    origin == pid,
+                    "replicate origin {origin} != authenticated peer {pid}"
+                );
                 let ack = self.replicate(batch).await;
                 Ok(Frame::new(Kind::Ack, id, ack.encode()))
             }
@@ -297,7 +330,11 @@ impl Node {
                     return Ok(Frame::new(Kind::Batches, id, out.freeze()));
                 }
                 let resp = self.control(c, ident).await?;
-                Ok(Frame::new(Kind::ControlResp, id, Bytes::from(serde_json::to_vec(&resp)?)))
+                Ok(Frame::new(
+                    Kind::ControlResp,
+                    id,
+                    Bytes::from(serde_json::to_vec(&resp)?),
+                ))
             }
             k => bail!("unexpected frame {k:?}"),
         }
@@ -313,13 +350,27 @@ impl Node {
                     batches,
                     events,
                     bytes,
-                    wal_bytes: self.wal.stats.bytes.load(std::sync::atomic::Ordering::Relaxed),
-                    fsyncs: self.wal.stats.syncs.load(std::sync::atomic::Ordering::Relaxed),
+                    wal_bytes: self
+                        .wal
+                        .stats
+                        .bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    fsyncs: self
+                        .wal
+                        .stats
+                        .syncs
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     logs: self.store.frontiers(None),
                 })
             }
-            Control::Read { stream, from_time_us, limit } => {
-                let (events, coverage) = self.store.read(&stream, from_time_us, limit.min(10_000) as usize);
+            Control::Read {
+                stream,
+                from_time_us,
+                limit,
+            } => {
+                let (events, coverage) =
+                    self.store
+                        .read(&stream, from_time_us, limit.min(10_000) as usize);
                 ControlResp::Read { events, coverage }
             }
             Control::Inventory { after, limit } => {
@@ -368,9 +419,20 @@ impl Node {
     }
 
     async fn replicate(&self, bytes: Bytes) -> Ack {
-        let crc = if bytes.len() >= 4 { batch_crc(&bytes) } else { 0 };
-        let mut ack = Ack { status: AckStatus::Rejected, copies: 0, nodes: 0, crc };
-        let Ok(batch) = Batch::parse(bytes) else { return ack };
+        let crc = if bytes.len() >= 4 {
+            batch_crc(&bytes)
+        } else {
+            0
+        };
+        let mut ack = Ack {
+            status: AckStatus::Rejected,
+            copies: 0,
+            nodes: 0,
+            crc,
+        };
+        let Ok(batch) = Batch::parse(bytes) else {
+            return ack;
+        };
         match self.store_local(&batch).await {
             Ok(Local::Stored) => ack.status = AckStatus::Ok,
             Ok(Local::Duplicate) => ack.status = AckStatus::Duplicate,
@@ -407,10 +469,23 @@ impl Node {
     }
 
     pub async fn append(self: &Arc<Self>, copies: u8, bytes: Bytes) -> Ack {
-        let crc = if bytes.len() >= 4 { batch_crc(&bytes) } else { 0 };
-        let reject = Ack { status: AckStatus::Rejected, copies: 0, nodes: 0, crc };
-        let Ok(_permit) = self.inflight.acquire().await else { return reject };
-        let Ok(batch) = Batch::parse(bytes) else { return reject };
+        let crc = if bytes.len() >= 4 {
+            batch_crc(&bytes)
+        } else {
+            0
+        };
+        let reject = Ack {
+            status: AckStatus::Rejected,
+            copies: 0,
+            nodes: 0,
+            crc,
+        };
+        let Ok(_permit) = self.inflight.acquire().await else {
+            return reject;
+        };
+        let Ok(batch) = Batch::parse(bytes) else {
+            return reject;
+        };
         let targets = self.targets();
         if copies == 0 || copies as usize > targets.len() + 1 {
             return reject; // cannot possibly satisfy: no side effects yet
@@ -426,15 +501,20 @@ impl Node {
             {
                 let node = node.clone();
                 let batch = batch.clone();
-                futs.push(Box::pin(async move { R::Local(node.store_local(&batch).await) })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send>>);
+                futs.push(
+                    Box::pin(async move { R::Local(node.store_local(&batch).await) })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send>>,
+                );
             }
             let body = encode_replicate(node.cfg.id, &batch.bytes);
             for p in targets {
                 let node = node.clone();
                 let body = body.clone();
                 futs.push(Box::pin(async move {
-                    let r = node.peer_call(&p, Kind::Replicate, body).await.and_then(|f| Ack::decode(f.body));
+                    let r = node
+                        .peer_call(&p, Kind::Replicate, body)
+                        .await
+                        .and_then(|f| Ack::decode(f.body));
                     R::Remote(p.cfg.id, p.cfg.domain.clone(), r)
                 }));
             }
@@ -450,29 +530,55 @@ impl Node {
                     R::Local(Ok(Local::Conflict(e))) => {
                         tracing::debug!("append conflict: {e}");
                         if let Some(tx) = tx.take() {
-                            let _ = tx.send(Ack { status: AckStatus::Conflict, copies: 0, nodes: 0, crc });
+                            let _ = tx.send(Ack {
+                                status: AckStatus::Conflict,
+                                copies: 0,
+                                nodes: 0,
+                                crc,
+                            });
                         }
                     }
                     R::Local(Err(e)) => tracing::warn!("local store failed: {e}"),
-                    R::Remote(pid, domain, Ok(a)) if a.is_success() && a.crc == crc && a.nodes == 1 << pid => {
+                    R::Remote(pid, domain, Ok(a))
+                        if a.is_success() && a.crc == crc && a.nodes == 1 << pid =>
+                    {
                         domains.insert(domain);
                         nodes |= 1 << pid;
                     }
-                    R::Remote(pid, _, Ok(a)) => tracing::debug!("peer {pid} did not confirm: {a:?}"),
-                    R::Remote(pid, _, Err(e)) => tracing::debug!("peer {pid} replicate failed: {e}"),
+                    R::Remote(pid, _, Ok(a)) => {
+                        tracing::debug!("peer {pid} did not confirm: {a:?}")
+                    }
+                    R::Remote(pid, _, Err(e)) => {
+                        tracing::debug!("peer {pid} replicate failed: {e}")
+                    }
                 }
                 if domains.len() >= copies as usize
                     && let Some(tx) = tx.take()
                 {
                     // Early completion; remaining copies finish in this task.
-                    let _ = tx.send(Ack { status: AckStatus::Ok, copies: domains.len() as u8, nodes, crc });
+                    let _ = tx.send(Ack {
+                        status: AckStatus::Ok,
+                        copies: domains.len() as u8,
+                        nodes,
+                        crc,
+                    });
                 }
             }
             if let Some(tx) = tx.take() {
-                let _ = tx.send(Ack { status: AckStatus::Unknown, copies: domains.len() as u8, nodes, crc });
+                let _ = tx.send(Ack {
+                    status: AckStatus::Unknown,
+                    copies: domains.len() as u8,
+                    nodes,
+                    crc,
+                });
             }
         });
-        rx.await.unwrap_or(Ack { status: AckStatus::Unknown, copies: 0, nodes: 0, crc })
+        rx.await.unwrap_or(Ack {
+            status: AckStatus::Unknown,
+            copies: 0,
+            nodes: 0,
+            crc,
+        })
     }
 
     async fn peer_client(&self, p: &Peer) -> Result<Arc<RpcClient>> {
@@ -495,8 +601,16 @@ impl Node {
         let timeout = Duration::from_millis(self.cfg.rpc_timeout_ms);
         let res: Result<Arc<RpcClient>> = async {
             let c = self.dialer.connect(&p.addr, timeout).await?;
-            let hello = Hello { token: self.cfg.token.clone(), node_id: Some(self.cfg.id) };
-            c.call(Kind::Hello, Bytes::from(serde_json::to_vec(&hello)?), timeout).await?;
+            let hello = Hello {
+                token: self.cfg.token.clone(),
+                node_id: Some(self.cfg.id),
+            };
+            c.call(
+                Kind::Hello,
+                Bytes::from(serde_json::to_vec(&hello)?),
+                timeout,
+            )
+            .await?;
             Ok(Arc::new(c))
         }
         .await;
@@ -515,7 +629,9 @@ impl Node {
 
     async fn peer_call(&self, p: &Peer, kind: Kind, body: Bytes) -> Result<Frame> {
         let c = self.peer_client(p).await?;
-        let r = c.call(kind, body, Duration::from_millis(self.cfg.rpc_timeout_ms)).await;
+        let r = c
+            .call(kind, body, Duration::from_millis(self.cfg.rpc_timeout_ms))
+            .await;
         if r.is_err() && c.is_closed() {
             let mut g = p.link.lock();
             if g.as_ref().is_some_and(|x| Arc::ptr_eq(x, &c)) {
@@ -526,7 +642,8 @@ impl Node {
     }
 
     async fn peer_control(&self, p: &Peer, c: &Control) -> Result<Frame> {
-        self.peer_call(p, Kind::Control, Bytes::from(serde_json::to_vec(c)?)).await
+        self.peer_call(p, Kind::Control, Bytes::from(serde_json::to_vec(c)?))
+            .await
     }
 
     /// Anti-entropy: pull every batch a peer made durable since our cursor that
@@ -549,8 +666,11 @@ impl Node {
         let mut fetched = 0;
         for _ in 0..64 {
             let after = *self.repair_cursor.lock().get(&p.cfg.id).unwrap_or(&0);
-            let f = self.peer_control(p, &Control::Inventory { after, limit: 8192 }).await?;
-            let ControlResp::Inventory { items, next, more } = serde_json::from_slice(&f.body)? else {
+            let f = self
+                .peer_control(p, &Control::Inventory { after, limit: 8192 })
+                .await?;
+            let ControlResp::Inventory { items, next, more } = serde_json::from_slice(&f.body)?
+            else {
                 bail!("unexpected inventory response");
             };
             let missing: Vec<BatchId> = items
@@ -561,7 +681,9 @@ impl Node {
             for chunk in missing.chunks(512) {
                 let mut want: Vec<BatchId> = chunk.to_vec();
                 while !want.is_empty() {
-                    let f = self.peer_control(p, &Control::Fetch { ids: want.clone() }).await?;
+                    let f = self
+                        .peer_control(p, &Control::Fetch { ids: want.clone() })
+                        .await?;
                     anyhow::ensure!(f.kind == Kind::Batches, "unexpected fetch response");
                     let mut got = HashSet::new();
                     let mut body = &f.body[..];
@@ -572,7 +694,9 @@ impl Node {
                         match self.store_local(&b).await? {
                             Local::Stored => fetched += 1,
                             Local::Duplicate => {}
-                            Local::Conflict(e) => tracing::error!("repair conflict from peer {}: {e}", p.cfg.id),
+                            Local::Conflict(e) => {
+                                tracing::error!("repair conflict from peer {}: {e}", p.cfg.id)
+                            }
                         }
                         got.insert(b.id);
                     }

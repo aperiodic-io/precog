@@ -18,18 +18,28 @@ pub type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
 pub type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// Reads one frame. `Ok(None)` on clean EOF at a frame boundary.
-pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, buf: &mut BytesMut) -> Result<Option<Frame>> {
+pub async fn read_frame<R: AsyncRead + Unpin>(
+    r: &mut R,
+    buf: &mut BytesMut,
+) -> Result<Option<Frame>> {
     loop {
         if buf.len() >= 4 {
             let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-            ensure!((9..=MAX_FRAME_BYTES).contains(&len), "bad frame length {len}");
+            ensure!(
+                (9..=MAX_FRAME_BYTES).contains(&len),
+                "bad frame length {len}"
+            );
             if buf.len() >= 4 + len {
                 buf.advance(4);
                 let mut f = buf.split_to(len);
                 let kind = Kind::from_u8(f[0])?;
                 let req_id = u64::from_le_bytes(f[1..9].try_into().unwrap());
                 f.advance(9);
-                return Ok(Some(Frame { kind, req_id, body: f.freeze() }));
+                return Ok(Some(Frame {
+                    kind,
+                    req_id,
+                    body: f.freeze(),
+                }));
             }
             buf.reserve(4 + len - buf.len());
         } else {
@@ -45,7 +55,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R, buf: &mut BytesMut) -> 
 }
 
 /// Writer task: drains `rx`, coalescing all immediately available frames.
-pub async fn write_loop<W: AsyncWrite + Unpin>(mut w: W, mut rx: mpsc::Receiver<Frame>) -> Result<()> {
+pub async fn write_loop<W: AsyncWrite + Unpin>(
+    mut w: W,
+    mut rx: mpsc::Receiver<Frame>,
+) -> Result<()> {
     let mut out = BytesMut::with_capacity(256 * 1024);
     while let Some(f) = rx.recv().await {
         f.encode_into(&mut out);
@@ -76,7 +89,11 @@ pub struct RpcClient {
 }
 
 impl RpcClient {
-    pub fn start(r: BoxRead, w: BoxWrite, keep: Option<Box<dyn std::any::Any + Send + Sync>>) -> RpcClient {
+    pub fn start(
+        r: BoxRead,
+        w: BoxWrite,
+        keep: Option<Box<dyn std::any::Any + Send + Sync>>,
+    ) -> RpcClient {
         let (tx, rx) = mpsc::channel::<Frame>(4096);
         let pending: Pending = Default::default();
         let closed = Arc::new(AtomicBool::new(false));
@@ -113,7 +130,13 @@ impl RpcClient {
                 pending.lock().clear(); // wakes all waiters with an error
             });
         }
-        RpcClient { tx, pending, next_id: AtomicU64::new(1), closed, _keep: keep }
+        RpcClient {
+            tx,
+            pending,
+            next_id: AtomicU64::new(1),
+            closed,
+            _keep: keep,
+        }
     }
 
     pub fn is_closed(&self) -> bool {

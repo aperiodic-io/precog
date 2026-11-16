@@ -15,11 +15,19 @@ struct Cluster {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 fn cluster(n: u32, iroh: bool, domains: &[&str]) -> Cluster {
@@ -52,14 +60,22 @@ fn cluster(n: u32, iroh: bool, domains: &[&str]) -> Cluster {
             iroh_relay: false,
             peers: (0..n)
                 .filter(|&j| j != i)
-                .map(|j| PeerConfig { id: j, domain: domains[j as usize].into(), addr: addrs[j as usize].clone() })
+                .map(|j| PeerConfig {
+                    id: j,
+                    domain: domains[j as usize].into(),
+                    addr: addrs[j as usize].clone(),
+                })
                 .collect(),
             target_copies: 3,
             rpc_timeout_ms: 500,
             repair_interval_ms: 1_000_000, // tests trigger repair explicitly
         })
         .collect();
-    Cluster { cfgs, addrs: addrs.iter().map(|a| a.parse().unwrap()).collect(), _dir: dir }
+    Cluster {
+        cfgs,
+        addrs: addrs.iter().map(|a| a.parse().unwrap()).collect(),
+        _dir: dir,
+    }
 }
 
 async fn start(c: &Cluster, i: usize) -> Arc<Node> {
@@ -69,7 +85,9 @@ async fn start(c: &Cluster, i: usize) -> Arc<Node> {
 }
 
 async fn client(c: &Cluster) -> Arc<MeshClient> {
-    let mc = MeshClient::new(c.addrs.clone(), "secret-token".into()).await.unwrap();
+    let mc = MeshClient::new(c.addrs.clone(), "secret-token".into())
+        .await
+        .unwrap();
     // keep failing tests fast
     let mc = Arc::into_inner(mc).unwrap();
     let mut mc = mc;
@@ -94,7 +112,10 @@ async fn replication_scenario(iroh: bool) {
     // Only two of three nodes up: durable-2 succeeds, durable-3 cannot.
     let mut w = Writer::new(mc.clone(), "s", "w1", 1, 0, 2);
     for i in 0..20u64 {
-        let r = w.append(&[(100 - i, format!("e{i}").as_bytes())]).await.unwrap();
+        let r = w
+            .append(&[(100 - i, format!("e{i}").as_bytes())])
+            .await
+            .unwrap();
         assert!(r.ack.copies >= 2, "{r:?}");
         assert_eq!(r.ack.nodes & 0b11, 0b11);
     }
@@ -122,7 +143,18 @@ async fn replication_scenario(iroh: bool) {
     let read = |n| {
         let mc = mc.clone();
         async move {
-            match mc.control(n, &Control::Read { stream: "s".into(), from_time_us: 0, limit: 100 }).await.unwrap() {
+            match mc
+                .control(
+                    n,
+                    &Control::Read {
+                        stream: "s".into(),
+                        from_time_us: 0,
+                        limit: 100,
+                    },
+                )
+                .await
+                .unwrap()
+            {
                 ControlResp::Read { events, .. } => events,
                 r => panic!("{r:?}"),
             }
@@ -130,7 +162,10 @@ async fn replication_scenario(iroh: bool) {
     };
     let e0 = read(0).await;
     assert_eq!(e0.len(), 21);
-    assert!(e0.windows(2).all(|w| w[0].event_time_us <= w[1].event_time_us));
+    assert!(
+        e0.windows(2)
+            .all(|w| w[0].event_time_us <= w[1].event_time_us)
+    );
     assert_eq!(e0[0].payload, Bytes::from_static(b"x")); // event time 1
     assert_eq!(read(2).await, e0);
 }
@@ -152,7 +187,11 @@ async fn idempotent_retry_and_conflict() {
         start(&c, i).await;
     }
     let mc = client(&c).await;
-    let log = LogId { stream: "s".into(), writer: "w".into(), epoch: 9 };
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 9,
+    };
     let b = Batch::encode(&log, 0, &[(5, b"one"), (6, b"two")]).unwrap();
     let r1 = mc.append(0, &b, 2).await.unwrap();
     // Retry of the same bytes through a *different* node: duplicate, no new data.
@@ -186,9 +225,19 @@ async fn duplicate_domain_labels_do_not_count_as_copies() {
     let mut w = Writer::new(mc.clone(), "s", "w", 1, 0, 2);
     let r = w.append(&[(1, b"x")]).await.unwrap();
     assert_eq!(r.ack.copies, 2);
-    assert_eq!(r.ack.nodes & 0b010, 0, "same-domain peer must not be a replication target");
+    assert_eq!(
+        r.ack.nodes & 0b010,
+        0,
+        "same-domain peer must not be a replication target"
+    );
     let mut w3 = Writer::new(mc.clone(), "s", "w3", 1, 0, 3);
-    assert!(w3.append(&[(1, b"x")]).await.unwrap_err().to_string().contains("Rejected"));
+    assert!(
+        w3.append(&[(1, b"x")])
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Rejected")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -196,11 +245,21 @@ async fn clients_cannot_replicate_and_bad_tokens_are_refused() {
     let c = cluster(1, false, &["a"]);
     start(&c, 0).await;
     let mc = client(&c).await;
-    let log = LogId { stream: "s".into(), writer: "w".into(), epoch: 1 };
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
     let b = Batch::encode(&log, 0, &[(1, b"x")]).unwrap();
-    let e = mc.call(0, Kind::Replicate, encode_replicate(0, &b)).await.unwrap_err().to_string();
+    let e = mc
+        .call(0, Kind::Replicate, encode_replicate(0, &b))
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("non-peer"), "{e}");
-    let bad = MeshClient::new(c.addrs.clone(), "wrong".into()).await.unwrap();
+    let bad = MeshClient::new(c.addrs.clone(), "wrong".into())
+        .await
+        .unwrap();
     assert!(bad.control(0, &Control::Status).await.is_err());
 }
 
@@ -211,8 +270,14 @@ async fn restart_recovers_from_wal() {
     {
         let (node, _) = Node::open(cfg.clone()).await.unwrap();
         for i in 0..5u64 {
-            let log = LogId { stream: "s".into(), writer: "w".into(), epoch: 1 };
-            let a = node.append(1, Batch::encode(&log, i, &[(i, b"p")]).unwrap()).await;
+            let log = LogId {
+                stream: "s".into(),
+                writer: "w".into(),
+                epoch: 1,
+            };
+            let a = node
+                .append(1, Batch::encode(&log, i, &[(i, b"p")]).unwrap())
+                .await;
             assert!(a.is_success());
         }
         drop(node);

@@ -31,7 +31,11 @@ pub struct Receipt {
 impl MeshClient {
     pub async fn new(nodes: Vec<Addr>, token: String) -> Result<Arc<MeshClient>> {
         let needs_iroh = nodes.iter().any(|a| matches!(a, Addr::Iroh { .. }));
-        let iroh = if needs_iroh { Some(iroh_endpoint(None, Some("127.0.0.1:0".parse()?), false).await?) } else { None };
+        let iroh = if needs_iroh {
+            Some(iroh_endpoint(None, Some("127.0.0.1:0".parse()?), false).await?)
+        } else {
+            None
+        };
         Self::with_dialer(nodes, token, Dialer { iroh })
     }
 
@@ -58,9 +62,20 @@ impl MeshClient {
         {
             return Ok(c.clone());
         }
-        let c = self.dialer.connect(&self.nodes[i], self.rpc_timeout).await?;
-        let hello = Hello { token: self.token.clone(), node_id: None };
-        c.call(Kind::Hello, Bytes::from(serde_json::to_vec(&hello)?), self.rpc_timeout).await?;
+        let c = self
+            .dialer
+            .connect(&self.nodes[i], self.rpc_timeout)
+            .await?;
+        let hello = Hello {
+            token: self.token.clone(),
+            node_id: None,
+        };
+        c.call(
+            Kind::Hello,
+            Bytes::from(serde_json::to_vec(&hello)?),
+            self.rpc_timeout,
+        )
+        .await?;
         let c = Arc::new(c);
         *g = Some(c.clone());
         Ok(c)
@@ -80,7 +95,9 @@ impl MeshClient {
     }
 
     pub async fn control(&self, node: usize, c: &Control) -> Result<ControlResp> {
-        let f = self.call(node, Kind::Control, Bytes::from(serde_json::to_vec(c)?)).await?;
+        let f = self
+            .call(node, Kind::Control, Bytes::from(serde_json::to_vec(c)?))
+            .await?;
         anyhow::ensure!(f.kind == Kind::ControlResp, "unexpected {:?}", f.kind);
         Ok(serde_json::from_slice(&f.body)?)
     }
@@ -96,8 +113,18 @@ impl MeshClient {
         let mut last_err;
         loop {
             attempts += 1;
-            match self.call(node, Kind::Append, body.clone()).await.and_then(|f| crate::node::parse_frame_ack(&f)) {
-                Ok(ack) if ack.is_success() => return Ok(Receipt { ack, node, attempts }),
+            match self
+                .call(node, Kind::Append, body.clone())
+                .await
+                .and_then(|f| crate::node::parse_frame_ack(&f))
+            {
+                Ok(ack) if ack.is_success() => {
+                    return Ok(Receipt {
+                        ack,
+                        node,
+                        attempts,
+                    });
+                }
                 Ok(ack) if matches!(ack.status, AckStatus::Conflict | AckStatus::Rejected) => {
                     bail!("append refused: {ack:?}")
                 }
@@ -125,9 +152,20 @@ pub struct Writer {
 }
 
 impl Writer {
-    pub fn new(client: Arc<MeshClient>, stream: &str, writer: &str, epoch: u64, preferred: usize, copies: u8) -> Writer {
+    pub fn new(
+        client: Arc<MeshClient>,
+        stream: &str,
+        writer: &str,
+        epoch: u64,
+        preferred: usize,
+        copies: u8,
+    ) -> Writer {
         Writer {
-            log: LogId { stream: stream.into(), writer: writer.into(), epoch },
+            log: LogId {
+                stream: stream.into(),
+                writer: writer.into(),
+                epoch,
+            },
             next_seq: 0,
             preferred,
             copies,
@@ -142,7 +180,10 @@ impl Writer {
     /// Appends one batch; on success advances the sequence and sticks to the
     /// node that answered (so failover is sticky).
     pub async fn append_encoded(&mut self, bytes: &Bytes, count: usize) -> Result<Receipt> {
-        let r = self.client.append(self.preferred, bytes, self.copies).await?;
+        let r = self
+            .client
+            .append(self.preferred, bytes, self.copies)
+            .await?;
         self.preferred = r.node;
         self.next_seq += count as u64;
         Ok(r)

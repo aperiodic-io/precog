@@ -76,9 +76,18 @@ pub struct Batch {
 impl Batch {
     pub fn encode(log: &LogId, first_seq: u64, events: &[(u64, &[u8])]) -> Result<Bytes> {
         ensure!(!events.is_empty(), "empty batch");
-        ensure!(events.len() as u64 <= MAX_EVENTS_PER_BATCH as u64, "too many events");
-        ensure!(log.stream.len() <= MAX_NAME && log.writer.len() <= MAX_NAME, "name too long");
-        ensure!(!log.stream.is_empty() && !log.writer.is_empty(), "empty name");
+        ensure!(
+            events.len() as u64 <= MAX_EVENTS_PER_BATCH as u64,
+            "too many events"
+        );
+        ensure!(
+            log.stream.len() <= MAX_NAME && log.writer.len() <= MAX_NAME,
+            "name too long"
+        );
+        ensure!(
+            !log.stream.is_empty() && !log.writer.is_empty(),
+            "empty name"
+        );
         first_seq
             .checked_add(events.len() as u64)
             .context("sequence overflow")?;
@@ -121,8 +130,13 @@ impl Batch {
         let epoch = c.get_u64_le();
         let first_seq = c.get_u64_le();
         let count = c.get_u32_le();
-        ensure!(count > 0 && count <= MAX_EVENTS_PER_BATCH, "bad event count");
-        first_seq.checked_add(count as u64).context("sequence overflow")?;
+        ensure!(
+            count > 0 && count <= MAX_EVENTS_PER_BATCH,
+            "bad event count"
+        );
+        first_seq
+            .checked_add(count as u64)
+            .context("sequence overflow")?;
         let events_off = body.len() - c.remaining();
         for _ in 0..count {
             ensure!(c.remaining() >= 12, "truncated event");
@@ -133,7 +147,14 @@ impl Batch {
         }
         ensure!(c.remaining() == 0, "trailing bytes in batch");
         Ok(Batch {
-            id: BatchId { log: LogId { stream, writer, epoch }, first_seq },
+            id: BatchId {
+                log: LogId {
+                    stream,
+                    writer,
+                    epoch,
+                },
+                first_seq,
+            },
             count,
             bytes,
             events_off,
@@ -166,8 +187,13 @@ impl Batch {
 fn take_str(c: &mut &[u8]) -> Result<String> {
     ensure!(c.remaining() >= 2, "truncated name");
     let n = c.get_u16_le() as usize;
-    ensure!(n > 0 && n <= MAX_NAME && c.remaining() >= n, "bad name length");
-    let s = std::str::from_utf8(&c[..n]).context("name not utf8")?.to_owned();
+    ensure!(
+        n > 0 && n <= MAX_NAME && c.remaining() >= n,
+        "bad name length"
+    );
+    let s = std::str::from_utf8(&c[..n])
+        .context("name not utf8")?
+        .to_owned();
     c.advance(n);
     Ok(s)
 }
@@ -304,7 +330,12 @@ impl Ack {
             4 => AckStatus::Rejected,
             v => bail!("bad ack status {v}"),
         };
-        Ok(Ack { status, copies: b.get_u8(), nodes: b.get_u32_le(), crc: b.get_u32_le() })
+        Ok(Ack {
+            status,
+            copies: b.get_u8(),
+            nodes: b.get_u32_le(),
+            crc: b.get_u32_le(),
+        })
     }
     pub fn is_success(&self) -> bool {
         matches!(self.status, AckStatus::Ok | AckStatus::Duplicate)
@@ -328,11 +359,20 @@ pub struct Hello {
 pub enum Control {
     Status,
     /// Event-time ordered snapshot read of one stream from local durable state.
-    Read { stream: String, from_time_us: u64, limit: u32 },
+    Read {
+        stream: String,
+        from_time_us: u64,
+        limit: u32,
+    },
     /// Batch ids this node made durable after local index `after`.
-    Inventory { after: u64, limit: u32 },
+    Inventory {
+        after: u64,
+        limit: u32,
+    },
     /// Raw batch bytes for the given ids (missing ones are skipped).
-    Fetch { ids: Vec<BatchId> },
+    Fetch {
+        ids: Vec<BatchId>,
+    },
     /// Run one anti-entropy pass against every peer now.
     Repair,
 }
@@ -341,9 +381,19 @@ pub enum Control {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ControlResp {
     Status(Status),
-    Read { events: Vec<Event>, coverage: Vec<Frontier> },
-    Inventory { items: Vec<(u64, BatchId, u32, u32)>, next: u64, more: bool },
-    Repair { fetched: u64, errors: Vec<String> },
+    Read {
+        events: Vec<Event>,
+        coverage: Vec<Frontier>,
+    },
+    Inventory {
+        items: Vec<(u64, BatchId, u32, u32)>,
+        next: u64,
+        more: bool,
+    },
+    Repair {
+        fetched: u64,
+        errors: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -391,7 +441,11 @@ mod tests {
     use super::*;
 
     fn log() -> LogId {
-        LogId { stream: "s".into(), writer: "w".into(), epoch: 7 }
+        LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 7,
+        }
     }
 
     #[test]
@@ -412,14 +466,22 @@ mod tests {
         for i in 0..b.len() {
             let mut v = b.to_vec();
             v[i] ^= 0x40;
-            assert!(Batch::parse(Bytes::from(v)).is_err(), "flip at {i} undetected");
+            assert!(
+                Batch::parse(Bytes::from(v)).is_err(),
+                "flip at {i} undetected"
+            );
         }
         assert!(Batch::parse(b.slice(..b.len() - 1)).is_err());
     }
 
     #[test]
     fn ack_roundtrip() {
-        let a = Ack { status: AckStatus::Unknown, copies: 1, nodes: 0b101, crc: 99 };
+        let a = Ack {
+            status: AckStatus::Unknown,
+            copies: 1,
+            nodes: 0b101,
+            crc: 99,
+        };
         assert_eq!(Ack::decode(a.encode()).unwrap(), a);
     }
 }
