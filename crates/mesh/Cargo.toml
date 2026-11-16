@@ -1,0 +1,24 @@
+[package]
+name = "precog-mesh"
+description = "Leaderless writer-log broker mesh POC (Iggy-inspired, Iroh transport)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+crc32c = "0.6"
+futures = "0.3"
+iroh = "=1.4.1"
+parking_lot = "0.12"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
