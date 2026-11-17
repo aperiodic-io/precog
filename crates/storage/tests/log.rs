@@ -1050,6 +1050,79 @@ fn records_out_of_sequence_or_outside_their_group_end_the_log() {
     }
 }
 
+/// The active segment's end after `fill`: (path, generation, next lsn, offset).
+fn active_end(d: &Path) -> (PathBuf, u64, u64, u64) {
+    let active = segment_files(d).pop().unwrap();
+    let (_, generation, base) = header_of(&active);
+    let data = std::fs::read(&active).unwrap();
+    let (mut off, mut n) = (4096usize, 0u64);
+    while let record::Decoded::Record { next, .. } = record::decode(&data, off, generation) {
+        off = next;
+        n += 1;
+    }
+    (active, generation, base + n, off as u64)
+}
+
+#[test]
+fn a_torn_group_is_zeroed_no_further_than_its_last_record() {
+    // A two-record group whose first record is damaged: both records go, and recovery writes
+    // nothing past the second record's header (it must not zero-fill the rest of the segment).
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+        fill(&mut log, 0, 10, 1, 100);
+    }
+    let (active, generation, lsn, x) = active_end(d.path());
+    let mut group = vec![];
+    record::encode(&mut group, generation, x, lsn, &meta(10), &[1; 200]);
+    let second = x + group.len() as u64;
+    record::encode(&mut group, generation, x, lsn + 1, &meta(11), &[2; 200]);
+    group[100] ^= 0xff; // first record's payload
+    patch(&active, x, &group);
+    let marker = second + 128 * KB;
+    patch(&active, marker, &[0xab; 8]);
+    let log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+    assert_eq!(log.next_lsn(), 10);
+    drop(log);
+    let b = std::fs::read(&active).unwrap();
+    let at = |o: u64, n: usize| &b[o as usize..o as usize + n];
+    assert!(at(second, 64).iter().all(|&v| v == 0), "torn record left");
+    assert_eq!(at(marker, 8), &[0xab; 8], "zeroed past the torn group");
+}
+
+#[test]
+fn recovery_looks_for_later_groups_within_two_groups_and_a_record_of_a_torn_write() {
+    // Past a torn write at x, a valid record of a later group within 2 * 32 MiB + 16 MiB means
+    // interior damage; further out it cannot belong to this log's history and is ignored.
+    const MIB: u64 = 1 << 20;
+    for (distance, corrupt) in [(78 * MIB, true), (82 * MIB, false)] {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = cfg(d.path(), 128 * MIB);
+        c.spares = 0;
+        {
+            let mut log = Log::open(c.clone()).unwrap();
+            fill(&mut log, 0, 10, 1, 100);
+        }
+        let (active, generation, lsn, x) = active_end(d.path());
+        let mut torn = vec![];
+        record::encode(&mut torn, generation, x, lsn, &meta(10), &[1; 200]);
+        torn[100] ^= 0xff;
+        patch(&active, x, &torn);
+        let at = x + distance;
+        let mut later = vec![];
+        record::encode(&mut later, generation, at, lsn + 5, &meta(15), &[3; 200]);
+        patch(&active, at, &later);
+        match Log::open(c) {
+            Err(Error::Corrupt(_)) => assert!(corrupt, "{distance}: refused"),
+            Ok(log) => {
+                assert!(!corrupt, "{distance}: opened");
+                assert_eq!(log.next_lsn(), 10);
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
 #[test]
 fn stale_records_of_another_generation_are_left_alone() {
     let d = tempfile::tempdir().unwrap();

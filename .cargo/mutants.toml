@@ -15,6 +15,9 @@ exclude_re = [
     # read-ahead buffering only: a wrong window re-reads or over-reads, which the recovery
     # tests catch as wrong results and the `recover` instruction bench catches as slowdowns
     "in Window<'_>::cover",
+    # the two scan loop bounds (`while off < limit`, `while pos < window_end`, both column 15):
+    # one more pass at the bound decodes an empty window (Short) or skips unwritten bytes
+    ":15: replace < with <= in scan",
     # closes a race with concurrent retention; not reachable deterministically from a test
     "replace match guard self.trimmed\\(lsn\\) with false in Reader::read",
 ]
