@@ -177,7 +177,7 @@ impl Reader {
     /// Damaged records are an error, never returned.
     pub fn read(&self, lsn: Lsn) -> Result<Option<Record>> {
         let s = &self.shared;
-        if lsn >= s.next_lsn.load(Ordering::Acquire) || lsn < s.first_lsn.load(Ordering::Acquire) {
+        if lsn >= s.next_lsn.load(Ordering::Acquire) || self.trimmed(lsn) {
             return Ok(None);
         }
         if let Some(r) = s.cache.lock().unwrap().get(lsn) {
@@ -213,12 +213,17 @@ impl Reader {
                 payload: payload.into(),
             })),
             // retention may have recycled the file under this read
-            _ if lsn < s.first_lsn.load(Ordering::Acquire) => Ok(None),
+            _ if self.trimmed(lsn) => Ok(None),
             _ => Err(Error::Corrupt(format!(
                 "segment {} offset {}: record {lsn} fails validation",
                 seg.id, e.offset
             ))),
         }
+    }
+
+    /// Below the retention floor.
+    fn trimmed(&self, lsn: Lsn) -> bool {
+        lsn < self.shared.first_lsn.load(Ordering::Acquire)
     }
 
     /// Index entries from `from`, at most `limit`, of durable records only.
@@ -244,9 +249,6 @@ impl Reader {
                     meta: e.meta.clone(),
                 });
                 lsn += 1;
-            }
-            if out.len() >= limit || lsn >= end {
-                break;
             }
         }
         out
@@ -334,17 +336,11 @@ impl Manifest {
     }
 
     fn decode(b: &[u8]) -> Option<Manifest> {
-        if b.len() < 24 || u32_at(b, 0) != MF_MAGIC {
+        let h = b.get(..24)?;
+        if u32_at(h, 0) != MF_MAGIC || u32_at(h, 4) != FORMAT_VERSION {
             return None;
         }
-        if u32_at(b, 4) != FORMAT_VERSION {
-            return None;
-        }
-        let len = u32_at(b, 16) as usize;
-        if 24 + len > b.len() {
-            return None;
-        }
-        let body = &b[24..24 + len];
+        let body = b.get(24..24usize.checked_add(u32_at(h, 16) as usize)?)?;
         if crc32c::crc32c_append(crc32c::crc32c(&b[..20]), body) != u32_at(b, 20) {
             return None;
         }
@@ -445,41 +441,36 @@ fn encode_index(seg: &Seg) -> Vec<u8> {
 }
 
 fn decode_index(b: &[u8], id: u64, generation: u64, base_lsn: Lsn) -> Option<Vec<IdxEntry>> {
-    if b.len() < 40 || crc32c::crc32c(&b[..b.len() - 4]) != u32_at(b, b.len() - 4) {
+    let (body, crc) = b.split_at_checked(b.len().checked_sub(4)?)?;
+    if crc32c::crc32c(body) != u32_at(crc, 0) {
         return None;
     }
-    if u32_at(b, 0) != IDX_MAGIC || u32_at(b, 4) != FORMAT_VERSION {
+    let h = body.get(..36)?;
+    if u32_at(h, 0) != IDX_MAGIC || u32_at(h, 4) != FORMAT_VERSION {
         return None;
     }
-    if (u64_at(b, 8), u64_at(b, 16), u64_at(b, 24)) != (id, generation, base_lsn) {
+    if (u64_at(h, 8), u64_at(h, 16), u64_at(h, 24)) != (id, generation, base_lsn) {
         return None;
     }
-    let n = u32_at(b, 32) as usize;
-    let mut o = 36;
-    let end = b.len() - 4;
-    let mut v = Vec::with_capacity(n);
-    for _ in 0..n {
-        if o + 38 > end {
-            return None;
-        }
-        let kl = u16::from_le_bytes(b[o + 36..o + 38].try_into().unwrap()) as usize;
-        if o + 38 + kl > end {
-            return None;
-        }
+    let mut rest = &body[36..];
+    let mut v = Vec::with_capacity(u32_at(h, 32) as usize);
+    for _ in 0..u32_at(h, 32) {
+        let e = rest.get(..38)?;
+        let key = rest.get(38..38 + u16::from_le_bytes(e[36..38].try_into().unwrap()) as usize)?;
         v.push(IdxEntry {
-            offset: u64_at(b, o),
-            len: u32_at(b, o + 8),
+            offset: u64_at(e, 0),
+            len: u32_at(e, 8),
             meta: Meta {
-                first_seq: u64_at(b, o + 12),
-                count: u32_at(b, o + 20),
-                tag: u32_at(b, o + 24),
-                time_ms: u64_at(b, o + 28),
-                key: b[o + 38..o + 38 + kl].to_vec(),
+                first_seq: u64_at(e, 12),
+                count: u32_at(e, 20),
+                tag: u32_at(e, 24),
+                time_ms: u64_at(e, 28),
+                key: key.to_vec(),
             },
         });
-        o += 38 + kl;
+        rest = &rest[38 + key.len()..];
     }
-    (o == end).then_some(v)
+    rest.is_empty().then_some(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -716,18 +707,26 @@ impl Log {
                 }
             }
             if m.sealed {
-                let entries = match std::fs::read(idx_path(&dir, m.id))
+                let index = std::fs::read(idx_path(&dir, m.id))
                     .ok()
                     .and_then(|b| decode_index(&b, m.id, m.generation, m.base_lsn))
-                {
-                    Some(e) if m.base_lsn + e.len() as u64 == m.end_lsn => e,
-                    _ => {
+                    .filter(|e| m.base_lsn + e.len() as u64 == m.end_lsn);
+                let rebuilt = index.is_none();
+                let entries = match index {
+                    Some(e) => e,
+                    None => {
                         let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset))?;
                         log.stats.index_rebuilds += 1;
                         log.stats.recovery_scanned_bytes += s.scanned;
-                        if s.damaged || m.base_lsn + s.entries.len() as u64 != m.end_lsn {
+                        if s.damaged {
                             return Err(Error::Corrupt(format!(
                                 "sealed segment {} is damaged",
+                                m.id
+                            )));
+                        }
+                        if m.base_lsn + s.entries.len() as u64 != m.end_lsn {
+                            return Err(Error::Corrupt(format!(
+                                "sealed segment {} disagrees with MANIFEST",
                                 m.id
                             )));
                         }
@@ -741,12 +740,7 @@ impl Log {
                     file,
                     entries: RwLock::new(entries),
                 });
-                if !idx_path(&dir, m.id).exists()
-                    || std::fs::read(idx_path(&dir, m.id))
-                        .ok()
-                        .and_then(|b| decode_index(&b, m.id, m.generation, m.base_lsn))
-                        .is_none()
-                {
+                if rebuilt {
                     write_index(&dir, &seg)?;
                 }
                 segs.push(seg);
@@ -848,9 +842,9 @@ impl Log {
         }
         // a sealed tail with no active segment is fine: the next append rolls
         if let Some((seg, s)) = active {
-            if s.dirty_end > s.end {
-                // zero the torn group's leftovers so a shorter write can never be followed by them
-                let zeros = vec![0u8; (s.dirty_end - s.end) as usize];
+            // zero the torn group's leftovers so a shorter write can never be followed by them
+            let zeros = vec![0u8; s.dirty_end.saturating_sub(s.end) as usize];
+            if !zeros.is_empty() {
                 seg.file.write_all_at(&zeros, s.end)?;
                 seg.file.sync_data()?;
             }
@@ -1226,52 +1220,19 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
         dirty_end: 0,
         scanned: 0,
     };
-    let mut buf: Vec<u8> = Vec::new();
-    let mut buf_start = SEG_HEADER;
-    let chunk = 8 << 20;
+    let mut w = Window {
+        file,
+        len,
+        buf: vec![],
+        start: SEG_HEADER,
+        scanned: 0,
+    };
     let mut off = SEG_HEADER;
     let mut group = SEG_HEADER;
     let mut stopped_on_written = false;
-    let fill = |buf: &mut Vec<u8>,
-                buf_start: &mut u64,
-                off: u64,
-                need: usize,
-                scanned: &mut u64|
-     -> Result<bool> {
-        // keep [off..] and read more
-        let rel = (off - *buf_start) as usize;
-        buf.drain(..rel.min(buf.len()));
-        *buf_start = off;
-        let have_to = *buf_start + buf.len() as u64;
-        if have_to >= limit {
-            return Ok(false);
-        }
-        let want = (need.max(chunk) as u64).min(limit - have_to) as usize;
-        let at = buf.len();
-        buf.resize(at + want, 0);
-        file.read_exact_at(&mut buf[at..], have_to)?;
-        *scanned += want as u64;
-        Ok(true)
-    };
-    loop {
-        if off >= limit {
-            break;
-        }
-        let rel = (off - buf_start) as usize;
-        let d = record::decode(&buf[..], rel.min(buf.len()), generation);
-        match d {
-            Decoded::Short => {
-                if !fill(
-                    &mut buf,
-                    &mut buf_start,
-                    off,
-                    record::MAX_RECORD + record::HEADER,
-                    &mut s.scanned,
-                )? {
-                    break; // ends inside a record at the end of the file: torn
-                }
-                continue;
-            }
+    while off < limit {
+        let rel = w.cover(off, (off + MAX_SCAN).min(limit))?;
+        match record::decode(&w.buf, rel, generation) {
             Decoded::Record {
                 header, key, next, ..
             } => {
@@ -1288,17 +1249,18 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
                     meta: meta_of(&header, key),
                 });
                 s.max_time = s.max_time.max(header.time_ms);
-                off = buf_start + next as u64;
+                off += (next - rel) as u64;
                 s.end = off;
             }
+            // Short: the record runs past the end of the file
+            Decoded::Short => break,
             Decoded::Invalid => {
-                let b = &buf[rel.min(buf.len())..];
-                stopped_on_written =
-                    b.len() >= 24 && u32_at(b, 0) == record::MAGIC && u64_at(b, 16) == generation;
+                stopped_on_written = w.written_at(rel, generation);
                 break;
             }
         }
     }
+    s.scanned = w.scanned;
     if let Some(e) = end {
         // sealed: the scan must reach the recorded end exactly
         s.damaged = s.end != e;
@@ -1307,62 +1269,38 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     if s.end >= limit {
         return Ok(s);
     }
-    // Active segment stopped at s.end. Look for a later valid record of this generation within
-    // the window a torn group can span.
+    // The active segment stopped at x. Look for a later valid record of this generation within
+    // the window a torn group can span: one of a later group means interior damage; ones of the
+    // torn group itself mean the group reached disk in part.
     let x = s.end;
     let window_end = (x + 2 * MAX_GROUP as u64 + record::MAX_RECORD as u64).min(len);
-    let mut pos = x + 8;
-    let mut later: Option<u64> = None; // group_start of a valid record from a later group
-    let mut torn: Option<u64> = None; // group_start of valid records of the torn group itself
+    let mut later = None;
+    let mut torn: Option<u64> = None;
     // a record of this generation was written at x but fails validation: damage, not a clean end
     let mut dirty = if stopped_on_written {
         x + record::HEADER as u64
     } else {
         x
     };
-    // continue in the buffer the main scan already read (no second read of the same bytes)
-    while pos < window_end {
-        let rel = (pos - buf_start) as usize;
-        if rel + record::HEADER > buf.len() {
-            let keep = (pos - buf_start) as usize;
-            buf.drain(..keep.min(buf.len()));
-            buf_start = pos;
-            let have_to = buf_start + buf.len() as u64;
-            if have_to >= window_end {
-                break;
-            }
-            let want = (chunk as u64).min(window_end - have_to) as usize;
-            let at = buf.len();
-            buf.resize(at + want, 0);
-            file.read_exact_at(&mut buf[at..], have_to)?;
-            s.scanned += want as u64;
-            continue;
-        }
-        let b = &buf[rel..];
-        if u32_at(b, 0) == record::MAGIC && u64_at(b, 16) == generation {
-            let rec_len = u32_at(b, 4) as u64;
-            dirty = dirty.max(pos + rec_len.min(record::MAX_RECORD as u64));
-            // validate fully (may need more bytes)
-            let need = rec_len as usize;
-            if rel + need > buf.len() && pos + rec_len <= window_end {
-                let at = buf.len();
-                let more = rel + need - at;
-                buf.resize(at + more, 0);
-                file.read_exact_at(&mut buf[at..], buf_start + at as u64)?;
-                s.scanned += more as u64;
-            }
-            if let Decoded::Record { header, next, .. } = record::decode(&buf, rel, generation) {
+    let mut pos = x + 8;
+    while pos + record::HEADER as u64 <= window_end {
+        let rel = w.cover(pos, (pos + MAX_SCAN).min(window_end))?;
+        if w.written_at(rel, generation) {
+            dirty =
+                dirty.max(pos + (u32_at(&w.buf[rel..], 4) as u64).min(record::MAX_RECORD as u64));
+            if let Decoded::Record { header, next, .. } = record::decode(&w.buf, rel, generation) {
                 if header.group_start > x {
                     later = Some(header.group_start);
                     break;
                 }
-                torn = Some(torn.map_or(header.group_start, |t: u64| t.min(header.group_start)));
-                pos = buf_start + next as u64;
+                torn = Some(torn.map_or(header.group_start, |t| t.min(header.group_start)));
+                pos += (next - rel) as u64;
                 continue;
             }
         }
         pos += 8;
     }
+    s.scanned = w.scanned;
     if let Some(g) = later {
         return Err(Error::Corrupt(format!(
             "damage at offset {x} of the active segment is followed by a later group at offset {g}"
@@ -1370,24 +1308,65 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     }
     match torn {
         Some(g) => {
-            // the torn group itself reached disk in part: drop the whole group
-            s.damaged = true;
-            let keep = s.entries.iter().take_while(|e| e.offset < g).count();
-            s.entries.truncate(keep);
-            s.end = g.max(SEG_HEADER);
+            // drop the whole torn group: it was never acknowledged
+            s.entries
+                .truncate(s.entries.iter().take_while(|e| e.offset < g).count());
+            s.end = g;
             s.max_time = s.entries.iter().map(|e| e.meta.time_ms).max().unwrap_or(0);
+            s.damaged = true;
         }
-        None => {
-            // nothing valid follows: a clean end, or a torn tail with its valid prefix kept
-            s.damaged = dirty > x;
-        }
+        // nothing valid follows: a clean end, or a torn tail whose valid prefix is kept
+        None => s.damaged = dirty > x,
     }
-    s.dirty_end = dirty.max(if s.damaged { x } else { 0 });
-    // zero at least the first record slot after the end so a torn group's remains are gone
     if s.damaged {
-        s.dirty_end = s.dirty_end.max(x + record::HEADER as u64).min(len);
+        // zero at least one record header past the end, so a torn group's remains are gone
+        s.dirty_end = dirty.max(x + record::HEADER as u64).min(len);
     }
     Ok(s)
+}
+
+/// How far ahead the scan keeps the file buffered: one maximal record and its header.
+const MAX_SCAN: u64 = (record::MAX_RECORD + record::HEADER) as u64;
+
+/// A buffered view of a file region for scanning, read ahead in large chunks.
+struct Window<'a> {
+    file: &'a File,
+    len: u64,
+    buf: Vec<u8>,
+    start: u64,
+    scanned: u64,
+}
+
+impl Window<'_> {
+    /// Makes the buffer hold `[from, to)` (reading ahead by at least 8 MiB, within the file)
+    /// and returns `from`'s offset in it.
+    fn cover(&mut self, from: u64, to: u64) -> Result<usize> {
+        const CHUNK: u64 = 8 << 20;
+        let end = self.start + self.buf.len() as u64;
+        if from < self.start || from > end {
+            self.buf.clear();
+            self.start = from;
+        } else if to > end && from - self.start >= CHUNK {
+            // drop what was consumed only once it is large, so the shift is amortized
+            self.buf.drain(..(from - self.start) as usize);
+            self.start = from;
+        }
+        let have = self.start + self.buf.len() as u64;
+        if to > have {
+            let upto = to.max(have + CHUNK).min(self.len).max(to);
+            let at = self.buf.len();
+            self.buf.resize(at + (upto - have) as usize, 0);
+            self.file.read_exact_at(&mut self.buf[at..], have)?;
+            self.scanned += upto - have;
+        }
+        Ok((from - self.start) as usize)
+    }
+
+    /// Bytes at `rel` start with this generation's record magic: something was written there.
+    fn written_at(&self, rel: usize, generation: u64) -> bool {
+        let b = &self.buf[rel..];
+        b.len() >= 24 && u32_at(b, 0) == record::MAGIC && u64_at(b, 16) == generation
+    }
 }
 
 #[cfg(test)]

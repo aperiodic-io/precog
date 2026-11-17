@@ -2,5 +2,14 @@
 # integration test. The acceptance suite (real processes, minutes) is not run per mutant.
 test_tool = "nextest"
 additional_cargo_test_args = ["-E", "not binary(acceptance)"]
-# benchmarks, examples and the CLI's argument plumbing are not production logic
+# benchmarks, examples and the comparison crates are not production logic
 exclude_globs = ["crates/*/benches/**", "crates/*/examples/**", "crates/storage-bench/**", "crates/bench/**"]
+# Equivalent or not observable in-process; each listed with why:
+exclude_re = [
+    # directory fsync: only a power cut between rename and fsync tells it apart
+    "replace sync_dir -> std::io::Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # stops the preallocator thread; the process exiting does the same, and a leak is invisible
+    "replace <impl Drop for Log>::drop with \\(\\)",
+    # the manifest body grows in 49-byte steps: body + 24 never equals the 64 KiB slot exactly
+    "replace > with >= in Manifest::encode",
+]

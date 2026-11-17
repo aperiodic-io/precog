@@ -1081,8 +1081,10 @@ fn adopted_segments_keep_generations_unique() {
     std::fs::write(&m, &mf).unwrap();
     let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
     assert!(
-        log.stats().recovery_scanned_bytes > 64 * KB,
-        "two segments scanned: one adopted"
+        log.stats().recovery_scanned_bytes > 64 * KB
+            && log.stats().recovery_scanned_bytes <= 2 * 64 * KB,
+        "two segments scanned, one adopted: {}",
+        log.stats().recovery_scanned_bytes
     );
     fill(&mut log, 140, 60, 2, 1000); // more rolls after the adoption
     drop(log);
@@ -1136,4 +1138,157 @@ fn interior_damage_far_from_the_end_of_a_large_segment_fails_closed() {
         Log::open(cfg(d.path(), seg)),
         Err(Error::Corrupt(_))
     ));
+}
+
+/// Parses an index file into (header, entries as byte ranges) and rewrites it with a fixed CRC.
+fn index_entries(b: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let body = &b[..b.len() - 4];
+    let n = u32::from_le_bytes(body[32..36].try_into().unwrap()) as usize;
+    let mut o = 36;
+    let mut v = vec![];
+    for _ in 0..n {
+        let kl = u16::from_le_bytes(body[o + 36..o + 38].try_into().unwrap()) as usize;
+        v.push(body[o..o + 38 + kl].to_vec());
+        o += 38 + kl;
+    }
+    (body[..36].to_vec(), v)
+}
+
+fn write_index(path: &Path, header: &[u8], entries: &[Vec<u8>]) {
+    let mut b = header.to_vec();
+    b[32..36].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        b.extend_from_slice(e);
+    }
+    let c = crc32c::crc32c(&b);
+    b.extend_from_slice(&c.to_le_bytes());
+    std::fs::write(path, b).unwrap();
+}
+
+#[test]
+fn an_index_pointing_at_the_wrong_record_is_caught_on_read() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+    }
+    let idx = segment_files(d.path())[0].with_extension("idx");
+    let (h, mut e) = index_entries(&std::fs::read(&idx).unwrap());
+    let (a, b) = (e[0][..8].to_vec(), e[1][..8].to_vec());
+    e[0][..8].copy_from_slice(&b);
+    e[1][..8].copy_from_slice(&a);
+    write_index(&idx, &h, &e);
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert_eq!(
+        log.stats().index_rebuilds,
+        0,
+        "the index is well-formed, so it is used"
+    );
+    assert!(
+        matches!(log.reader().read(0), Err(Error::Corrupt(_))),
+        "record 1 is not served as record 0"
+    );
+}
+
+#[test]
+fn an_index_with_the_wrong_number_of_entries_is_rebuilt() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+    }
+    let idx = segment_files(d.path())[0].with_extension("idx");
+    let (h, mut e) = index_entries(&std::fs::read(&idx).unwrap());
+    e.pop();
+    write_index(&idx, &h, &e);
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert_eq!(log.stats().index_rebuilds, 1);
+    check_all(&log, 0, 200, 1000);
+}
+
+#[test]
+fn a_crash_right_after_renaming_a_recycled_spare_recovers() {
+    // A recycled spare still holds its old segment's valid header. If the roll dies before the
+    // new header is written, the renamed file carries another segment's identity: recycle it.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 64 * KB);
+    c.spares = 0; // the pool holds only recycled files
+    {
+        let mut log = Log::open(c.clone()).unwrap();
+        fill(&mut log, 0, 300, 1, 1000);
+        log.retain(Some(2 * 64 * KB), None).unwrap();
+        assert!(log.stats().recycled >= 1);
+    }
+    c.failpoints.fail_at = Some("roll:after_spare_rename");
+    let mut log = Log::open(c.clone()).unwrap();
+    let mut i = log.next_lsn();
+    loop {
+        let (m, p) = (meta(i), payload(i, 1000));
+        if log.append(&[(m, &p[..])]).is_err() {
+            break;
+        }
+        i += 1;
+    }
+    let acked = i;
+    drop(log);
+    c.failpoints.fail_at = None;
+    let mut log = Log::open(c).unwrap();
+    assert_eq!(log.next_lsn(), acked);
+    let first = log.first_lsn();
+    check_all(&log, first, acked, 1000);
+    fill(&mut log, acked, 100, 1, 1000);
+}
+
+#[test]
+fn both_manifest_slots_are_written_alternately() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+    }
+    let mf = std::fs::read(d.path().join("MANIFEST")).unwrap();
+    let slot = mf.len() / 2;
+    let seq = |o: usize| u64::from_le_bytes(mf[o + 8..o + 16].try_into().unwrap());
+    let (a, b) = (seq(0), seq(slot));
+    assert!(
+        a > 2 && b > 2 && a.abs_diff(b) == 1,
+        "slots at seq {a} and {b}"
+    );
+}
+
+#[test]
+fn a_maximal_record_reads_back_after_a_restart() {
+    let d = tempfile::tempdir().unwrap();
+    let big = vec![9u8; record::MAX_RECORD - record::HEADER];
+    {
+        let mut log = Log::open(cfg(d.path(), 20 << 20)).unwrap();
+        log.append(&[(Meta::default(), &big[..])]).unwrap();
+    }
+    let log = Log::open(cfg(d.path(), 20 << 20)).unwrap();
+    assert_eq!(log.next_lsn(), 1);
+    assert_eq!(
+        log.reader().read(0).unwrap().unwrap().payload.len(),
+        big.len()
+    );
+}
+
+#[test]
+fn a_damaged_final_record_is_dropped_and_zeroed() {
+    let d = tempfile::tempdir().unwrap();
+    let off;
+    {
+        let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+        fill(&mut log, 0, 10, 1, 100);
+        off = log.reader().entries(9, 1)[0].offset;
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, off + record::HEADER as u64 + 30, &[0xEE]); // payload: the checksum fails
+    let log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+    assert_eq!(log.next_lsn(), 9);
+    drop(log);
+    let b = std::fs::read(&active).unwrap();
+    assert!(
+        b[off as usize..off as usize + 64].iter().all(|&x| x == 0),
+        "its header was zeroed"
+    );
 }
