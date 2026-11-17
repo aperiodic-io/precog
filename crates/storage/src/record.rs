@@ -222,6 +222,60 @@ mod tests {
         assert_eq!(decode(&[0u8; 10], 0, 7), Decoded::Invalid);
     }
 
+    /// Re-encodes a record's header field and its checksum, so only the field is wrong.
+    fn with_field(mut buf: Vec<u8>, off: usize, bytes: &[u8]) -> Vec<u8> {
+        buf[off..off + bytes.len()].copy_from_slice(bytes);
+        let len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let end = len.min(buf.len());
+        let crc = crc32c::crc32c(&buf[12..end]);
+        buf[8..12].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn structurally_invalid_records_are_refused_even_with_a_valid_checksum() {
+        let mut buf = vec![];
+        encode(&mut buf, 7, 0, 1, &meta(), b"payload");
+        assert!(matches!(decode(&buf, 0, 7), Decoded::Record { .. }));
+        let flags = with_field(buf.clone(), 14, &1u16.to_le_bytes());
+        assert_eq!(decode(&flags, 0, 7), Decoded::Invalid, "flags must be zero");
+        let key = with_field(buf.clone(), 12, &((MAX_KEY + 1) as u16).to_le_bytes());
+        assert_eq!(decode(&key, 0, 7), Decoded::Invalid, "key too long");
+        let small = with_field(buf.clone(), 4, &((HEADER + 15 - 1) as u32).to_le_bytes());
+        assert_eq!(
+            decode(&small, 0, 7),
+            Decoded::Invalid,
+            "length shorter than header + key"
+        );
+        let huge = with_field(buf.clone(), 4, &((MAX_RECORD + 1) as u32).to_le_bytes());
+        assert_eq!(
+            decode(&huge, 0, 7),
+            Decoded::Invalid,
+            "length beyond the maximum"
+        );
+    }
+
+    #[test]
+    fn a_record_of_header_only_decodes_at_the_end_of_a_buffer() {
+        let mut buf = vec![];
+        encode(&mut buf, 7, 0, 1, &Meta::default(), b"");
+        assert_eq!(buf.len(), HEADER);
+        assert!(matches!(
+            decode(&buf, 0, 7),
+            Decoded::Record { next: 64, .. }
+        ));
+        let key_only = Meta {
+            key: vec![b'k'; MAX_KEY],
+            ..Meta::default()
+        };
+        let mut buf = vec![];
+        encode(&mut buf, 7, 0, 1, &key_only, b"");
+        assert!(
+            matches!(decode(&buf, 0, 7), Decoded::Record { .. }),
+            "a key of exactly MAX_KEY bytes"
+        );
+    }
+
     #[test]
     fn truncated_record_is_short() {
         let mut buf = vec![];

@@ -71,6 +71,10 @@ impl Config {
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     pub segments: usize,
+    /// Bytes of records in the log (sealed segments' ends plus the active segment's offset).
+    pub log_bytes: u64,
+    /// Sealed segments whose index file was missing or invalid at startup and was rebuilt.
+    pub index_rebuilds: u64,
     pub bytes: u64,
     pub recovery_scanned_bytes: u64,
     pub spare_hits: u64,
@@ -138,11 +142,6 @@ impl TailCache {
         if self.cap == 0 {
             return;
         }
-        if let Some(last) = self.recs.back()
-            && last.lsn + 1 != r.lsn
-        {
-            self.clear();
-        }
         self.bytes += r.payload.len();
         self.recs.push_back(r);
         while self.bytes > self.cap {
@@ -155,7 +154,11 @@ impl TailCache {
         if lsn < first {
             return None;
         }
-        self.recs.get((lsn - first) as usize).cloned()
+        // appends push contiguous LSNs; checking costs nothing and keeps a wrong slot impossible
+        self.recs
+            .get((lsn - first) as usize)
+            .filter(|r| r.lsn == lsn)
+            .cloned()
     }
     fn clear(&mut self) {
         self.recs.clear();
@@ -720,6 +723,8 @@ impl Log {
                     Some(e) if m.base_lsn + e.len() as u64 == m.end_lsn => e,
                     _ => {
                         let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset))?;
+                        log.stats.index_rebuilds += 1;
+                        log.stats.recovery_scanned_bytes += s.scanned;
                         if s.damaged || m.base_lsn + s.entries.len() as u64 != m.end_lsn {
                             return Err(Error::Corrupt(format!(
                                 "sealed segment {} is damaged",
@@ -795,12 +800,8 @@ impl Log {
                     let s = scan(&file, g, b, None)?;
                     log.stats.recovery_scanned_bytes += s.scanned;
                     if let Some((prev, ps)) = active.take() {
-                        if ps.damaged && !s.entries.is_empty() {
-                            return Err(Error::Corrupt(format!(
-                                "segment {} is damaged at offset {} and a later segment {} holds records",
-                                prev.id, ps.end, id
-                            )));
-                        }
+                        // Lost records would make the successor's base LSN mismatch (refused
+                        // below); bytes past the last record of a full segment hold nothing.
                         // seal the previous active segment
                         *prev.entries.write().unwrap() = ps.entries;
                         let mf = manifest.segs.last_mut().unwrap();
@@ -901,6 +902,14 @@ impl Log {
         let mut s = self.stats.clone();
         s.cache_hits = self.shared.cache_hits.load(Ordering::Relaxed);
         s.segments = self.shared.segs.read().unwrap().len();
+        s.log_bytes = self
+            .manifest
+            .segs
+            .iter()
+            .filter(|m| m.sealed)
+            .map(|m| m.end_offset)
+            .sum::<u64>()
+            + self.active.as_ref().map_or(0, |a| a.offset);
         s
     }
 
@@ -1379,4 +1388,190 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
         s.dirty_end = s.dirty_end.max(x + record::HEADER as u64).min(len);
     }
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(lsn: Lsn, n: usize) -> Record {
+        Record {
+            lsn,
+            meta: Meta::default(),
+            payload: vec![0u8; n].into(),
+        }
+    }
+
+    #[test]
+    fn tail_cache_evicts_oldest_beyond_its_byte_budget() {
+        let mut c = TailCache {
+            cap: 80,
+            ..Default::default()
+        };
+        c.push(rec(1, 40));
+        c.push(rec(2, 40));
+        assert_eq!(
+            (c.recs.len(), c.bytes),
+            (2, 80),
+            "exactly at the budget: nothing evicted"
+        );
+        c.push(rec(3, 40));
+        assert_eq!((c.recs.len(), c.bytes), (2, 80));
+        assert!(c.get(1).is_none());
+        assert_eq!(
+            c.get(2).unwrap().lsn,
+            2,
+            "the oldest cached record is a hit"
+        );
+        assert_eq!(c.get(3).unwrap().lsn, 3);
+        assert!(c.get(4).is_none());
+    }
+
+    fn mf(n: usize) -> Manifest {
+        Manifest {
+            seq: 9,
+            next_generation: 5,
+            next_segment_id: 7,
+            first_lsn: 100,
+            segs: (0..n as u64)
+                .map(|i| MfSeg {
+                    id: i,
+                    generation: i + 1,
+                    base_lsn: 100 + i * 10,
+                    sealed: i + 1 < n as u64,
+                    end_offset: 4096 + i,
+                    end_lsn: 110 + i * 10,
+                    max_time: i,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn manifest_roundtrip_and_bounds() {
+        let m = mf(3);
+        let b = m.encode().unwrap();
+        assert_eq!(b.len(), MF_SLOT);
+        assert_eq!(Manifest::decode(&b).unwrap(), m);
+        // the slot's capacity: the largest manifest that fits encodes, one more segment does not
+        let fits = (MF_SLOT - 24 - 28) / 49;
+        assert!(mf(fits).encode().is_ok());
+        assert!(matches!(mf(fits + 1).encode(), Err(Error::Invalid(_))));
+        // too short, a length past the end, or a segment list cut short: rejected
+        assert!(Manifest::decode(&b[..23]).is_none());
+        assert!(Manifest::decode(&b[..24]).is_none());
+        let mut long = b.clone();
+        long[16..20].copy_from_slice(&((MF_SLOT - 23) as u32).to_le_bytes());
+        assert!(Manifest::decode(&long).is_none());
+        let mut v = b.clone();
+        v[4] = 9; // version
+        assert!(Manifest::decode(&v).is_none());
+    }
+
+    fn header_with(magic: u32, version: u32, id: u64, generation: u64, base: Lsn) -> Vec<u8> {
+        let mut b = vec![];
+        b.extend_from_slice(&magic.to_le_bytes());
+        b.extend_from_slice(&version.to_le_bytes());
+        for v in [id, generation, base] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        let c = crc32c::crc32c(&b);
+        b.extend_from_slice(&c.to_le_bytes());
+        b.resize(SEG_HEADER as usize, 0);
+        b
+    }
+
+    #[test]
+    fn segment_headers_need_magic_version_and_checksum() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("h");
+        let check = |b: &[u8]| {
+            std::fs::write(&p, b).unwrap();
+            read_seg_header(&File::open(&p).unwrap())
+        };
+        assert_eq!(check(&seg_header(3, 4, 5)), Some((3, 4, 5)));
+        assert_eq!(
+            check(&header_with(SEG_MAGIC, FORMAT_VERSION, 3, 4, 5)),
+            Some((3, 4, 5))
+        );
+        // each check on its own, with a valid checksum
+        assert_eq!(
+            check(&header_with(SEG_MAGIC ^ 1, FORMAT_VERSION, 3, 4, 5)),
+            None
+        );
+        assert_eq!(
+            check(&header_with(SEG_MAGIC, FORMAT_VERSION + 1, 3, 4, 5)),
+            None
+        );
+        let mut bad_crc = seg_header(3, 4, 5);
+        bad_crc[32] ^= 1;
+        assert_eq!(check(&bad_crc), None);
+        assert_eq!(check(&[0u8; 10]), None);
+    }
+
+    #[test]
+    fn index_files_roundtrip_and_reject_damage() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("s");
+        std::fs::write(&p, b"").unwrap();
+        let entries: Vec<IdxEntry> = (0..5u64)
+            .map(|i| IdxEntry {
+                offset: 4096 + i * 100,
+                len: 90,
+                meta: Meta {
+                    key: vec![b'k'; i as usize],
+                    first_seq: i,
+                    count: 2,
+                    tag: 7,
+                    time_ms: 9,
+                },
+            })
+            .collect();
+        let seg = Seg {
+            id: 3,
+            generation: 4,
+            base_lsn: 50,
+            file: File::open(&p).unwrap(),
+            entries: RwLock::new(entries.clone()),
+        };
+        let b = encode_index(&seg);
+        let got = decode_index(&b, 3, 4, 50).unwrap();
+        assert_eq!(got.len(), 5);
+        for (a, e) in got.iter().zip(&entries) {
+            assert_eq!((a.offset, a.len, &a.meta), (e.offset, e.len, &e.meta));
+        }
+        // another segment's identity, any flipped byte, or a cut: rejected
+        assert!(decode_index(&b, 3, 5, 50).is_none());
+        assert!(decode_index(&b, 2, 4, 50).is_none());
+        assert!(decode_index(&b, 3, 4, 51).is_none());
+        for i in 0..b.len() {
+            let mut v = b.clone();
+            v[i] ^= 0x10;
+            assert!(decode_index(&v, 3, 4, 50).is_none(), "flip at {i}");
+        }
+        for cut in [0, 10, 39, b.len() - 1] {
+            assert!(decode_index(&b[..cut], 3, 4, 50).is_none(), "cut at {cut}");
+        }
+        // a valid checksum over a body that lies about its entry count
+        let mut lie = b[..b.len() - 4].to_vec();
+        lie[32..36].copy_from_slice(&6u32.to_le_bytes());
+        let c = crc32c::crc32c(&lie);
+        lie.extend_from_slice(&c.to_le_bytes());
+        assert!(decode_index(&lie, 3, 4, 50).is_none());
+        let mut short = b[..b.len() - 4].to_vec();
+        short[32..36].copy_from_slice(&4u32.to_le_bytes());
+        let c = crc32c::crc32c(&short);
+        short.extend_from_slice(&c.to_le_bytes());
+        assert!(
+            decode_index(&short, 3, 4, 50).is_none(),
+            "trailing bytes after the entries"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_cache_holds_nothing() {
+        let mut c = TailCache::default();
+        c.push(rec(1, 10));
+        assert!(c.get(1).is_none());
+    }
 }

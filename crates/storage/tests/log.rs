@@ -725,3 +725,415 @@ fn opening_and_dropping_never_hangs() {
     rx.recv_timeout(std::time::Duration::from_secs(60))
         .expect("open/drop cycle hung");
 }
+
+// ---------------------------------------------------------------------------
+// Targeted tests from mutation testing: each pins a check whose mutation survived.
+
+fn seg_header_bytes(id: u64, generation: u64, base: u64) -> Vec<u8> {
+    let mut b = vec![];
+    b.extend_from_slice(b"PCSG");
+    b.extend_from_slice(&1u32.to_le_bytes());
+    for v in [id, generation, base] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    let c = crc32c::crc32c(&b);
+    b.extend_from_slice(&c.to_le_bytes());
+    b
+}
+
+fn header_of(seg: &Path) -> (u64, u64, u64) {
+    let b = std::fs::read(seg).unwrap();
+    let u = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    (u(8), u(16), u(24))
+}
+
+#[test]
+fn a_clean_restart_uses_the_index_files_and_rebuilds_none() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+    }
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    let s = log.stats();
+    assert_eq!(s.index_rebuilds, 0, "{s:?}");
+    assert!(
+        s.recovery_scanned_bytes > 0 && s.recovery_scanned_bytes <= 64 * KB,
+        "{s:?}"
+    );
+    drop(log);
+    // drop one index: exactly one rebuild, then the rewritten index is used again
+    let segs = segment_files(d.path());
+    std::fs::remove_file(segs[1].with_extension("idx")).unwrap();
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert_eq!(log.stats().index_rebuilds, 1);
+    drop(log);
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert_eq!(
+        log.stats().index_rebuilds,
+        0,
+        "the rebuilt index was written back"
+    );
+    check_all(&log, 0, 200, 1000);
+}
+
+#[test]
+fn reader_entries_and_bounds_across_segments() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    fill(&mut log, 0, 100, 2, 1000);
+    let r = log.reader();
+    assert_eq!((r.first_lsn(), r.next_lsn()), (0, 200));
+    let all = r.entries(0, usize::MAX);
+    assert_eq!(
+        all.iter().map(|e| e.lsn).collect::<Vec<_>>(),
+        (0..200).collect::<Vec<_>>()
+    );
+    assert!(
+        all.first().unwrap().segment != all.last().unwrap().segment,
+        "spans segments"
+    );
+    for (from, limit) in [(0, 1), (37, 50), (59, 120), (150, 1000), (199, 5)] {
+        let e = r.entries(from, limit);
+        let want: Vec<u64> = (from..(from + limit as u64).min(200)).collect();
+        assert_eq!(
+            e.iter().map(|x| x.lsn).collect::<Vec<_>>(),
+            want,
+            "from {from} limit {limit}"
+        );
+    }
+    assert!(r.entries(200, 10).is_empty());
+    assert!(r.entries(0, 0).is_empty());
+    let floor = log.retain(Some(2 * 64 * KB), None).unwrap();
+    let r = log.reader();
+    assert_eq!(r.first_lsn(), floor);
+    assert_eq!(
+        r.entries(0, 3)[0].lsn,
+        floor,
+        "entries start at the retention floor"
+    );
+}
+
+#[test]
+fn appends_at_the_exact_size_limits() {
+    let d = tempfile::tempdir().unwrap();
+    let seg = 20 << 20;
+    let mut log = Log::open(cfg(d.path(), seg)).unwrap();
+    // a key of exactly MAX_KEY and a record of exactly MAX_RECORD bytes are accepted
+    let mut m = meta(0);
+    m.key = vec![b'k'; record::MAX_KEY];
+    log.append(&[(m.clone(), b"x")]).unwrap();
+    let big = vec![1u8; record::MAX_RECORD - record::HEADER - 5];
+    let mut m5 = meta(1);
+    m5.key = b"12345".to_vec();
+    log.append(&[(m5, &big[..])]).unwrap();
+    assert_eq!(log.next_lsn(), 2);
+    let mut c = Config::new(d.path().join("small"));
+    c.segment_size = 64 * KB;
+    c.tail_cache_bytes = 0; // reads below go to the file, through the in-memory index
+    let mut log = Log::open(c.clone()).unwrap();
+    let room = 64 * KB as usize - 4096;
+    let key = 0usize;
+    // one record whose padded size is exactly the room of a segment: fits, no roll
+    let exact = vec![2u8; room - record::HEADER - key];
+    log.append(&[(Meta::default(), &exact[..])]).unwrap();
+    assert_eq!(log.stats().segments, 1, "{:?}", log.stats());
+    let too_big = vec![2u8; room - record::HEADER - key + 8];
+    assert!(matches!(
+        log.append(&[(Meta::default(), &too_big[..])]),
+        Err(Error::Invalid(_))
+    ));
+    // the next append rolls into a new segment
+    log.append(&[(Meta::default(), b"next")]).unwrap();
+    assert_eq!(log.stats().segments, 2);
+    let r = log.reader();
+    assert_eq!(r.read(0).unwrap().unwrap().payload.len(), exact.len());
+    assert_eq!(&r.read(1).unwrap().unwrap().payload[..], b"next");
+    let s = log.stats();
+    assert_eq!(s.bytes, (room + record::encoded_len(0, 4)) as u64, "{s:?}");
+    assert_eq!(
+        s.log_bytes,
+        64 * KB + 4096 + record::encoded_len(0, 4) as u64
+    );
+}
+
+#[test]
+fn retention_boundaries_are_exact() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 64 * KB);
+    c.spares = 0;
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 100, 2, 1000);
+    let total = log.stats().log_bytes;
+    assert_eq!(
+        log.retain(Some(total), None).unwrap(),
+        0,
+        "at the limit: nothing dropped"
+    );
+    let segs_before = log.stats().segments;
+    let floor = log.retain(Some(total - 1), None).unwrap();
+    assert!(floor > 0);
+    assert_eq!(
+        log.stats().segments,
+        segs_before - 1,
+        "one byte over: exactly one segment dropped"
+    );
+    // by age: the next segment's newest record has time 1000 + (its last lsn)
+    let e = log.reader().entries(floor, 1000);
+    let first_seg = e[0].segment;
+    let last_lsn = e
+        .iter()
+        .filter(|x| x.segment == first_seg)
+        .last()
+        .unwrap()
+        .lsn;
+    assert_eq!(
+        log.retain(None, Some(1000 + last_lsn)).unwrap(),
+        floor,
+        "not older than the cutoff"
+    );
+    let f2 = log.retain(None, Some(1000 + last_lsn + 1)).unwrap();
+    assert_eq!(f2, last_lsn + 1, "older by one: that segment goes");
+}
+
+#[test]
+fn retention_recycles_at_most_two_files_per_spare_slot() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 64 * KB);
+    c.spares = 0; // no preallocator: the pool holds only recycled files
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 200, 2, 1000);
+    let segs = log.stats().segments;
+    assert!(segs >= 7);
+    log.retain(Some(64 * KB), None).unwrap();
+    assert_eq!(log.stats().recycled, 2, "{:?}", log.stats());
+    let spares = std::fs::read_dir(d.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("spare-")
+        })
+        .count();
+    assert_eq!(spares, 2);
+}
+
+#[test]
+fn wrong_sized_spares_are_discarded_on_open() {
+    let d = tempfile::tempdir().unwrap();
+    drop(Log::open(cfg(d.path(), 64 * KB)).unwrap());
+    std::fs::write(d.path().join("spare-00000099.log"), b"short").unwrap();
+    std::fs::write(d.path().join("spare-tmp-5"), b"partial").unwrap();
+    drop(Log::open(cfg(d.path(), 64 * KB)).unwrap());
+    assert!(!d.path().join("spare-00000099.log").exists());
+    assert!(!d.path().join("spare-tmp-5").exists());
+}
+
+#[test]
+fn a_header_with_a_valid_checksum_but_the_wrong_identity_is_refused() {
+    for field in ["generation", "base"] {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+            fill(&mut log, 0, 100, 2, 1000);
+        }
+        let segs = segment_files(d.path());
+        let (id, g, b) = header_of(&segs[1]);
+        let h = match field {
+            "generation" => seg_header_bytes(id, g + 1, b),
+            _ => seg_header_bytes(id, g, b + 1),
+        };
+        patch(&segs[1], 0, &h);
+        assert!(
+            matches!(Log::open(cfg(d.path(), 64 * KB)), Err(Error::Corrupt(_))),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn a_recycled_head_segment_moves_the_floor_exactly() {
+    // retention renamed the oldest segment's file away but its manifest write was lost: the
+    // file now holds another header (here: zeros)
+    let d = tempfile::tempdir().unwrap();
+    let second_base;
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+        let e = log.reader().entries(0, 1000);
+        second_base = e.iter().find(|x| x.segment != e[0].segment).unwrap().lsn;
+    }
+    let segs = segment_files(d.path());
+    patch(&segs[0], 0, &[0u8; 64]);
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert_eq!(log.first_lsn(), second_base);
+    assert!(log.reader().read(second_base - 1).unwrap().is_none());
+    check_all(&log, second_base, 200, 1000);
+    drop(log);
+    // a missing head file (not just a recycled one) gives the same floor
+    let d2 = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d2.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+    }
+    std::fs::remove_file(&segment_files(d2.path())[0]).unwrap();
+    assert_eq!(
+        Log::open(cfg(d2.path(), 64 * KB)).unwrap().first_lsn(),
+        second_base
+    );
+}
+
+/// Writes a well-formed record of the active segment's generation right after its last record.
+fn plant(d: &Path, lsn_delta: i64, group_delta: i64) -> u64 {
+    let active = segment_files(d).pop().unwrap();
+    let (_, generation, base) = header_of(&active);
+    let data = std::fs::read(&active).unwrap();
+    let mut off = 4096usize;
+    let mut n = 0u64;
+    while let record::Decoded::Record { next, .. } = record::decode(&data, off, generation) {
+        off = next;
+        n += 1;
+    }
+    let mut buf = vec![];
+    let lsn = (base + n) as i64 + lsn_delta;
+    let group = off as i64 + group_delta;
+    record::encode(
+        &mut buf,
+        generation,
+        group as u64,
+        lsn as u64,
+        &meta(9),
+        b"planted",
+    );
+    patch(&active, off as u64, &buf);
+    off as u64
+}
+
+#[test]
+fn records_out_of_sequence_or_outside_their_group_end_the_log() {
+    for (lsn_delta, group_delta) in [(5, 0), (0, 8)] {
+        let d = tempfile::tempdir().unwrap();
+        {
+            let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+            fill(&mut log, 0, 10, 1, 100);
+        }
+        let at = plant(d.path(), lsn_delta, group_delta);
+        let log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+        assert_eq!(log.next_lsn(), 10, "lsn {lsn_delta} group {group_delta}");
+        drop(log);
+        // it was written (same generation): recovery zeroes it so it can never come back
+        let active = segment_files(d.path()).pop().unwrap();
+        let b = std::fs::read(&active).unwrap();
+        assert!(
+            b[at as usize..at as usize + 64].iter().all(|&x| x == 0),
+            "planted record left on disk"
+        );
+    }
+}
+
+#[test]
+fn stale_records_of_another_generation_are_left_alone() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+        fill(&mut log, 0, 10, 1, 100);
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    let (_, generation, _) = header_of(&active);
+    let data = std::fs::read(&active).unwrap();
+    let mut off = 4096usize;
+    while let record::Decoded::Record { next, .. } = record::decode(&data, off, generation) {
+        off = next;
+    }
+    let mut buf = vec![];
+    record::encode(&mut buf, generation + 7, off as u64, 10, &meta(9), b"stale");
+    patch(&active, off as u64, &buf);
+    let log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+    assert_eq!(log.next_lsn(), 10);
+    drop(log);
+    let b = std::fs::read(&active).unwrap();
+    assert_eq!(
+        &b[off..off + buf.len()],
+        &buf[..],
+        "a clean end: nothing to zero"
+    );
+}
+
+#[test]
+fn adopted_segments_keep_generations_unique() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 70, 2, 1000);
+    }
+    let m = d.path().join("MANIFEST");
+    let mut mf = std::fs::read(&m).unwrap();
+    let slot = mf.len() / 2;
+    let seq = |b: &[u8], o: usize| u64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap());
+    let newest = if seq(&mf, 0) > seq(&mf, slot) {
+        0
+    } else {
+        slot
+    };
+    mf[newest + 20] ^= 0xFF;
+    std::fs::write(&m, &mf).unwrap();
+    let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert!(
+        log.stats().recovery_scanned_bytes > 64 * KB,
+        "two segments scanned: one adopted"
+    );
+    fill(&mut log, 140, 60, 2, 1000); // more rolls after the adoption
+    drop(log);
+    let gens: Vec<u64> = segment_files(d.path())
+        .iter()
+        .map(|p| header_of(p).1)
+        .collect();
+    let mut u = gens.clone();
+    u.sort();
+    u.dedup();
+    assert_eq!(u.len(), gens.len(), "generations {gens:?}");
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    check_all(&log, 0, 260, 1000);
+}
+
+#[test]
+fn recovery_of_an_active_segment_larger_than_its_read_buffer() {
+    // ~26 MiB in the active segment: the scan refills past its first 16 MiB read, and the
+    // torn-group search continues past what the scan had buffered
+    let d = tempfile::tempdir().unwrap();
+    let seg = 48 << 20;
+    let last;
+    {
+        let mut log = Log::open(cfg(d.path(), seg)).unwrap();
+        fill(&mut log, 0, 440, 4, 15_000);
+        last = log.reader().entries(1756, 4);
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    // the first record of the last group is damaged, the rest of the group reached disk
+    patch(&active, last[0].offset + 8, &[0xFF; 4]);
+    let log = Log::open(cfg(d.path(), seg)).unwrap();
+    assert_eq!(log.next_lsn(), 1756);
+    check_all(&log, 1700, 1756, 15_000);
+    let s = log.stats();
+    assert!(s.recovery_scanned_bytes > 16 << 20, "{s:?}");
+}
+
+#[test]
+fn interior_damage_far_from_the_end_of_a_large_segment_fails_closed() {
+    let d = tempfile::tempdir().unwrap();
+    let seg = 48 << 20;
+    let early;
+    {
+        let mut log = Log::open(cfg(d.path(), seg)).unwrap();
+        fill(&mut log, 0, 400, 4, 15_000);
+        early = log.reader().entries(1200, 1)[0].offset; // ~18 MiB in
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, early + 8, &[0xFF; 4]);
+    assert!(matches!(
+        Log::open(cfg(d.path(), seg)),
+        Err(Error::Corrupt(_))
+    ));
+}
