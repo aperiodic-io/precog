@@ -106,11 +106,7 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
 /// Validates and decodes the record at `buf[off..]`.
 pub fn decode(buf: &[u8], off: usize, generation: u64) -> Decoded<'_> {
     if buf.len() < off + HEADER {
-        return if buf.len() > off && buf[off..].iter().all(|&b| b == 0) {
-            Decoded::Invalid
-        } else {
-            Decoded::Short
-        };
+        return Decoded::Short;
     }
     let b = &buf[off..];
     if u32_at(b, 0) != MAGIC {
@@ -219,7 +215,7 @@ mod tests {
         encode(&mut buf, 7, 0, 1, &meta(), b"x");
         assert_eq!(decode(&buf, 0, 8), Decoded::Invalid);
         assert_eq!(decode(&[0u8; 200], 0, 7), Decoded::Invalid);
-        assert_eq!(decode(&[0u8; 10], 0, 7), Decoded::Invalid);
+        assert_eq!(decode(&[0u8; 10], 0, 7), Decoded::Short);
     }
 
     /// Re-encodes a record's header field and its checksum, so only the field is wrong.

@@ -240,7 +240,8 @@ impl Reader {
                 continue;
             }
             let mut lsn = from.max(seg.base_lsn);
-            while lsn < seg_end && lsn < end && out.len() < limit {
+            let stop = seg_end.min(end);
+            while lsn < stop && out.len() < limit {
                 let e = &ents[(lsn - seg.base_lsn) as usize];
                 out.push(Entry {
                     lsn,
@@ -1231,7 +1232,7 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     let mut group = SEG_HEADER;
     let mut stopped_on_written = false;
     while off < limit {
-        let rel = w.cover(off, (off + MAX_SCAN).min(limit))?;
+        let rel = w.cover_ahead(off, limit)?;
         match record::decode(&w.buf, rel, generation) {
             Decoded::Record {
                 header, key, next, ..
@@ -1273,21 +1274,17 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     // the window a torn group can span: one of a later group means interior damage; ones of the
     // torn group itself mean the group reached disk in part.
     let x = s.end;
-    let window_end = (x + 2 * MAX_GROUP as u64 + record::MAX_RECORD as u64).min(len);
+    let window_end = x.saturating_add(SEARCH_WINDOW).min(len);
     let mut later = None;
     let mut torn: Option<u64> = None;
     // a record of this generation was written at x but fails validation: damage, not a clean end
-    let mut dirty = if stopped_on_written {
-        x + record::HEADER as u64
-    } else {
-        x
-    };
+    let mut dirty = x + u64::from(stopped_on_written);
     let mut pos = x + 8;
-    while pos + record::HEADER as u64 <= window_end {
-        let rel = w.cover(pos, (pos + MAX_SCAN).min(window_end))?;
+    while pos < window_end {
+        let rel = w.cover_ahead(pos, window_end)?;
         if w.written_at(rel, generation) {
-            dirty =
-                dirty.max(pos + (u32_at(&w.buf[rel..], 4) as u64).min(record::MAX_RECORD as u64));
+            // zeroing a record's header is enough to make it unreadable for good
+            dirty = dirty.max(pos + record::HEADER as u64);
             if let Decoded::Record { header, next, .. } = record::decode(&w.buf, rel, generation) {
                 if header.group_start > x {
                     later = Some(header.group_start);
@@ -1325,8 +1322,9 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     Ok(s)
 }
 
-/// How far ahead the scan keeps the file buffered: one maximal record and its header.
-const MAX_SCAN: u64 = (record::MAX_RECORD + record::HEADER) as u64;
+/// How far past a torn write recovery looks for later records: a torn group spans at most
+/// MAX_GROUP bytes, so a later group must start within this window.
+const SEARCH_WINDOW: u64 = (2 * MAX_GROUP + record::MAX_RECORD) as u64;
 
 /// A buffered view of a file region for scanning, read ahead in large chunks.
 struct Window<'a> {
@@ -1360,6 +1358,12 @@ impl Window<'_> {
             self.scanned += upto - have;
         }
         Ok((from - self.start) as usize)
+    }
+
+    /// Covers `[from, min(from + one maximal record, limit))`: enough to decode any record there.
+    fn cover_ahead(&mut self, from: u64, limit: u64) -> Result<usize> {
+        const MAX_SCAN: u64 = (record::MAX_RECORD + record::HEADER) as u64;
+        self.cover(from, from.saturating_add(MAX_SCAN).min(limit))
     }
 
     /// Bytes at `rel` start with this generation's record magic: something was written there.
@@ -1442,9 +1446,15 @@ mod tests {
         let mut long = b.clone();
         long[16..20].copy_from_slice(&((MF_SLOT - 23) as u32).to_le_bytes());
         assert!(Manifest::decode(&long).is_none());
-        let mut v = b.clone();
-        v[4] = 9; // version
-        assert!(Manifest::decode(&v).is_none());
+        // a wrong magic or version is refused even under a valid checksum
+        for (at, bad) in [(0, 0xdead_beef_u32), (4, 9)] {
+            let mut v = b.clone();
+            v[at..at + 4].copy_from_slice(&bad.to_le_bytes());
+            let len = u32_at(&v, 16) as usize;
+            let c = crc32c::crc32c_append(crc32c::crc32c(&v[..20]), &v[24..24 + len]);
+            v[20..24].copy_from_slice(&c.to_le_bytes());
+            assert!(Manifest::decode(&v).is_none(), "field at {at}");
+        }
     }
 
     fn header_with(magic: u32, version: u32, id: u64, generation: u64, base: Lsn) -> Vec<u8> {
@@ -1530,6 +1540,14 @@ mod tests {
         }
         for cut in [0, 10, 39, b.len() - 1] {
             assert!(decode_index(&b[..cut], 3, 4, 50).is_none(), "cut at {cut}");
+        }
+        // a wrong magic or version is refused even under a valid checksum
+        for (at, bad) in [(0, 0xdead_beef_u32), (4, 9)] {
+            let mut v = b[..b.len() - 4].to_vec();
+            v[at..at + 4].copy_from_slice(&bad.to_le_bytes());
+            let c = crc32c::crc32c(&v);
+            v.extend_from_slice(&c.to_le_bytes());
+            assert!(decode_index(&v, 3, 4, 50).is_none(), "field at {at}");
         }
         // a valid checksum over a body that lies about its entry count
         let mut lie = b[..b.len() - 4].to_vec();

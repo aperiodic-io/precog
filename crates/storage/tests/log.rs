@@ -552,6 +552,22 @@ fn a_fresh_log_is_ready_to_append_without_a_roll() {
 }
 
 #[test]
+fn without_spares_every_new_segment_is_a_counted_stall() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 64 * KB);
+    c.spares = 0;
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 200, 1, 1000);
+    let s = log.stats();
+    assert!(s.segments >= 3, "{s:?}");
+    assert_eq!(
+        (s.roll_stalls, s.spare_hits),
+        (s.segments as u64, 0),
+        "{s:?}"
+    );
+}
+
+#[test]
 fn the_tail_cache_is_bounded_and_older_reads_go_to_disk() {
     let d = tempfile::tempdir().unwrap();
     let mut c = cfg(d.path(), 1 << 20);
@@ -767,6 +783,12 @@ fn a_clean_restart_uses_the_index_files_and_rebuilds_none() {
     std::fs::remove_file(segs[1].with_extension("idx")).unwrap();
     let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
     assert_eq!(log.stats().index_rebuilds, 1);
+    // the rebuild read the whole sealed segment on top of the active one
+    assert!(
+        log.stats().recovery_scanned_bytes >= s.recovery_scanned_bytes + 32 * KB,
+        "{:?}",
+        log.stats()
+    );
     drop(log);
     let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
     assert_eq!(
@@ -881,12 +903,7 @@ fn retention_boundaries_are_exact() {
     // by age: the next segment's newest record has time 1000 + (its last lsn)
     let e = log.reader().entries(floor, 1000);
     let first_seg = e[0].segment;
-    let last_lsn = e
-        .iter()
-        .filter(|x| x.segment == first_seg)
-        .last()
-        .unwrap()
-        .lsn;
+    let last_lsn = e.iter().rfind(|x| x.segment == first_seg).unwrap().lsn;
     assert_eq!(
         log.retain(None, Some(1000 + last_lsn)).unwrap(),
         floor,

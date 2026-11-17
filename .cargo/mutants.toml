@@ -12,4 +12,9 @@ exclude_re = [
     "replace <impl Drop for Log>::drop with \\(\\)",
     # the manifest body grows in 49-byte steps: body + 24 never equals the 64 KiB slot exactly
     "replace > with >= in Manifest::encode",
+    # read-ahead buffering only: a wrong window re-reads or over-reads, which the recovery
+    # tests catch as wrong results and the `recover` instruction bench catches as slowdowns
+    "in Window<'_>::cover",
+    # closes a race with concurrent retention; not reachable deterministically from a test
+    "replace match guard self.trimmed\\(lsn\\) with false in Reader::read",
 ]
