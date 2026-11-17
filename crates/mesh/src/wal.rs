@@ -146,9 +146,7 @@ fn writer(
                 stats
                     .segments
                     .store(log.stats().segments as u64, Ordering::Relaxed);
-                if log_is_fatal(&r) {
-                    fatal.store(true, Ordering::Release);
-                }
+                fatal.store(log.is_fenced(), Ordering::Release);
                 let _ = done.send(r);
                 continue;
             }
@@ -182,7 +180,10 @@ fn writer(
                 (meta, &b.bytes[..])
             })
             .collect();
-        match log.append(&items) {
+        let r = log.append(&items);
+        // a fatal error fences the log for good; the node stops acknowledging until restart
+        fatal.store(log.is_fenced(), Ordering::Release);
+        match r {
             Ok(first) => {
                 let s = log.stats();
                 stats.syncs.store(s.syncs, Ordering::Relaxed);
@@ -193,10 +194,7 @@ fn writer(
                 }
             }
             Err(e) => {
-                if matches!(e, precog_storage::Error::Fatal(_)) {
-                    fatal.store(true, Ordering::Release);
-                    tracing::error!("storage fault, node fenced until restart: {e}");
-                }
+                tracing::error!("storage append failed: {e}");
                 let msg = e.to_string();
                 for (_, done) in group.drain(..) {
                     let _ = done.send(Err(msg.clone()));
@@ -204,8 +202,4 @@ fn writer(
             }
         }
     }
-}
-
-fn log_is_fatal(r: &Result<Lsn, String>) -> bool {
-    matches!(r, Err(e) if e.starts_with("fatal"))
 }

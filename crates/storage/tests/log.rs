@@ -119,6 +119,31 @@ fn rolls_segments_and_restart_scans_only_the_active_one() {
 }
 
 #[test]
+fn entries_report_each_payload_length_without_reading_it() {
+    // lengths that are not multiples of the 8-byte padding, from sealed and active segments,
+    // before and after a restart (index files and the recovery scan)
+    let d = tempfile::tempdir().unwrap();
+    let lens: Vec<usize> = (0..120).map(|i| 1 + i * 13 % 997).collect();
+    let mut log = Log::open(cfg(d.path(), 16 * KB)).unwrap();
+    for (i, &n) in lens.iter().enumerate() {
+        log.append(&[(meta(i as u64), &payload(i as u64, n)[..])])
+            .unwrap();
+    }
+    for pass in 0..2 {
+        let got: Vec<usize> = log
+            .reader()
+            .entries(0, 1000)
+            .iter()
+            .map(|e| e.payload_len as usize)
+            .collect();
+        assert_eq!(got, lens, "pass {pass}");
+        assert!(log.stats().segments > 2);
+        drop(log);
+        log = Log::open(cfg(d.path(), 16 * KB)).unwrap();
+    }
+}
+
+#[test]
 fn torn_final_group_is_dropped_even_if_later_pages_reached_disk() {
     let d = tempfile::tempdir().unwrap();
     let last_group_offset;
@@ -304,12 +329,15 @@ fn a_failed_fsync_is_fatal() {
     c.failpoints.fail_data_sync_after = Some(3);
     let mut log = Log::open(c).unwrap();
     fill(&mut log, 0, 3, 1, 100);
+    assert!(!log.is_fenced());
     let m = meta(3);
     let p = payload(3, 100);
     assert!(matches!(
         log.append(&[(m.clone(), &p[..])]),
         Err(Error::Fatal(_))
     ));
+    assert!(log.is_fenced());
+    assert!(matches!(log.retain(Some(0), None), Err(Error::Fatal(_))));
     assert!(
         matches!(log.append(&[(m, &p[..])]), Err(Error::Fatal(_))),
         "stays fatal"

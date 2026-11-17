@@ -182,6 +182,24 @@ async fn iroh_replication_degraded_and_repair() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_fails_over_to_the_next_node_when_its_preferred_one_is_down() {
+    let c = cluster(3, false, &["a", "b", "c"]);
+    // node 2 is down: a client preferring it wraps around to node 0
+    for i in 0..2 {
+        start(&c, i).await;
+    }
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let b = Batch::encode(&log, 0, &[(1, b"x")]).unwrap();
+    let r = mc.append(2, &b, 1).await.unwrap();
+    assert_eq!((r.node, r.attempts), (0, 2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idempotent_retry_and_conflict() {
     let c = cluster(3, false, &["a", "b", "c"]);
     for i in 0..3 {

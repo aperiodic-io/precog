@@ -97,6 +97,7 @@ pub struct Entry {
     pub lsn: Lsn,
     pub segment: u64,
     pub offset: u64,
+    pub payload_len: u32,
     pub meta: Meta,
 }
 
@@ -247,6 +248,7 @@ impl Reader {
                     lsn,
                     segment: seg.id,
                     offset: e.offset,
+                    payload_len: e.len - (record::HEADER + e.meta.key.len()) as u32,
                     meta: e.meta.clone(),
                 });
                 lsn += 1;
@@ -891,6 +893,11 @@ impl Log {
 
     pub fn first_lsn(&self) -> Lsn {
         self.shared.first_lsn.load(Ordering::Acquire)
+    }
+
+    /// A fatal error refused all further writes; reopen to recover.
+    pub fn is_fenced(&self) -> bool {
+        self.failed.is_some()
     }
 
     pub fn stats(&self) -> Stats {

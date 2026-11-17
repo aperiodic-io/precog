@@ -2,7 +2,9 @@
 # integration test. The acceptance suite (real processes, minutes) is not run per mutant.
 test_tool = "nextest"
 # benchmarks, examples and the comparison crates are not production logic
-exclude_globs = ["crates/*/benches/**", "crates/*/examples/**", "crates/storage-bench/**", "crates/bench/**"]
+exclude_globs = ["crates/*/benches/**", "crates/*/examples/**", "crates/storage-bench/**", "crates/bench/**",
+    # the CLI is driven end to end by the acceptance suite, which is not run per mutant
+    "crates/mesh/src/bin/**"]
 # Equivalent or not observable in-process; each listed with why:
 exclude_re = [
     # directory fsync: only a power cut between rename and fsync tells it apart
@@ -17,6 +19,11 @@ exclude_re = [
     # the two scan loop bounds (`while off < limit`, `while pos < window_end`, both column 15):
     # one more pass at the bound decodes an empty window (Short) or skips unwritten bytes
     ":15: replace < with <= in scan",
+    # the node's serve-forever loop: only real processes (the acceptance suite) reach it
+    "replace Node::run -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
+    # how many appends share one fsync: throughput only, held by the perf gate
+    "replace \\+= with \\*= in writer",
+    "wal\\.rs:\\d+:\\d+: replace << with >>$",
     # closes a race with concurrent retention; not reachable deterministically from a test
     "replace match guard self.trimmed\\(lsn\\) with false in Reader::read",
 ]

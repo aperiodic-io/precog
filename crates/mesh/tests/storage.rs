@@ -87,6 +87,41 @@ async fn retention_trims_the_log_and_the_metadata() {
     assert!(node.store.get(&id(399)).is_some());
     let f = node.store.frontiers(None);
     assert_eq!(f[0].high, 400);
+    assert!(!node.is_fatal(), "retention does not fence a healthy node");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn age_retention_drops_sealed_segments_older_than_the_limit() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    c.retention_ms = Some(60_000);
+    let (node, _) = Node::open(c.clone()).await.unwrap();
+    append_n(&node, "w", 200, 1000).await;
+    node.apply_retention().await.unwrap();
+    assert_eq!(node.store.totals().0, 200, "nothing is a minute old yet");
+    drop(node);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    c.retention_ms = Some(10);
+    let (node, _) = Node::open(c).await.unwrap();
+    node.apply_retention().await.unwrap();
+    let kept = node.store.totals().0;
+    assert!(
+        kept > 0 && kept < 200,
+        "kept {kept}: only the active segment stays"
+    );
+}
+
+#[test]
+fn omitted_config_fields_take_production_defaults() {
+    let c: NodeConfig = serde_json::from_str(
+        r#"{"id":0,"domain":"a","data_dir":"/d","token":"t","listen_tcp":null,
+            "listen_iroh":null,"peers":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(c.segment_size, 1 << 30);
+    assert_eq!(c.tail_cache_bytes, 64 << 20);
+    assert_eq!(c.retention_interval_ms, 10_000);
+    assert_eq!((c.retention_bytes, c.retention_ms), (None, None));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -96,6 +131,7 @@ async fn a_storage_fault_fences_the_node() {
     c.storage_failpoints.fail_data_sync_after = Some(5);
     let (node, _) = Node::open(c).await.unwrap();
     append_n(&node, "w", 5, 100).await;
+    assert!(!node.is_fatal());
     let ack = node.append(1, batch("w", 5, 100)).await;
     assert!(!ack.is_success(), "{ack:?}");
     assert!(node.is_fatal());

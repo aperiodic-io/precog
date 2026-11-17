@@ -107,7 +107,7 @@ impl Store {
                     end: e.meta.first_seq + e.meta.count as u64,
                     count: e.meta.count,
                     crc: e.meta.tag,
-                    len: 0,
+                    len: e.payload_len,
                 };
                 let map = inner.logs.entry(log.clone()).or_default();
                 if let Some((&s0, x)) = map.range(..=id.first_seq).next_back()
@@ -126,12 +126,12 @@ impl Store {
                         id.first_seq
                     );
                 }
-                let len = s.reader.read(e.lsn)?.map_or(0, |r| r.payload.len() as u32);
+                let len = shape.len;
                 let (tx, _) = watch::channel(State::Durable);
                 map.insert(
                     id.first_seq,
                     Entry {
-                        shape: Shape { len, ..shape },
+                        shape,
                         lsn: Some(e.lsn),
                         state: tx,
                     },
@@ -640,5 +640,100 @@ mod tests {
         assert_eq!(s2.totals(), t.s.totals());
         assert_eq!(s2.frontiers(None), t.s.frontiers(None));
         assert_eq!(s2.get(&xs[3].id).unwrap().bytes, xs[3].bytes);
+    }
+
+    impl T {
+        fn log_only(&mut self, x: &Batch, crc: u32) {
+            let m = Meta {
+                key: encode_log_key(&x.id.log),
+                first_seq: x.id.first_seq,
+                count: x.count,
+                tag: crc,
+                time_ms: 0,
+            };
+            self.log.append(&[(m, &x.bytes[..])]).unwrap();
+        }
+        fn reload(&self) -> anyhow::Result<Store> {
+            let r = self.log.reader();
+            Store::load(r.clone(), r.entries(0, 1000))
+        }
+    }
+
+    #[test]
+    fn load_keeps_a_batch_logged_twice_once_and_refuses_conflicting_ones() {
+        let mut t = store();
+        let a = b("w", 1, 0, &[(1, b"a"), (2, b"bb")]);
+        let crc = batch_crc(&a.bytes);
+        t.log_only(&a, crc);
+        t.log_only(&a, crc); // a repair raced a replicate
+        let s = t.reload().unwrap();
+        assert_eq!(s.totals(), (1, 2, a.bytes.len() as u64));
+        assert!(
+            matches!(s.reserve(&a), Reserve::Duplicate(_)),
+            "retry after restart"
+        );
+        assert!(s.has(&a.id, crc));
+        // same first_seq, other content
+        let mut t = store();
+        t.log_only(&a, crc);
+        t.log_only(&a, crc ^ 1);
+        assert!(t.reload().is_err());
+        // a later first_seq inside the stored batch
+        let mut t = store();
+        t.log_only(&a, crc);
+        t.log_only(&b("w", 1, 1, &[(1, b"x")]), 7);
+        assert!(t.reload().is_err());
+        // adjacent batches are fine
+        let mut t = store();
+        t.log_only(&a, crc);
+        let c = b("w", 1, 2, &[(1, b"x")]);
+        t.log_only(&c, batch_crc(&c.bytes));
+        assert_eq!(t.reload().unwrap().totals().0, 2);
+    }
+
+    #[test]
+    fn trim_keeps_totals_and_the_boundary_batch_exact() {
+        let mut t = store();
+        let xs: Vec<Batch> = (0..6).map(|i| b("w", 1, i, &[(i, b"xyz")])).collect();
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        t.s.trim(3);
+        let len = xs[0].bytes.len() as u64;
+        assert_eq!(t.s.totals(), (3, 3, 3 * len));
+        // the first kept batch is a duplicate, not expired, and needs its own checksum
+        assert!(matches!(t.s.reserve(&xs[3]), Reserve::Duplicate(_)));
+        assert!(t.s.has(&xs[3].id, batch_crc(&xs[3].bytes)));
+        assert!(!t.s.has(&xs[3].id, 0));
+    }
+
+    #[test]
+    fn has_needs_a_durable_copy_with_the_same_checksum() {
+        let mut t = store();
+        let a = b("w", 1, 0, &[(1, b"a")]);
+        let crc = batch_crc(&a.bytes);
+        t.s.reserve(&a);
+        assert!(!t.s.has(&a.id, crc), "reserved is not durable");
+        t.durable(&a);
+        assert!(t.s.has(&a.id, crc));
+        assert!(!t.s.has(&a.id, crc ^ 1));
+        let other = b("v", 1, 0, &[(1, b"a")]);
+        assert!(!t.s.has(&other.id, crc));
+    }
+
+    #[test]
+    fn tail_stops_near_max_bytes_and_frontiers_filter_by_stream() {
+        let mut t = store();
+        let xs: Vec<Batch> = (0..10).map(|i| b("w", 1, i, &[(i, &[7; 100])])).collect();
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        let one = xs[0].bytes.len();
+        let (got, next) = t.s.tail(0, None, 3 * one);
+        assert_eq!((got.len(), next), (3, 3));
+        assert_eq!(t.s.frontiers(Some("s")).len(), 1);
+        assert!(t.s.frontiers(Some("other")).is_empty());
     }
 }
