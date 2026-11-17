@@ -2,7 +2,10 @@
 """Wall-clock perf gate: a pull request's binaries against its merge base's, on one runner.
 
 Each metric runs base and head alternately (ABAB...) so that runner noise hits both, and
-compares medians. The gate fails when head's median is below (1 - threshold) x base's.
+compares the best run of each: noise on a shared runner (another tenant's fsyncs, CPU steal)
+only ever slows a run down, so the best run is the stable estimate. Identical binaries gave
+medians 25% apart on ubuntu-latest; their best runs stay within the threshold. The gate fails
+when head's best is below (1 - threshold) x base's.
 
   gate.py --base DIR --head DIR [--runs 5] [--threshold 0.15]
 
@@ -17,7 +20,6 @@ import os
 import shutil
 import signal
 import socket
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -88,12 +90,12 @@ def main():
                 v = fn(d, k)
                 acc.append(v)
                 print(f"{name} [{side}]: {v:,.1f}", flush=True)
-        b, h = statistics.median(base), statistics.median(head)
+        b, h = max(base), max(head)
         ratio = h / b if b else 0
         ok = ratio >= 1 - a.threshold
         failed |= not ok
         rows.append(f"| {name} | {b:,.1f} | {h:,.1f} | {ratio:.3f} | {'ok' if ok else 'REGRESSED'} |")
-    table = "\n".join(["| metric | base (median) | head (median) | head/base | |", "|---|---:|---:|---:|---|"] + rows)
+    table = "\n".join(["| metric | base (best) | head (best) | head/base | |", "|---|---:|---:|---:|---|"] + rows)
     print(table)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
