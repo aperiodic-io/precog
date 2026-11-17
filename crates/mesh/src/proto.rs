@@ -348,6 +348,28 @@ impl Ack {
     }
 }
 
+/// Storage key of a writer log: `u16 len | stream | u16 len | writer | u64 epoch`.
+pub fn encode_log_key(log: &LogId) -> Vec<u8> {
+    let mut v = Vec::with_capacity(12 + log.stream.len() + log.writer.len());
+    v.extend_from_slice(&(log.stream.len() as u16).to_le_bytes());
+    v.extend_from_slice(log.stream.as_bytes());
+    v.extend_from_slice(&(log.writer.len() as u16).to_le_bytes());
+    v.extend_from_slice(log.writer.as_bytes());
+    v.extend_from_slice(&log.epoch.to_le_bytes());
+    v
+}
+
+pub fn decode_log_key(mut b: &[u8]) -> Result<LogId> {
+    let stream = take_str(&mut b)?;
+    let writer = take_str(&mut b)?;
+    ensure!(b.len() == 8, "bad log key");
+    Ok(LogId {
+        stream,
+        writer,
+        epoch: u64::from_le_bytes(b.try_into().unwrap()),
+    })
+}
+
 pub fn batch_crc(batch: &Bytes) -> u32 {
     u32::from_le_bytes(batch[batch.len() - 4..].try_into().unwrap())
 }
@@ -487,6 +509,13 @@ mod tests {
             );
         }
         assert!(Batch::parse(b.slice(..b.len() - 1)).is_err());
+    }
+
+    #[test]
+    fn log_key_roundtrip() {
+        let l = log();
+        assert_eq!(decode_log_key(&encode_log_key(&l)).unwrap(), l);
+        assert!(decode_log_key(&encode_log_key(&l)[..5]).is_err());
     }
 
     #[test]

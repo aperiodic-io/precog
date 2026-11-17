@@ -145,11 +145,28 @@ impl MeshClient {
 impl MeshClient {
     /// Opens a live subscription on one node. Delivers every batch that
     /// becomes durable on that node, per writer log in sequence order.
-    pub async fn subscribe(&self, node: usize, stream: Option<&str>, from_start: bool) -> Result<Subscription> {
+    pub async fn subscribe(
+        &self,
+        node: usize,
+        stream: Option<&str>,
+        from_start: bool,
+    ) -> Result<Subscription> {
         let c = self.link(node).await?;
-        let body = serde_json::to_vec(&Subscribe { stream: stream.map(str::to_owned), from_start })?;
-        let rx = c.subscribe(Kind::Subscribe, Bytes::from(body), 1024).await?;
-        Ok(Subscription { rx, from_start, next: Default::default(), held: Default::default(), ready: Default::default(), _conn: c })
+        let body = serde_json::to_vec(&Subscribe {
+            stream: stream.map(str::to_owned),
+            from_start,
+        })?;
+        let rx = c
+            .subscribe(Kind::Subscribe, Bytes::from(body), 1024)
+            .await?;
+        Ok(Subscription {
+            rx,
+            from_start,
+            next: Default::default(),
+            held: Default::default(),
+            ready: Default::default(),
+            _conn: c,
+        })
     }
 }
 
@@ -176,7 +193,10 @@ impl Subscription {
             }
             let f = self.rx.recv().await?;
             if f.kind == Kind::Error {
-                return Some(Err(anyhow::anyhow!("subscription refused: {}", String::from_utf8_lossy(&f.body))));
+                return Some(Err(anyhow::anyhow!(
+                    "subscription refused: {}",
+                    String::from_utf8_lossy(&f.body)
+                )));
             }
             let b = match Batch::parse(f.body) {
                 Ok(b) => b,

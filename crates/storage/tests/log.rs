@@ -447,3 +447,90 @@ mod property {
         }
     }
 }
+
+#[test]
+fn damaged_sealed_segment_without_index_fails_closed() {
+    let d = tempfile::tempdir().unwrap();
+    let off;
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+        off = log.reader().entries(5, 1)[0].offset;
+    }
+    let first = segment_files(d.path())[0].clone();
+    std::fs::remove_file(first.with_extension("idx")).unwrap();
+    patch(&first, off + record::HEADER as u64 + 20, &[0x77]);
+    assert!(matches!(
+        Log::open(cfg(d.path(), 64 * KB)),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn segments_missing_at_the_head_count_as_retained() {
+    // a retention that recycled files but crashed before its manifest write was durable
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 150, 2, 1000);
+    }
+    let segs = segment_files(d.path());
+    std::fs::remove_file(&segs[0]).unwrap();
+    std::fs::remove_file(&segs[1]).unwrap();
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert!(log.first_lsn() > 0);
+    assert_eq!(log.next_lsn(), 300);
+    check_all(&log, log.first_lsn(), 300, 1000);
+    // a hole in the middle is not retention
+    drop(log);
+    let segs = segment_files(d.path());
+    std::fs::remove_file(&segs[1]).unwrap();
+    assert!(matches!(
+        Log::open(cfg(d.path(), 64 * KB)),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+mod flips {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+
+        /// Arbitrary damage confined to the last write never stops recovery, and what is
+        /// recovered is a prefix of what was written, byte for byte.
+        #[test]
+        fn damage_in_the_last_write_recovers_a_prefix(
+            groups in proptest::collection::vec(1usize..4, 1..8),
+            flips in proptest::collection::vec((0.0f64..1.0, any::<u8>()), 1..6),
+        ) {
+            let d = tempfile::tempdir().unwrap();
+            let (last_start, last_end, total);
+            {
+                let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+                let mut i = 0u64;
+                for g in &groups {
+                    fill(&mut log, i, 1, *g as u64, 400);
+                    i += *g as u64;
+                }
+                total = log.next_lsn();
+                let e = log.reader().entries(0, total as usize);
+                let last_g = *groups.last().unwrap() as u64;
+                last_start = e[(total - last_g) as usize].offset;
+                let l = e.last().unwrap();
+                last_end = l.offset + (record::HEADER + l.meta.key.len() + 400) as u64;
+            }
+            let active = segment_files(d.path()).pop().unwrap();
+            for (f, x) in flips {
+                let at = last_start + ((last_end - last_start - 1) as f64 * f) as u64;
+                patch(&active, at, &[x ^ 0xA5]);
+            }
+            let log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+            let n = log.next_lsn();
+            prop_assert!(n <= total);
+            prop_assert!(n >= total - *groups.last().unwrap() as u64);
+            check_all(&log, 0, n, 400);
+        }
+    }
+}

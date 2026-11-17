@@ -88,7 +88,10 @@ unsafe impl Send for AlignedBuf {}
 impl AlignedBuf {
     fn new(cap: usize) -> AlignedBuf {
         let layout = std::alloc::Layout::from_size_align(cap, 4096).unwrap();
-        AlignedBuf { ptr: unsafe { std::alloc::alloc_zeroed(layout) }, cap }
+        AlignedBuf {
+            ptr: unsafe { std::alloc::alloc_zeroed(layout) },
+            cap,
+        }
     }
     fn slice(&mut self, n: usize) -> &mut [u8] {
         assert!(n <= self.cap);
@@ -97,7 +100,12 @@ impl AlignedBuf {
 }
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr, std::alloc::Layout::from_size_align(self.cap, 4096).unwrap()) }
+        unsafe {
+            std::alloc::dealloc(
+                self.ptr,
+                std::alloc::Layout::from_size_align(self.cap, 4096).unwrap(),
+            )
+        }
     }
 }
 
@@ -105,7 +113,9 @@ impl Drop for AlignedBuf {
 fn pool_segment(pool: &Path, i: usize) -> Result<PathBuf> {
     std::fs::create_dir_all(pool)?;
     let p = pool.join(format!("seg-{i:04}"));
-    let ok = std::fs::metadata(&p).map(|m| m.len() == SEG_SIZE).unwrap_or(false);
+    let ok = std::fs::metadata(&p)
+        .map(|m| m.len() == SEG_SIZE)
+        .unwrap_or(false);
     if !ok {
         let mut f = File::create(&p)?;
         let z = vec![0u8; 8 << 20];
@@ -121,7 +131,11 @@ fn pool_segment(pool: &Path, i: usize) -> Result<PathBuf> {
 impl RawStore {
     fn open(mode: RawMode, dir: &Path, pool: &Path) -> Result<RawStore> {
         std::fs::create_dir_all(dir)?;
-        let ring = if mode == RawMode::Uring { Some(io_uring::IoUring::new(64)?) } else { None };
+        let ring = if mode == RawMode::Uring {
+            Some(io_uring::IoUring::new(64)?)
+        } else {
+            None
+        };
         let mut s = RawStore {
             mode,
             dir: dir.into(),
@@ -133,11 +147,14 @@ impl RawStore {
             abuf: AlignedBuf::new(48 << 20),
             tail: vec![],
             ring,
-            generation: std::fs::read_to_string(dir.join("GENERATION")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or_else(|| {
-                let g = rand::random::<u32>() | 1;
-                let _ = std::fs::write(dir.join("GENERATION"), g.to_string());
-                g
-            }),
+            generation: std::fs::read_to_string(dir.join("GENERATION"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or_else(|| {
+                    let g = rand::random::<u32>() | 1;
+                    let _ = std::fs::write(dir.join("GENERATION"), g.to_string());
+                    g
+                }),
             readers: vec![],
         };
         s.add_segment()?;
@@ -155,7 +172,12 @@ impl RawStore {
             RawMode::Falloc => {
                 let path = self.dir.join(format!("seg-{i:04}"));
                 let existed = path.exists();
-                let f = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+                let f = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&path)?;
                 if existed {
                     self.segs.push(f.try_clone()?);
                     self.readers.push(f);
@@ -169,9 +191,10 @@ impl RawStore {
                 f.sync_all()?;
                 f
             }
-            RawMode::Prealloc | RawMode::Uring => {
-                OpenOptions::new().read(true).write(true).open(pool_segment(&self.pool, i)?)?
-            }
+            RawMode::Prealloc | RawMode::Uring => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(pool_segment(&self.pool, i)?)?,
             RawMode::Direct => OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -216,7 +239,8 @@ impl RawStore {
                 let keep = (new_end & 4095) as usize;
                 let from = total - keep;
                 self.tail.clear();
-                self.tail.extend_from_slice(&self.abuf.slice(padded)[from..total]);
+                self.tail
+                    .extend_from_slice(&self.abuf.slice(padded)[from..total]);
             }
             RawMode::Uring => {
                 use io_uring::{opcode, squeue, types};
@@ -227,7 +251,10 @@ impl RawStore {
                     .build()
                     .flags(squeue::Flags::IO_LINK)
                     .user_data(1);
-                let s = opcode::Fsync::new(fd).flags(types::FsyncFlags::DATASYNC).build().user_data(2);
+                let s = opcode::Fsync::new(fd)
+                    .flags(types::FsyncFlags::DATASYNC)
+                    .build()
+                    .user_data(2);
                 unsafe {
                     let mut sq = ring.submission();
                     sq.push(&w).map_err(|_| anyhow::anyhow!("sq full"))?;
@@ -236,7 +263,11 @@ impl RawStore {
                 ring.submit_and_wait(2)?;
                 for c in ring.completion() {
                     if c.result() < 0 {
-                        bail!("io_uring op {} failed: {}", c.user_data(), std::io::Error::from_raw_os_error(-c.result()));
+                        bail!(
+                            "io_uring op {} failed: {}",
+                            c.user_data(),
+                            std::io::Error::from_raw_os_error(-c.result())
+                        );
                     }
                     if c.user_data() == 1 && c.result() as usize != self.buf.len() {
                         bail!("short io_uring write");
@@ -282,7 +313,8 @@ impl RawStore {
                         stop = true;
                         break;
                     }
-                    self.index.insert(k, (si as u32, (o + HDR) as u64, len as u32));
+                    self.index
+                        .insert(k, (si as u32, (o + HDR) as u64, len as u32));
                     found_any = true;
                     o += HDR + len;
                 }
@@ -306,7 +338,8 @@ impl RawStore {
                 if crc32(&data[o + HDR..o + HDR + len]) != crc {
                     break;
                 }
-                self.index.insert(k, (si as u32, (o + HDR) as u64, len as u32));
+                self.index
+                    .insert(k, (si as u32, (o + HDR) as u64, len as u32));
                 o += HDR + len;
             }
         }
@@ -352,7 +385,8 @@ impl Store for RawStore {
             self.buf.extend_from_slice(&crc32(v).to_le_bytes());
             self.buf.extend_from_slice(&self.generation.to_le_bytes());
             self.buf.extend_from_slice(v);
-            self.index.insert(*k, (si, pos + HDR as u64, v.len() as u32));
+            self.index
+                .insert(*k, (si, pos + HDR as u64, v.len() as u32));
             pos += (HDR + v.len()) as u64;
         }
         self.write_group()?;
@@ -360,7 +394,9 @@ impl Store for RawStore {
         Ok(())
     }
     fn get(&mut self, k: &Key) -> Result<Option<usize>> {
-        let Some(&(s, o, l)) = self.index.get(k) else { return Ok(None) };
+        let Some(&(s, o, l)) = self.index.get(k) else {
+            return Ok(None);
+        };
         let mut v = vec![0u8; l as usize];
         self.readers[s as usize].read_exact_at(&mut v, o)?;
         Ok(Some(v.len()))
@@ -402,7 +438,9 @@ impl Rocks {
             o.set_min_blob_size(1024);
             o.set_blob_compression_type(rocksdb::DBCompressionType::None);
         }
-        Ok(Rocks { db: rocksdb::DB::open(&o, dir)? })
+        Ok(Rocks {
+            db: rocksdb::DB::open(&o, dir)?,
+        })
     }
 }
 impl Store for Rocks {
@@ -439,7 +477,11 @@ impl Fjall {
         let db = fjall::Database::builder(dir).open()?;
         let ks = db.keyspace("data", || {
             let o = fjall::KeyspaceCreateOptions::default().max_memtable_size(64 << 20);
-            if kv_sep { o.with_kv_separation(Some(fjall::KvSeparationOptions::default())) } else { o }
+            if kv_sep {
+                o.with_kv_separation(Some(fjall::KvSeparationOptions::default()))
+            } else {
+                o
+            }
         })?;
         Ok(Fjall { db, ks })
     }
@@ -512,13 +554,20 @@ struct Lmdb {
 impl Lmdb {
     fn open(dir: &Path) -> Result<Lmdb> {
         std::fs::create_dir_all(dir)?;
-        let env = unsafe { heed::EnvOpenOptions::new().map_size(64 << 30).max_dbs(1).open(dir)? };
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .map_size(64 << 30)
+                .max_dbs(1)
+                .open(dir)?
+        };
         let w = env.write_txn()?;
         let db = env
             .create_databases_and_commit(w, |wdo, wtxn| {
-                let d: heed::Database<heed::types::Bytes, heed::types::Bytes> = wdo.create_database(wtxn, Some("data"))?;
+                let d: heed::Database<heed::types::Bytes, heed::types::Bytes> =
+                    wdo.create_database(wtxn, Some("data"))?;
                 // The handle is only a dbi number; extend its borrow of env to 'static.
-                let d: heed::Database<'static, heed::types::Bytes, heed::types::Bytes> = unsafe { std::mem::transmute(d) };
+                let d: heed::Database<'static, heed::types::Bytes, heed::types::Bytes> =
+                    unsafe { std::mem::transmute(d) };
                 heed::Result::Ok(heed::CommitOrAbort::<_, ()>::Commit(d))
             })?
             .unwrap_commit();
@@ -560,7 +609,10 @@ impl Sqlite {
         c.pragma_update(None, "journal_mode", "WAL")?;
         c.pragma_update(None, "synchronous", "FULL")?;
         c.pragma_update(None, "wal_autocheckpoint", 10000)?;
-        c.execute("CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID", [])?;
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB) WITHOUT ROWID",
+            [],
+        )?;
         Ok(Sqlite { c })
     }
 }
@@ -577,7 +629,9 @@ impl Store for Sqlite {
         Ok(())
     }
     fn get(&mut self, k: &Key) -> Result<Option<usize>> {
-        let mut st = self.c.prepare_cached("SELECT length(v) FROM kv WHERE k = ?1")?;
+        let mut st = self
+            .c
+            .prepare_cached("SELECT length(v) FROM kv WHERE k = ?1")?;
         let mut rows = st.query([&k[..]])?;
         Ok(match rows.next()? {
             Some(r) => Some(r.get::<_, i64>(0)? as usize),
@@ -646,7 +700,10 @@ impl Store for RaftEng {
     fn get(&mut self, k: &Key) -> Result<Option<usize>> {
         let region = u64::from_be_bytes(k[..8].try_into().unwrap());
         let idx = u64::from_be_bytes(k[8..].try_into().unwrap()) + 1;
-        Ok(self.e.get_entry::<RaftMsg>(region, idx)?.map(|e| e.data.len()))
+        Ok(self
+            .e
+            .get_entry::<RaftMsg>(region, idx)?
+            .map(|e| e.data.len()))
     }
     fn scan(&mut self) -> Result<(u64, u64)> {
         let (mut n, mut b) = (0, 0);
@@ -656,7 +713,8 @@ impl Store for RaftEng {
             while i <= l {
                 let end = (i + 256).min(l + 1);
                 v.clear();
-                self.e.fetch_entries_to::<RaftMsg>(r, i, end, None, &mut v)?;
+                self.e
+                    .fetch_entries_to::<RaftMsg>(r, i, end, None, &mut v)?;
                 for e in &v {
                     n += 1;
                     b += touch(&e.data);
@@ -699,7 +757,9 @@ fn open_store(name: &str, dir: &Path, pool: &Path) -> Result<Box<dyn Store>> {
         "fjall-kvsep" => Box::new(Fjall::open(dir, true)?),
         "redb" => {
             std::fs::create_dir_all(dir)?;
-            Box::new(Redb { db: redb::Database::create(dir.join("db.redb"))? })
+            Box::new(Redb {
+                db: redb::Database::create(dir.join("db.redb"))?,
+            })
         }
         "lmdb" => Box::new(Lmdb::open(dir)?),
         "sqlite" => Box::new(Sqlite::open(dir)?),
@@ -740,7 +800,11 @@ struct Req {
 fn io_write_bytes() -> u64 {
     std::fs::read_to_string("/sys/block/vda/stat")
         .ok()
-        .and_then(|s| s.split_whitespace().nth(6).and_then(|x| x.parse::<u64>().ok()))
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(6)
+                .and_then(|x| x.parse::<u64>().ok())
+        })
         .map(|sectors| sectors * 512)
         .unwrap_or(0)
 }
@@ -780,7 +844,10 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     // Pre-create recycled segments outside the timed region.
-    if matches!(a.backend.as_str(), "raw-prealloc" | "raw-odirect" | "raw-uring") {
+    if matches!(
+        a.backend.as_str(),
+        "raw-prealloc" | "raw-odirect" | "raw-uring"
+    ) {
         for i in 0..6 {
             pool_segment(&pool, i)?;
         }
@@ -837,7 +904,12 @@ fn main() -> Result<()> {
                 let mut v = base.clone();
                 v[..8].copy_from_slice(&seq.to_le_bytes());
                 let s = Instant::now();
-                tx.send(Req { key: key(p as u64, seq), val: v, done: dtx.clone() }).unwrap();
+                tx.send(Req {
+                    key: key(p as u64, seq),
+                    val: v,
+                    done: dtx.clone(),
+                })
+                .unwrap();
                 drx.recv().unwrap();
                 h.record(s.elapsed().as_micros().max(1) as u64).unwrap();
                 seq += 1;
@@ -896,7 +968,15 @@ fn main() -> Result<()> {
     let replay = raw_replay(&mut store, &a.backend, &dir, &pool)?;
     let reopen_total = tr.elapsed().as_secs_f64();
     let ok_after = store.get(&key(0, written[0].saturating_sub(1)))?.is_some();
-    let disk = if a.backend == "raw-falloc" { 0 } else { dir_size(&dir) } + if a.backend.starts_with("raw-") && a.backend != "raw-append" { user_bytes } else { 0 };
+    let disk = if a.backend == "raw-falloc" {
+        0
+    } else {
+        dir_size(&dir)
+    } + if a.backend.starts_with("raw-") && a.backend != "raw-append" {
+        user_bytes
+    } else {
+        0
+    };
 
     let r = serde_json::json!({
         "label": a.label, "backend": a.backend, "producers": a.producers, "size": a.size, "secs": elapsed,
@@ -912,9 +992,21 @@ fn main() -> Result<()> {
     });
     println!(
         "{:<13} p{:<2} {:>6}B  {:>8.0} app/s {:>7.1} MB/s  grp {:>5.1}  p50 {:>6}us p99 {:>7}us  cpu {:>6.1}us/app  wamp {:>4.2} disk {:>4.2}  get {:>8.0}/s  scan {:>7.0} MB/s  reopen {:>7.0} ms{}",
-        a.backend, a.producers, a.size, r["appends_per_s"].as_f64().unwrap(), r["mb_per_s"].as_f64().unwrap(), r["avg_group"].as_f64().unwrap(),
-        r["lat_p50_us"], r["lat_p99_us"], r["cpu_us_per_append"].as_f64().unwrap(), r["write_amp"].as_f64().unwrap(), r["disk_amp"].as_f64().unwrap(),
-        r["get_per_s"].as_f64().unwrap(), r["scan_mb_per_s"].as_f64().unwrap(), r["reopen_ms"].as_f64().unwrap(), if cold { " (cold)" } else { "" }
+        a.backend,
+        a.producers,
+        a.size,
+        r["appends_per_s"].as_f64().unwrap(),
+        r["mb_per_s"].as_f64().unwrap(),
+        r["avg_group"].as_f64().unwrap(),
+        r["lat_p50_us"],
+        r["lat_p99_us"],
+        r["cpu_us_per_append"].as_f64().unwrap(),
+        r["write_amp"].as_f64().unwrap(),
+        r["disk_amp"].as_f64().unwrap(),
+        r["get_per_s"].as_f64().unwrap(),
+        r["scan_mb_per_s"].as_f64().unwrap(),
+        r["reopen_ms"].as_f64().unwrap(),
+        if cold { " (cold)" } else { "" }
     );
     if let Some(p) = &a.json {
         let mut f = OpenOptions::new().create(true).append(true).open(p)?;
@@ -952,8 +1044,13 @@ fn raw_replay(store: &mut Box<dyn Store>, backend: &str, dir: &Path, pool: &Path
         i += 1;
     }
     let mut rs = RawStore::open(RawMode::Append, &dir.join("replay-scratch"), pool)?;
-    rs.generation = std::fs::read_to_string(dir.join("GENERATION"))?.trim().parse()?;
-    rs.readers = segs.iter().map(|f| f.try_clone()).collect::<std::io::Result<_>>()?;
+    rs.generation = std::fs::read_to_string(dir.join("GENERATION"))?
+        .trim()
+        .parse()?;
+    rs.readers = segs
+        .iter()
+        .map(|f| f.try_clone())
+        .collect::<std::io::Result<_>>()?;
     rs.segs = segs;
     rs.rebuild()?;
     let n = rs.index.len() as u64;
