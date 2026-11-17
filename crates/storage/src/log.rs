@@ -830,6 +830,13 @@ impl Log {
                     active = Some((seg, s));
                     log.write_manifest(&mut manifest)?;
                 }
+                Some((hid, g, b)) if hid == id => {
+                    // A durable successor that does not continue the log: something before it
+                    // is damaged or missing. Recycling it would discard acknowledged records.
+                    return Err(Error::Corrupt(format!(
+                        "segment {id} (generation {g}) starts at lsn {b} but the log before it ends at lsn {next_lsn}"
+                    )));
+                }
                 _ => {
                     // a roll that crashed before its header was durable: return the file to the pool
                     drop(file);
@@ -1020,8 +1027,12 @@ impl Log {
     }
 
     fn take_spare(&mut self) -> Result<PathBuf> {
-        let p = self.spares.pool.lock().unwrap().pop();
-        self.spares.cv.notify_all();
+        let p = {
+            let mut pool = self.spares.pool.lock().unwrap();
+            let p = pool.pop();
+            self.spares.cv.notify_all(); // under the lock, so the preallocator cannot miss it
+            p
+        };
         Ok(match p {
             Some(p) => {
                 self.stats.spare_hits += 1;
@@ -1170,8 +1181,12 @@ impl Log {
 
 impl Drop for Log {
     fn drop(&mut self) {
-        self.spares.stop.store(true, Ordering::Release);
-        self.spares.cv.notify_all();
+        {
+            // under the pool lock: the preallocator checks `stop` under it before waiting
+            let _g = self.spares.pool.lock().unwrap();
+            self.spares.stop.store(true, Ordering::Release);
+            self.spares.cv.notify_all();
+        }
         if let Some(t) = self.prealloc.take() {
             let _ = t.join();
         }
@@ -1207,6 +1222,7 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     let chunk = 8 << 20;
     let mut off = SEG_HEADER;
     let mut group = SEG_HEADER;
+    let mut stopped_on_written = false;
     let fill = |buf: &mut Vec<u8>,
                 buf_start: &mut u64,
                 off: u64,
@@ -1253,6 +1269,7 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
                 let lsn_ok = header.lsn == base_lsn + s.entries.len() as u64;
                 let group_ok = header.group_start == off || header.group_start == group;
                 if !lsn_ok || !group_ok {
+                    stopped_on_written = true;
                     break;
                 }
                 group = header.group_start;
@@ -1265,7 +1282,12 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
                 off = buf_start + next as u64;
                 s.end = off;
             }
-            Decoded::Invalid => break,
+            Decoded::Invalid => {
+                let b = &buf[rel.min(buf.len())..];
+                stopped_on_written =
+                    b.len() >= 24 && u32_at(b, 0) == record::MAGIC && u64_at(b, 16) == generation;
+                break;
+            }
         }
     }
     if let Some(e) = end {
@@ -1283,7 +1305,12 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     let mut pos = x + 8;
     let mut later: Option<u64> = None; // group_start of a valid record from a later group
     let mut torn: Option<u64> = None; // group_start of valid records of the torn group itself
-    let mut dirty = x;
+    // a record of this generation was written at x but fails validation: damage, not a clean end
+    let mut dirty = if stopped_on_written {
+        x + record::HEADER as u64
+    } else {
+        x
+    };
     // continue in the buffer the main scan already read (no second read of the same bytes)
     while pos < window_end {
         let rel = (pos - buf_start) as usize;

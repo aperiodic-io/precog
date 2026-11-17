@@ -550,3 +550,178 @@ fn a_fresh_log_is_ready_to_append_without_a_roll() {
         "first append rolled"
     );
 }
+
+#[test]
+fn the_tail_cache_is_bounded_and_older_reads_go_to_disk() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 1 << 20);
+    c.tail_cache_bytes = 10 * 1024;
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 100, 1, 1000);
+    let r = log.reader();
+    let before = log.stats().cache_hits;
+    r.read(99).unwrap().unwrap();
+    assert_eq!(
+        log.stats().cache_hits,
+        before + 1,
+        "recent record served from memory"
+    );
+    r.read(0).unwrap().unwrap();
+    assert_eq!(
+        log.stats().cache_hits,
+        before + 1,
+        "old record read from disk"
+    );
+    check_all(&log, 0, 100, 1000);
+}
+
+#[test]
+fn oversized_keys_and_records_are_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(cfg(d.path(), 64 << 20)).unwrap();
+    let mut m = meta(0);
+    m.key = vec![b'k'; record::MAX_KEY + 1];
+    assert!(matches!(log.append(&[(m, b"x")]), Err(Error::Invalid(_))));
+    let big = vec![0u8; record::MAX_RECORD];
+    assert!(matches!(
+        log.append(&[(meta(0), &big[..])]),
+        Err(Error::Invalid(_))
+    ));
+    assert_eq!(log.next_lsn(), 0);
+}
+
+#[test]
+fn segments_without_a_manifest_are_refused() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+        fill(&mut log, 0, 3, 1, 100);
+    }
+    std::fs::remove_file(d.path().join("MANIFEST")).unwrap();
+    assert!(matches!(
+        Log::open(cfg(d.path(), 1 << 20)),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn a_segment_header_that_contradicts_the_manifest_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+    }
+    let segs = segment_files(d.path());
+    patch(&segs[1], 8, &[0xEE]); // id field of the second segment's header
+    assert!(matches!(
+        Log::open(cfg(d.path(), 64 * KB)),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn damage_before_a_successor_segment_with_records_fails_closed() {
+    // The manifest's newest slot is lost, so the older slot makes the previous segment look
+    // active. That segment's last record is damaged, but its successor holds records: the
+    // damaged record was acknowledged, so this is interior damage, never a torn tail.
+    let d = tempfile::tempdir().unwrap();
+    let last_of_prev;
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 70, 2, 1000);
+        let e = log.reader().entries(0, 1000);
+        let last_seg = e.last().unwrap().segment;
+        last_of_prev = e
+            .iter()
+            .rev()
+            .find(|x| x.segment != last_seg)
+            .unwrap()
+            .offset;
+    }
+    let m = d.path().join("MANIFEST");
+    let mut mf = std::fs::read(&m).unwrap();
+    let slot = mf.len() / 2;
+    let seq = |o: usize| u64::from_le_bytes(mf[o + 8..o + 16].try_into().unwrap());
+    let newest = if seq(0) > seq(slot) { 0 } else { slot };
+    mf[newest + 20] ^= 0xFF;
+    std::fs::write(&m, &mf).unwrap();
+    let segs = segment_files(d.path());
+    patch(&segs[segs.len() - 2], last_of_prev + 8, &[0xFF; 4]);
+    assert!(matches!(
+        Log::open(cfg(d.path(), 64 * KB)),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn damage_that_cuts_a_segment_short_never_discards_its_successor() {
+    // regression: a successor whose base LSN no longer matched was recycled as a leftover
+    let d = tempfile::tempdir().unwrap();
+    let mid;
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 70, 2, 1000);
+        let e = log.reader().entries(0, 1000);
+        let last_seg = e.last().unwrap().segment;
+        mid = e
+            .iter()
+            .filter(|x| x.segment != last_seg)
+            .rev()
+            .nth(5)
+            .unwrap()
+            .offset;
+    }
+    let m = d.path().join("MANIFEST");
+    let mut mf = std::fs::read(&m).unwrap();
+    let slot = mf.len() / 2;
+    let seq = |o: usize| u64::from_le_bytes(mf[o + 8..o + 16].try_into().unwrap());
+    let newest = if seq(0) > seq(slot) { 0 } else { slot };
+    mf[newest + 20] ^= 0xFF;
+    std::fs::write(&m, &mf).unwrap();
+    let segs = segment_files(d.path());
+    patch(&segs[segs.len() - 2], mid + 8, &[0xFF; 4]);
+    assert!(matches!(
+        Log::open(cfg(d.path(), 64 * KB)),
+        Err(Error::Corrupt(_))
+    ));
+    assert_eq!(
+        segment_files(d.path()).len(),
+        segs.len(),
+        "no segment was recycled"
+    );
+}
+
+#[test]
+fn recovery_handles_torn_groups_beyond_the_first_read_chunk() {
+    // 12 MiB of data in a 24 MiB segment: the scan crosses its 8 MiB read chunks.
+    let d = tempfile::tempdir().unwrap();
+    let seg = 24 << 20;
+    let last;
+    {
+        let mut log = Log::open(cfg(d.path(), seg)).unwrap();
+        fill(&mut log, 0, 200, 4, 15_000);
+        last = log.reader().entries(796, 1)[0].offset;
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, last + 8, &[0xFF; 4]);
+    let log = Log::open(cfg(d.path(), seg)).unwrap();
+    assert_eq!(log.next_lsn(), 796);
+    check_all(&log, 790, 796, 15_000);
+}
+
+#[test]
+fn opening_and_dropping_never_hangs() {
+    // regression: a lost wakeup let the preallocator sleep through shutdown, hanging drop
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..300u64 {
+            let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+            let n = log.next_lsn();
+            fill(&mut log, n, 1, 1, 100 + (i as usize % 7) * 100);
+        }
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .expect("open/drop cycle hung");
+}
