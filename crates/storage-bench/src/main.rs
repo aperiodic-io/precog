@@ -153,12 +153,15 @@ impl RawStore {
                 .read(true)
                 .open(self.dir.join(format!("seg-{i:04}")))?,
             RawMode::Falloc => {
-                let f = OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .read(true)
-                    .write(true)
-                    .open(self.dir.join(format!("seg-{i:04}")))?;
+                let path = self.dir.join(format!("seg-{i:04}"));
+                let existed = path.exists();
+                let f = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+                if existed {
+                    self.segs.push(f.try_clone()?);
+                    self.readers.push(f);
+                    self.off = 0;
+                    return Ok(()); // reopen: keep existing data (replay rebuilds the index)
+                }
                 let r = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, SEG_SIZE as i64) };
                 if r != 0 {
                     bail!("fallocate: {}", std::io::Error::last_os_error());
