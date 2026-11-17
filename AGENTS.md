@@ -30,7 +30,7 @@ the bench and perf gates.
 | Format, lint | `cargo fmt --all` then `cargo clippy --workspace --all-targets -- -D warnings` |
 | Unit and integration tests | `cargo nextest run --workspace` (or `cargo test --workspace`) |
 | Acceptance scenarios | `cargo test -p precog-mesh --test acceptance` (filter: `-- --tags '@storage'`) |
-| Coverage gate | `cargo llvm-cov nextest --workspace --lcov --output-path lcov.info -E 'not binary(acceptance)' && scripts/coverage-gate.sh lcov.info` |
+| Coverage gate | `cargo llvm-cov nextest --workspace --lcov --output-path lcov.info && scripts/coverage-gate.sh lcov.info` |
 | Instruction-count benches | `cargo bench -p precog-storage --bench gate` (needs valgrind and `gungraun-runner`) |
 | Wall-clock perf gate | `python3 bench/perf-gate/gate.py --base <dir> --head <dir>` (see `.github/workflows/ci.yml`) |
 | Mutants of a diff | `git diff origin/main... -- '*.rs' > pr.diff && cargo mutants --in-diff pr.diff` |

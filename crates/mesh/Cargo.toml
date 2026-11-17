@@ -27,10 +27,13 @@ cucumber = "0.23"
 tempfile = "3"
 
 # Feature files under tests/acceptance/features driven against real precog-node processes.
+# Not a default test target (minutes, and its runner has no `--list` for nextest):
+# run it with `cargo test -p precog-mesh --test acceptance`.
 [[test]]
 name = "acceptance"
 path = "tests/acceptance/main.rs"
 harness = false
+test = false
 
 # Instruction-count gate (CI fails a PR that adds more than 2% instructions)
 [[bench]]

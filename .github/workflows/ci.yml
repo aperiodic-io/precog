@@ -38,7 +38,7 @@ jobs:
         with: { tool: "cargo-nextest,cargo-llvm-cov" }
       # unit, property and integration tests (TCP and Iroh clusters on loopback) with coverage;
       # the acceptance suite runs in its own job
-      - run: cargo llvm-cov nextest $WS --exclude precog-bench --lcov --output-path lcov.info -E 'not binary(acceptance)'
+      - run: cargo llvm-cov nextest $WS --exclude precog-bench --lcov --output-path lcov.info
       - run: scripts/coverage-gate.sh lcov.info
 
   acceptance:
