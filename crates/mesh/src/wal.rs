@@ -136,7 +136,7 @@ fn writer(
             } => {
                 let cutoff = max_age_ms.map(|a| now_ms().saturating_sub(a));
                 let r = log.retain(max_bytes, cutoff).map_err(|e| e.to_string());
-                if matches!(r, Err(_)) && log_is_fatal(&r) {
+                if log_is_fatal(&r) {
                     fatal.store(true, Ordering::Release);
                 }
                 let _ = done.send(r);

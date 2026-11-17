@@ -135,7 +135,7 @@ impl MeshClient {
                 bail!("append outcome unknown after {attempts} attempts: {last_err}");
             }
             node = (node + 1) % self.nodes.len();
-            if attempts as usize % self.nodes.len() == 0 {
+            if (attempts as usize).is_multiple_of(self.nodes.len()) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }

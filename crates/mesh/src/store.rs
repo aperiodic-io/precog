@@ -15,6 +15,9 @@ use precog_storage::{Lsn, Reader};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tokio::sync::watch;
 
+/// (lsn, batch id, event count, batch checksum)
+pub type InventoryItem = (u64, BatchId, u32, u32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Pending,
@@ -285,7 +288,7 @@ impl Store {
 
     /// Durable batches with LSN >= `after`: (lsn, id, count, crc), the next cursor, and
     /// whether more remain.
-    pub fn inventory(&self, after: u64, limit: u32) -> (Vec<(u64, BatchId, u32, u32)>, u64, bool) {
+    pub fn inventory(&self, after: u64, limit: u32) -> (Vec<InventoryItem>, u64, bool) {
         let g = self.inner.lock();
         let items: Vec<_> = g
             .order

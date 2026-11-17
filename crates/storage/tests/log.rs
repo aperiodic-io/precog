@@ -534,3 +534,19 @@ mod flips {
         }
     }
 }
+
+#[test]
+fn a_fresh_log_is_ready_to_append_without_a_roll() {
+    // The first segment is created while opening, so the first append never waits for a
+    // spare to be zero-filled (seconds for a 1 GiB segment).
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+    assert_eq!(log.stats().segments, 1, "{:?}", log.stats());
+    let stalls = log.stats().roll_stalls + log.stats().spare_hits;
+    fill(&mut log, 0, 1, 1, 10);
+    assert_eq!(
+        log.stats().roll_stalls + log.stats().spare_hits,
+        stalls,
+        "first append rolled"
+    );
+}

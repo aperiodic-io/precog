@@ -863,6 +863,10 @@ impl Log {
         log.shared.next_lsn.store(next_lsn, Ordering::Release);
         log.manifest = manifest;
 
+        // Start with an active segment so no append ever waits for a spare to be zero-filled.
+        if log.active.is_none() {
+            log.roll()?;
+        }
         let sp = log.spares.clone();
         log.prealloc = Some(
             std::thread::Builder::new()
@@ -899,10 +903,9 @@ impl Log {
         Err(Error::Fatal(w))
     }
 
-    fn failpoint(&mut self, step: &'static str) -> Result<()> {
-        // only rolls that seal a segment, so the crash leaves data behind to recover
-        if self.cfg.failpoints.fail_at == Some(step) && self.manifest.segs.iter().any(|s| !s.sealed)
-        {
+    /// Fails at a named step; only on rolls that seal a segment, so the crash leaves data to recover.
+    fn failpoint(&mut self, step: &'static str, sealing: bool) -> Result<()> {
+        if sealing && self.cfg.failpoints.fail_at == Some(step) {
             return self.fail(format!("failpoint {step}"));
         }
         Ok(())
@@ -1037,16 +1040,17 @@ impl Log {
         let id = self.manifest.next_segment_id;
         let generation = self.manifest.next_generation;
         let base = self.next_lsn();
+        let sealing = self.active.is_some();
         let res: Result<()> = (|| {
             let spare = self.take_spare()?;
             let path = seg_path(&dir, id);
             std::fs::rename(&spare, &path)?;
             sync_dir(&dir)?;
-            self.failpoint("roll:after_spare_rename")?;
+            self.failpoint("roll:after_spare_rename", sealing)?;
             let file = OpenOptions::new().read(true).write(true).open(&path)?;
             file.write_all_at(&seg_header(id, generation, base), 0)?;
             file.sync_data()?;
-            self.failpoint("roll:after_header")?;
+            self.failpoint("roll:after_header", sealing)?;
 
             let mut m = self.manifest.clone();
             if let Some(a) = &self.active {
@@ -1066,7 +1070,7 @@ impl Log {
             m.next_generation = generation + 1;
             self.write_manifest(&mut m)?;
             self.manifest = m;
-            self.failpoint("roll:after_manifest")?;
+            self.failpoint("roll:after_manifest", sealing)?;
 
             let seg = Arc::new(Seg {
                 id,
@@ -1087,7 +1091,7 @@ impl Log {
             if let Some(p) = prev {
                 write_index(&dir, &p.seg)?;
             }
-            self.failpoint("roll:after_index")?;
+            self.failpoint("roll:after_index", sealing)?;
             Ok(())
         })();
         match res {
