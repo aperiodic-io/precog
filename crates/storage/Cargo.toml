@@ -1,0 +1,14 @@
+[package]
+name = "precog-storage"
+description = "Node-local durable segment log for the precog broker mesh"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+crc32c = "0.6"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
