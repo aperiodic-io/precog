@@ -21,6 +21,8 @@ const MAX_GROUP_BYTES: usize = 16 << 20;
 pub struct WalStats {
     pub bytes: AtomicU64,
     pub syncs: AtomicU64,
+    pub segments: AtomicU64,
+    pub recovery_scanned_bytes: AtomicU64,
 }
 
 enum Req {
@@ -59,6 +61,11 @@ impl Wal {
         let entries = reader.entries(reader.first_lsn(), usize::MAX);
         let (tx, rx) = std::sync::mpsc::channel::<Req>();
         let stats = Arc::new(WalStats::default());
+        let s = log.stats();
+        stats.segments.store(s.segments as u64, Ordering::Relaxed);
+        stats
+            .recovery_scanned_bytes
+            .store(s.recovery_scanned_bytes, Ordering::Relaxed);
         let fatal = Arc::new(AtomicBool::new(false));
         {
             let stats = stats.clone();
@@ -136,6 +143,9 @@ fn writer(
             } => {
                 let cutoff = max_age_ms.map(|a| now_ms().saturating_sub(a));
                 let r = log.retain(max_bytes, cutoff).map_err(|e| e.to_string());
+                stats
+                    .segments
+                    .store(log.stats().segments as u64, Ordering::Relaxed);
                 if log_is_fatal(&r) {
                     fatal.store(true, Ordering::Release);
                 }
@@ -177,6 +187,7 @@ fn writer(
                 let s = log.stats();
                 stats.syncs.store(s.syncs, Ordering::Relaxed);
                 stats.bytes.store(s.bytes, Ordering::Relaxed);
+                stats.segments.store(s.segments as u64, Ordering::Relaxed);
                 for (i, (_, done)) in group.drain(..).enumerate() {
                     let _ = done.send(Ok(first + i as u64));
                 }

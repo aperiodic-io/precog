@@ -22,4 +22,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+cucumber = "0.23"
 tempfile = "3"
+
+# Feature files under tests/acceptance/features driven against real precog-node processes.
+[[test]]
+name = "acceptance"
+path = "tests/acceptance/main.rs"
+harness = false

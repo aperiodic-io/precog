@@ -58,6 +58,9 @@ pub struct NodeConfig {
     /// Drop sealed segments whose newest batch is older than this.
     #[serde(default)]
     pub retention_ms: Option<u64>,
+    /// How often retention runs.
+    #[serde(default = "retention_interval_ms")]
+    pub retention_interval_ms: u64,
     /// Recent batches kept in memory for subscribers.
     #[serde(default = "tail_cache_bytes")]
     pub tail_cache_bytes: usize,
@@ -84,6 +87,7 @@ impl NodeConfig {
             segment_size: segment_size(),
             retention_bytes: None,
             retention_ms: None,
+            retention_interval_ms: retention_interval_ms(),
             tail_cache_bytes: tail_cache_bytes(),
             storage_failpoints: Default::default(),
         }
@@ -100,6 +104,9 @@ impl NodeConfig {
 
 fn segment_size() -> u64 {
     1 << 30
+}
+fn retention_interval_ms() -> u64 {
+    10_000
 }
 fn tail_cache_bytes() -> usize {
     64 << 20
@@ -215,7 +222,8 @@ impl Node {
         let n = node.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(Duration::from_millis(n.cfg.retention_interval_ms.max(10)))
+                    .await;
                 if let Err(e) = n.apply_retention().await {
                     tracing::error!("retention: {e}");
                 }
@@ -228,6 +236,24 @@ impl Node {
                 tracing::error!("storage fault: exiting so the node restarts and recovers");
                 std::process::exit(70);
             }
+        }
+    }
+
+    pub fn status(&self) -> Status {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (batches, events, bytes) = self.store.totals();
+        let w = &self.wal.stats;
+        Status {
+            node_id: self.cfg.id,
+            domain: self.cfg.domain.clone(),
+            batches,
+            events,
+            bytes,
+            wal_bytes: w.bytes.load(Relaxed),
+            fsyncs: w.syncs.load(Relaxed),
+            segments: w.segments.load(Relaxed),
+            recovery_scanned_bytes: w.recovery_scanned_bytes.load(Relaxed),
+            logs: self.store.frontiers(None),
         }
     }
 
@@ -471,27 +497,7 @@ impl Node {
 
     async fn control(self: &Arc<Self>, c: Control, _ident: Ident) -> Result<ControlResp> {
         Ok(match c {
-            Control::Status => {
-                let (batches, events, bytes) = self.store.totals();
-                ControlResp::Status(Status {
-                    node_id: self.cfg.id,
-                    domain: self.cfg.domain.clone(),
-                    batches,
-                    events,
-                    bytes,
-                    wal_bytes: self
-                        .wal
-                        .stats
-                        .bytes
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    fsyncs: self
-                        .wal
-                        .stats
-                        .syncs
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    logs: self.store.frontiers(None),
-                })
-            }
+            Control::Status => ControlResp::Status(self.status()),
             Control::Read {
                 stream,
                 from_time_us,

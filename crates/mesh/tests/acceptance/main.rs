@@ -1,0 +1,622 @@
+//! Acceptance scenarios (tests/acceptance/features) against real `precog-node` processes:
+//! SIGKILLs, files damaged on disk, restarts, retention, replication and subscriptions.
+//!
+//! cargo test -p precog-mesh --test acceptance -- --tags 'not @nightly'
+
+use bytes::Bytes;
+use cucumber::{World, given, then, when};
+use precog_mesh::client::{MeshClient, Writer};
+use precog_mesh::proto::*;
+use precog_mesh::transport::Addr;
+use precog_storage::record;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const BIN: &str = env!("CARGO_BIN_EXE_precog-node");
+static NEXT_PORT: AtomicU16 = AtomicU16::new(17_100);
+
+struct WriterState {
+    name: String,
+    epoch: u64,
+    acked: u64,
+    size: usize,
+    copies: u8,
+}
+
+type SubLog = Arc<Mutex<Vec<(String, u64, u32)>>>;
+
+#[derive(Default, World)]
+pub struct Mesh {
+    dir: Option<tempfile::TempDir>,
+    n: usize,
+    procs: Arc<Mutex<Vec<Option<Child>>>>,
+    client: Option<Arc<MeshClient>>,
+    writers: Vec<WriterState>,
+    subs: Vec<(SubLog, Arc<AtomicBool>)>,
+}
+
+impl std::fmt::Debug for Mesh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Mesh({} nodes)", self.n)
+    }
+}
+
+impl Drop for Mesh {
+    fn drop(&mut self) {
+        for s in &self.subs {
+            s.1.store(true, Ordering::Release);
+        }
+        for c in self.procs.lock().unwrap().iter_mut().flatten() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+fn payload(writer: &str, seq: u64, size: usize) -> Vec<u8> {
+    let h = writer.bytes().fold(seq.wrapping_mul(2654435761), |a, b| {
+        a.wrapping_mul(31).wrapping_add(b as u64)
+    });
+    (0..size)
+        .map(|j| (h.wrapping_add(j as u64 * 7) % 251) as u8)
+        .collect()
+}
+
+impl Mesh {
+    fn root(&self) -> &Path {
+        self.dir.as_ref().unwrap().path()
+    }
+    fn client(&self) -> Arc<MeshClient> {
+        self.client.clone().unwrap()
+    }
+
+    fn start(&self, i: usize) {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root().join(format!("n{i}.log")))
+            .unwrap();
+        let child = Command::new(BIN)
+            .args(["serve", "--config"])
+            .arg(self.root().join(format!("node-{i}.json")))
+            .args(["--threads", "2"])
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("spawn precog-node");
+        self.procs.lock().unwrap()[i] = Some(child);
+    }
+
+    fn kill(&self, i: usize) {
+        if let Some(mut c) = self.procs.lock().unwrap()[i].take() {
+            let _ = c.kill(); // SIGKILL
+            let _ = c.wait();
+        }
+    }
+
+    async fn wait_ready(&self, i: usize) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if self.status(i).await.is_some() {
+                return;
+            }
+            if let Some(c) = self.procs.lock().unwrap()[i].as_mut()
+                && let Ok(Some(st)) = c.try_wait()
+            {
+                panic!(
+                    "node {i} exited during startup ({st}): {}",
+                    self.node_log(i)
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node {i} not ready: {}",
+                self.node_log(i)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn node_log(&self, i: usize) -> String {
+        std::fs::read_to_string(self.root().join(format!("n{i}.log"))).unwrap_or_default()
+    }
+
+    async fn status(&self, i: usize) -> Option<Status> {
+        match self.client().control(i, &Control::Status).await {
+            Ok(ControlResp::Status(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The batches node `i` holds among `seqs` of a writer.
+    async fn fetch(&self, i: usize, w: &WriterState, seqs: &[u64]) -> Vec<Batch> {
+        let mut out = vec![];
+        for chunk in seqs.chunks(256) {
+            let ids: Vec<BatchId> = chunk
+                .iter()
+                .map(|&s| BatchId {
+                    log: LogId {
+                        stream: "s".into(),
+                        writer: w.name.clone(),
+                        epoch: w.epoch,
+                    },
+                    first_seq: s,
+                })
+                .collect();
+            let body = Bytes::from(serde_json::to_vec(&Control::Fetch { ids }).unwrap());
+            let f = self
+                .client()
+                .call(i, Kind::Control, body)
+                .await
+                .expect("fetch");
+            assert_eq!(f.kind, Kind::Batches);
+            let mut b = &f.body[..];
+            while b.len() >= 4 {
+                let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+                out.push(Batch::parse(f.body.slice_ref(&b[4..4 + n])).expect("valid batch"));
+                b = &b[4 + n..];
+            }
+        }
+        out
+    }
+
+    fn active_segment(&self, i: usize) -> PathBuf {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(self.root().join(format!("n{i}/log")))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name().unwrap().to_string_lossy().starts_with("seg-")
+                    && p.extension().is_some_and(|x| x == "log")
+            })
+            .collect();
+        v.sort();
+        v.pop().expect("an active segment")
+    }
+
+    async fn append(&mut self, w: usize, n: u64) {
+        let c = self.client();
+        let preferred = w % self.n;
+        let ws = &mut self.writers[w];
+        let mut writer = Writer::new(c, "s", &ws.name, ws.epoch, preferred, ws.copies);
+        writer.next_seq = ws.acked;
+        for _ in 0..n {
+            let seq = writer.next_seq;
+            let p = payload(&ws.name, seq, ws.size);
+            writer
+                .append(&[(seq, &p[..])])
+                .await
+                .unwrap_or_else(|e| panic!("append {seq}: {e}"));
+            ws.acked = writer.next_seq;
+        }
+    }
+}
+
+/// Segment generation (header offset 16) and the offsets of its valid records.
+fn records(seg: &Path) -> (u64, Vec<(u64, usize)>) {
+    let data = std::fs::read(seg).unwrap();
+    let generation = u64::from_le_bytes(data[16..24].try_into().unwrap());
+    let mut off = 4096;
+    let mut v = vec![];
+    while let record::Decoded::Record { header, next, .. } = record::decode(&data, off, generation)
+    {
+        v.push((off as u64, header.len as usize));
+        off = next;
+    }
+    (generation, v)
+}
+
+fn patch(path: &Path, offset: u64, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    f.write_all_at(bytes, offset).unwrap();
+    f.sync_all().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+
+#[given(
+    regex = r"^a (\d+)-node cluster( over iroh)? with (\d+) MiB segments(?: and (\d+) MiB retention)?$"
+)]
+async fn cluster(w: &mut Mesh, n: usize, iroh: String, seg_mb: u64, retention_mb: String) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = NEXT_PORT.fetch_add(10, Ordering::Relaxed);
+    let mut cmd = Command::new(BIN);
+    cmd.args([
+        "init",
+        "--nodes",
+        &n.to_string(),
+        "--transport",
+        if iroh.is_empty() { "tcp" } else { "iroh" },
+    ])
+    .args([
+        "--base-port",
+        &base.to_string(),
+        "--segment-mb",
+        &seg_mb.to_string(),
+    ])
+    .arg("--dir")
+    .arg(dir.path());
+    if !retention_mb.is_empty() {
+        cmd.args(["--retention-mb", &retention_mb]);
+    }
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for i in 0..n {
+        // retention runs often enough for a scenario to see it
+        let p = dir.path().join(format!("node-{i}.json"));
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        v["retention_interval_ms"] = 200.into();
+        std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    }
+    let cf: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("cluster.json")).unwrap()).unwrap();
+    let addrs: Vec<Addr> = cf["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().parse().unwrap())
+        .collect();
+    let mut mc = Arc::into_inner(
+        MeshClient::new(addrs, cf["token"].as_str().unwrap().into())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    mc.rpc_timeout = Duration::from_millis(1500);
+    mc.append_deadline = Duration::from_secs(60);
+    w.client = Some(Arc::new(mc));
+    w.n = n;
+    w.dir = Some(dir);
+    *w.procs.lock().unwrap() = (0..n).map(|_| None).collect();
+    for i in 0..n {
+        w.start(i);
+    }
+    for i in 0..n {
+        w.wait_ready(i).await;
+    }
+}
+
+#[given(regex = r"^a subscriber on node (\d+)$")]
+async fn subscriber(w: &mut Mesh, node: usize) {
+    let mut sub = w.client().subscribe(node, Some("s"), false).await.unwrap();
+    let log: SubLog = Default::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (l, s) = (log.clone(), stop.clone());
+    tokio::spawn(async move {
+        while !s.load(Ordering::Acquire) {
+            if let Ok(Some(Ok(b))) =
+                tokio::time::timeout(Duration::from_millis(200), sub.next()).await
+            {
+                l.lock()
+                    .unwrap()
+                    .push((b.id.log.writer.clone(), b.id.first_seq, b.count));
+            }
+        }
+    });
+    w.subs.push((log, stop));
+}
+
+fn new_writer(w: &mut Mesh, size: usize, copies: u8) -> usize {
+    let i = w.writers.len();
+    w.writers.push(WriterState {
+        name: format!("writer-{i}"),
+        epoch: 1,
+        acked: 0,
+        size,
+        copies,
+    });
+    i
+}
+
+#[when(regex = r"^a writer appends (\d+) batches of (\d+) bytes with (\d+) cop(?:y|ies)$")]
+async fn append(w: &mut Mesh, n: u64, size: usize, copies: u8) {
+    let i = new_writer(w, size, copies);
+    w.append(i, n).await;
+}
+
+#[when(regex = r"^(\d+) writers each append (\d+) batches of (\d+) bytes with (\d+) copies$")]
+async fn append_many(w: &mut Mesh, k: usize, n: u64, size: usize, copies: u8) {
+    let ids: Vec<usize> = (0..k).map(|_| new_writer(w, size, copies)).collect();
+    let mut tasks = vec![];
+    for &i in &ids {
+        let c = w.client();
+        let preferred = i % w.n;
+        let (name, epoch) = (w.writers[i].name.clone(), w.writers[i].epoch);
+        tasks.push(tokio::spawn(async move {
+            let mut writer = Writer::new(c, "s", &name, epoch, preferred, copies);
+            for seq in 0..n {
+                let p = payload(&name, seq, size);
+                writer.append(&[(seq, &p[..])]).await.unwrap();
+            }
+            n
+        }));
+    }
+    for (t, &i) in tasks.into_iter().zip(&ids) {
+        w.writers[i].acked = t.await.unwrap();
+    }
+}
+
+#[when(regex = r"^the writer appends (\d+) more batches$")]
+async fn append_more(w: &mut Mesh, n: u64) {
+    let i = w.writers.len() - 1;
+    w.append(i, n).await;
+}
+
+#[when(
+    regex = r"^a writer appends (\d+) batches of (\d+) bytes with (\d+) cop(?:y|ies) while node (\d+) is killed (\d+) times$"
+)]
+async fn append_with_kills(w: &mut Mesh, n: u64, size: usize, copies: u8, node: usize, kills: u32) {
+    let i = new_writer(w, size, copies);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (procs, root, stop2) = (w.procs.clone(), w.root().to_path_buf(), stop.clone());
+    // the killer: SIGKILL, restart, wait, repeat, spread over the run
+    let killer = std::thread::spawn(move || {
+        for _ in 0..kills {
+            std::thread::sleep(Duration::from_millis(300 + rand::random::<u64>() % 700));
+            if stop2.load(Ordering::Acquire) {
+                break;
+            }
+            if let Some(mut c) = procs.lock().unwrap()[node].take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(root.join(format!("n{node}.log")))
+                .unwrap();
+            let child = Command::new(BIN)
+                .args(["serve", "--config"])
+                .arg(root.join(format!("node-{node}.json")))
+                .args(["--threads", "2"])
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .unwrap();
+            procs.lock().unwrap()[node] = Some(child);
+        }
+    });
+    w.append(i, n).await;
+    stop.store(true, Ordering::Release);
+    killer.join().unwrap();
+    w.wait_ready(node).await;
+}
+
+#[when(regex = r"^node (\d+) is killed and restarted$")]
+async fn kill_restart(w: &mut Mesh, i: usize) {
+    w.kill(i);
+    w.start(i);
+    w.wait_ready(i).await;
+}
+
+#[when(regex = r"^node (\d+) is stopped$")]
+async fn stop(w: &mut Mesh, i: usize) {
+    w.kill(i);
+}
+
+#[when(regex = r"^node (\d+) is started$")]
+async fn start(w: &mut Mesh, i: usize) {
+    w.start(i);
+    w.wait_ready(i).await;
+}
+
+#[when(
+    regex = r"^a torn, unacknowledged write is left after the last record of node (\d+)'s active segment$"
+)]
+async fn torn_write(w: &mut Mesh, i: usize) {
+    let seg = w.active_segment(i);
+    let (generation, recs) = records(&seg);
+    let (off, len) = *recs.last().unwrap();
+    let end = off + len.next_multiple_of(8) as u64;
+    // a group that was being written when the node died: header and part of the body only
+    let mut buf = vec![];
+    let meta = record::Meta {
+        key: b"torn".to_vec(),
+        first_seq: 9_999,
+        count: 1,
+        tag: 0,
+        time_ms: 0,
+    };
+    record::encode(&mut buf, generation, end, u64::MAX / 2, &meta, &[7u8; 3000]);
+    patch(&seg, end, &buf[..buf.len() / 2]);
+}
+
+#[when(regex = r"^an early record of node (\d+)'s active segment is damaged$")]
+async fn damage(w: &mut Mesh, i: usize) {
+    let seg = w.active_segment(i);
+    let (_, recs) = records(&seg);
+    let (off, _) = recs[10];
+    patch(&seg, off + record::HEADER as u64 + 40, &[0x5A, 0xA5]);
+}
+
+#[when(regex = r"^retention has run on node (\d+)$")]
+async fn retention_ran(_w: &mut Mesh, _i: usize) {
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+}
+
+#[when(regex = r"^repair has run on every node$")]
+async fn repair(w: &mut Mesh) {
+    for i in 0..w.n {
+        match w.client().control(i, &Control::Repair).await.unwrap() {
+            ControlResp::Repair { errors, .. } => {
+                assert!(errors.is_empty(), "node {i}: {errors:?}")
+            }
+            r => panic!("{r:?}"),
+        }
+    }
+}
+
+#[then(regex = r"^every acknowledged batch is readable from node (\d+)$")]
+async fn all_readable(w: &mut Mesh, i: usize) {
+    for ws in &w.writers {
+        let seqs: Vec<u64> = (0..ws.acked).collect();
+        let got = w.fetch(i, ws, &seqs).await;
+        assert_eq!(
+            got.len() as u64,
+            ws.acked,
+            "{} of {} acknowledged batches on node {i}",
+            got.len(),
+            ws.acked
+        );
+        for b in got {
+            let e = b.events().next().unwrap();
+            assert_eq!(
+                &e.payload[..],
+                &payload(&ws.name, b.id.first_seq, ws.size)[..],
+                "payload of {}",
+                b.id.first_seq
+            );
+        }
+    }
+}
+
+#[then(regex = r"^every acknowledged batch is held by (?:at least (\d+)|all (\d+)) nodes$")]
+async fn held_by(w: &mut Mesh, at_least: String, all: String) {
+    let k: usize = if at_least.is_empty() {
+        all.parse().unwrap()
+    } else {
+        at_least.parse().unwrap()
+    };
+    for ws in &w.writers {
+        let seqs: Vec<u64> = (0..ws.acked).collect();
+        let mut count = vec![0usize; ws.acked as usize];
+        for i in 0..w.n {
+            for b in w.fetch(i, ws, &seqs).await {
+                count[b.id.first_seq as usize] += 1;
+            }
+        }
+        let short: Vec<usize> = count
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c < k)
+            .map(|(s, _)| s)
+            .take(5)
+            .collect();
+        assert!(
+            short.is_empty(),
+            "batches held by fewer than {k} nodes, e.g. seqs {short:?}"
+        );
+    }
+}
+
+#[then(regex = r"^node (\d+) reports at least (\d+) segments$")]
+async fn segments_at_least(w: &mut Mesh, i: usize, n: u64) {
+    let s = w.status(i).await.unwrap();
+    assert!(s.segments >= n, "{} segments", s.segments);
+}
+
+#[then(regex = r"^node (\d+) keeps at most (\d+) segments$")]
+async fn segments_at_most(w: &mut Mesh, i: usize, n: u64) {
+    let s = w.status(i).await.unwrap();
+    assert!(s.segments <= n, "{} segments", s.segments);
+}
+
+#[then(regex = r"^node (\d+) recovered by scanning at most (\d+) MiB$")]
+async fn recovered_scanning(w: &mut Mesh, i: usize, mib: u64) {
+    let s = w.status(i).await.unwrap();
+    assert!(
+        s.recovery_scanned_bytes > 0 && s.recovery_scanned_bytes <= mib << 20,
+        "scanned {}",
+        s.recovery_scanned_bytes
+    );
+}
+
+#[then(regex = r"^the newest (\d+) batches are readable from node (\d+)$")]
+async fn newest_readable(w: &mut Mesh, n: u64, i: usize) {
+    let ws = w.writers.last().unwrap();
+    let seqs: Vec<u64> = (ws.acked - n..ws.acked).collect();
+    assert_eq!(w.fetch(i, ws, &seqs).await.len() as u64, n);
+}
+
+#[then(regex = r"^the oldest batch is gone from node (\d+)$")]
+async fn oldest_gone(w: &mut Mesh, i: usize) {
+    let ws = w.writers.last().unwrap();
+    assert!(w.fetch(i, ws, &[0]).await.is_empty());
+}
+
+#[then(regex = r"^node (\d+) holds exactly the writer's (\d+) batches$")]
+async fn holds_exactly(w: &mut Mesh, i: usize, n: u64) {
+    let s = w.status(i).await.unwrap();
+    let ws = w.writers.last().unwrap();
+    let f = s
+        .logs
+        .iter()
+        .find(|f| f.log.writer == ws.name)
+        .expect("writer's log");
+    assert_eq!((f.contiguous, f.high), (n, n));
+}
+
+#[then(regex = r#"^node (\d+) refuses to start, saying "([^"]+)"$"#)]
+async fn refuses(w: &mut Mesh, i: usize, msg: String) {
+    w.start(i);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let st = w.procs.lock().unwrap()[i]
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap();
+        if let Some(st) = st {
+            assert!(!st.success(), "node exited successfully");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node {i} started despite the damage"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let log = w.node_log(i).to_lowercase();
+    assert!(
+        log.contains(&msg.to_lowercase()),
+        "log does not mention {msg:?}: {log}"
+    );
+}
+
+#[then(regex = r"^every subscriber received every acknowledged batch in writer order$")]
+async fn subscribers_complete(w: &mut Mesh) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for (log, _) in &w.subs {
+        loop {
+            let done = {
+                let l = log.lock().unwrap();
+                w.writers
+                    .iter()
+                    .all(|ws| l.iter().filter(|x| x.0 == ws.name).count() as u64 == ws.acked)
+            };
+            if done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "a subscriber is missing batches");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let l = log.lock().unwrap();
+        for ws in &w.writers {
+            let seqs: Vec<u64> = l.iter().filter(|x| x.0 == ws.name).map(|x| x.1).collect();
+            assert_eq!(
+                seqs,
+                (0..ws.acked).collect::<Vec<_>>(),
+                "{}: out of order or duplicated",
+                ws.name
+            );
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    Mesh::cucumber()
+        .max_concurrent_scenarios(1)
+        .fail_on_skipped()
+        .run_and_exit("tests/acceptance/features")
+        .await;
+}

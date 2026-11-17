@@ -102,3 +102,21 @@ async fn a_storage_fault_fences_the_node() {
     let ack = node.append(1, batch("other", 0, 100)).await;
     assert!(!ack.is_success(), "a fenced node acknowledges nothing");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reports_recovery_and_segments() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let (node, _) = Node::open(config(d.path())).await.unwrap();
+        append_n(&node, "w", 120, 1500).await;
+    }
+    let (node, _) = Node::open(config(d.path())).await.unwrap();
+    let s = node.status();
+    assert_eq!(s.batches, 120);
+    assert!(s.segments >= 3, "{s:?}");
+    assert!(
+        s.recovery_scanned_bytes > 0 && s.recovery_scanned_bytes <= 64 * 1024,
+        "{s:?}"
+    );
+    assert!(s.fsyncs == 0, "fsyncs count this process's group commits");
+}

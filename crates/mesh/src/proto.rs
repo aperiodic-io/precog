@@ -442,6 +442,12 @@ pub struct Status {
     pub bytes: u64,
     pub wal_bytes: u64,
     pub fsyncs: u64,
+    /// Segment files in the node's log.
+    #[serde(default)]
+    pub segments: u64,
+    /// Bytes the last startup had to scan to recover (only the active segment).
+    #[serde(default)]
+    pub recovery_scanned_bytes: u64,
     pub logs: Vec<Frontier>,
 }
 

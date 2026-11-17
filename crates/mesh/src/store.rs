@@ -71,6 +71,9 @@ struct Inner {
     order: BTreeMap<Lsn, (BatchId, u32, u32, u32)>,
     /// Per writer log: sequences below this were trimmed by retention.
     trimmed: HashMap<LogId, u64>,
+    /// Every LSN below this is in `order` (or trimmed). Subscriptions read only below it:
+    /// batches are marked durable in any order, but a reader must never skip one.
+    contiguous: Lsn,
     events: u64,
     bytes: u64,
 }
@@ -93,6 +96,7 @@ impl Store {
         {
             let mut g = s.inner.lock();
             let inner = &mut *g;
+            inner.contiguous = s.reader.next_lsn(); // everything recovered is durable
             for e in entries {
                 let log = decode_log_key(&e.meta.key)?;
                 let id = BatchId {
@@ -216,6 +220,9 @@ impl Store {
             .insert(lsn, (id.clone(), sh.count, sh.crc, sh.len));
         inner.events += sh.count as u64;
         inner.bytes += sh.len as u64;
+        while inner.order.contains_key(&inner.contiguous) {
+            inner.contiguous += 1;
+        }
         drop(g);
         self.durable_notify.notify_waiters();
     }
@@ -233,6 +240,7 @@ impl Store {
     pub fn trim(&self, floor: Lsn) {
         let mut g = self.inner.lock();
         let inner = &mut *g;
+        inner.contiguous = inner.contiguous.max(floor);
         let keep = inner.order.split_off(&floor);
         let gone = std::mem::replace(&mut inner.order, keep);
         for (_, (id, count, _, len)) in gone {
@@ -313,7 +321,7 @@ impl Store {
             let g = self.inner.lock();
             let mut size = 0usize;
             let mut v = vec![];
-            for (&lsn, (id, _, _, len)) in g.order.range(from..) {
+            for (&lsn, (id, _, _, len)) in g.order.range(from..g.contiguous.max(from)) {
                 if size >= max_bytes {
                     break;
                 }
@@ -336,11 +344,7 @@ impl Store {
 
     /// The LSN a subscription "from now" starts at.
     pub fn durable_len(&self) -> u64 {
-        self.inner
-            .lock()
-            .order
-            .last_key_value()
-            .map_or(0, |(&l, _)| l + 1)
+        self.inner.lock().contiguous
     }
 
     pub fn totals(&self) -> (u64, u64, u64) {
@@ -587,6 +591,38 @@ mod tests {
         );
         let (items, next, more) = t.s.inventory(0, 10);
         assert_eq!((items[0].0, next, more), (3, 6, false));
+    }
+
+    #[test]
+    fn tail_never_skips_a_batch_marked_durable_out_of_lsn_order() {
+        // LSNs come from the log in order, but tasks mark batches durable in any order
+        let mut t = store();
+        let xs: Vec<Batch> = (0..3).map(|i| b("w", 1, i, &[(i, b"x")])).collect();
+        let mut lsns = vec![];
+        for x in &xs {
+            t.s.reserve(x);
+            let m = Meta {
+                key: encode_log_key(&x.id.log),
+                first_seq: x.id.first_seq,
+                count: 1,
+                tag: batch_crc(&x.bytes),
+                time_ms: 0,
+            };
+            lsns.push(t.log.append(&[(m, &x.bytes[..])]).unwrap());
+        }
+        t.s.mark_durable(&xs[0].id, lsns[0]);
+        t.s.mark_durable(&xs[2].id, lsns[2]); // lsn 2 before lsn 1
+        let (got, next) = t.s.tail(0, None, 1 << 20);
+        assert_eq!(
+            got.len(),
+            1,
+            "only the contiguous prefix is visible to subscribers"
+        );
+        t.s.mark_durable(&xs[1].id, lsns[1]);
+        let (got, next2) = t.s.tail(next, None, 1 << 20);
+        assert_eq!(got.len(), 2);
+        assert_eq!(next2, 3);
+        assert_eq!(t.s.durable_len(), 3);
     }
 
     #[test]
