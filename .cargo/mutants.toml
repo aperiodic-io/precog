@@ -1,0 +1,6 @@
+# cargo-mutants: every mutant in changed production code must be caught by a unit, property or
+# integration test. The acceptance suite (real processes, minutes) is not run per mutant.
+test_tool = "nextest"
+additional_cargo_test_args = ["-E", "not binary(acceptance)"]
+# benchmarks, examples and the CLI's argument plumbing are not production logic
+exclude_globs = ["crates/*/benches/**", "crates/*/examples/**", "crates/storage-bench/**", "crates/bench/**"]

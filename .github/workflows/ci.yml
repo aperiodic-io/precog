@@ -1,0 +1,163 @@
+name: ci
+on:
+  pull_request:
+    # ready_for_review: a draft's mutants run once it is ready (mutants-plan)
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+# a newer push to a PR makes its running checks moot; pushes to main are never cancelled
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions: { contents: read }
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # storage-bench links RocksDB (C++, libclang): evidence for the storage design, not product
+  # code, so it is left out of every job
+  WS: --workspace --exclude storage-bench
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # main saves the cache; pull requests restore it (their own copies would evict main's)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
+      - run: cargo fmt --all --check
+      - run: cargo clippy $WS --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with: { tool: "cargo-nextest,cargo-llvm-cov" }
+      # unit, property and integration tests (TCP and Iroh clusters on loopback) with coverage;
+      # the acceptance suite runs in its own job
+      - run: cargo llvm-cov nextest $WS --exclude precog-bench --lcov --output-path lcov.info -E 'not binary(acceptance)'
+      - run: scripts/coverage-gate.sh lcov.info
+
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
+      # real precog-node processes: SIGKILL, damaged files, retention, 3-node mesh, Iroh.
+      # @stress and @nightly scenarios run in nightly.yml.
+      - run: cargo test -p precog-mesh --test acceptance -- --tags 'not @nightly and not @stress'
+
+  # One shard per 150 mutants of the diff, at most 4; none without mutants. Drafts skip it.
+  mutants-plan:
+    if: github.event_name == 'pull_request' && !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    outputs: { shards: "${{ steps.plan.outputs.shards }}", count: "${{ steps.plan.outputs.count }}" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with: { tool: cargo-mutants }
+      - id: plan
+        run: |
+          git diff origin/${{ github.base_ref }}... -- '*.rs' > pr.diff
+          n=$(cargo mutants --list --in-diff pr.diff -p precog-storage -p precog-mesh | wc -l)
+          k=$(( (n + 149) / 150 )); if [ "$k" -gt 4 ]; then k=4; fi
+          echo "$n mutants: $k shards"
+          echo "count=$k" >> "$GITHUB_OUTPUT"
+          echo "shards=[$(seq -s, 0 $((k - 1)))]" >> "$GITHUB_OUTPUT"
+
+  mutants:
+    needs: [lint, mutants-plan]
+    if: needs.mutants-plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: { shard: "${{ fromJSON(needs.mutants-plan.outputs.shards) }}" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { shared-key: mutants, cache-on-failure: true }
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with: { tool: "cargo-mutants,cargo-nextest" }
+      - run: git diff origin/${{ github.base_ref }}... -- '*.rs' > pr.diff
+      # Every mutant in changed production code must be caught. Exit 2: missed; 3: timed out
+      # (it hung the suite, so it was detected) - a 3 passes only when nothing was missed.
+      - env: { CARGO_INCREMENTAL: "1" }
+        run: |
+          c=0
+          cargo mutants --in-diff pr.diff -p precog-storage -p precog-mesh --no-shuffle \
+            --shard ${{ matrix.shard }}/${{ needs.mutants-plan.outputs.count }} || c=$?
+          if [ "$c" -eq 3 ] && [ -s mutants.out/timeout.txt ] && ! [ -s mutants.out/missed.txt ]; then c=0; fi
+          exit "$c"
+      - if: failure()
+        run: cat mutants.out/missed.txt 2>/dev/null || true
+
+  # Instruction counts (callgrind) of the hot paths: the PR may add at most 2% over its merge
+  # base, measured in this run (never against an older run's numbers).
+  bench-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "false" }
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with: { tool: "gungraun-runner@0.19.4" }
+      - run: |
+          export GUNGRAUN_HOME="$RUNNER_TEMP/gungraun"
+          rm -rf "$GUNGRAUN_HOME"
+          base=$(git merge-base HEAD origin/${{ github.base_ref }})
+          pkgs=""
+          for p in storage mesh; do
+            if git cat-file -e "$base:crates/$p/benches/gate.rs" 2> /dev/null; then pkgs="$pkgs -p precog-$p"; fi
+          done
+          if [ -n "$pkgs" ]; then
+            git checkout -q "$base"
+            cargo bench $pkgs --bench gate -- --save-baseline=base
+            git checkout -q ${{ github.sha }}
+            cargo bench -p precog-storage -p precog-mesh --bench gate -- --baseline=base --callgrind-limits='ir=2%'
+          else
+            echo "::warning::the merge base $base has no gate benches: nothing to compare with, the PR's only run"
+            cargo bench -p precog-storage -p precog-mesh --bench gate
+          fi
+
+  # Wall-clock throughput, the PR against its merge base on this one runner, alternating runs
+  # (bench/perf-gate/gate.py): storage group commit and a 3-node durable-2 mesh. Catches what
+  # instruction counts cannot see: fsync, syscalls, threads, the network.
+  perf-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "false" }
+      - run: |
+          build() { # <dir>
+            cargo build --release --locked -p precog-mesh -p precog-bench
+            cargo build --release --locked -p precog-storage --example throughput
+            mkdir -p "$1"
+            cp target/release/precog-node target/release/precog-bench target/release/examples/throughput "$1"/
+          }
+          base=$(git merge-base HEAD origin/${{ github.base_ref }})
+          git checkout -q "$base"
+          if [ -f crates/storage/examples/throughput.rs ]; then
+            build "$RUNNER_TEMP/base"
+          else
+            echo "::warning::the merge base has no throughput example: comparing the PR with itself"
+            skip_base=1
+          fi
+          git checkout -q ${{ github.sha }}
+          build "$RUNNER_TEMP/head"
+          if [ -n "${skip_base:-}" ]; then cp -r "$RUNNER_TEMP/head" "$RUNNER_TEMP/base"; fi
+      - run: python3 bench/perf-gate/gate.py --base "$RUNNER_TEMP/base" --head "$RUNNER_TEMP/head"
