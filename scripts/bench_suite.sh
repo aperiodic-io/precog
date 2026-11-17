@@ -2,7 +2,7 @@
 # Full append benchmark: Apache Iggy 0.10 (official SDK) vs precog mesh.
 # Every run starts from a fresh cluster. Results: results/suite.jsonl
 #   REPS=3 DUR=10 scripts/bench_suite.sh [section...]
-# Sections: single cluster iggyfair batch nosync
+# Sections: single cluster iggyfair batch nosync subs
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPS=${REPS:-3}; DUR=${DUR:-10}; WARM=${WARM:-2}
@@ -38,7 +38,7 @@ run() {
     local target=mesh extra=()
     case $sys in iggy1) target=iggy ;; iggy3) target=iggy; extra=(--iggy "$I3" --replication 3) ;; esac
     timeout $((DUR + WARM + 60)) $BENCH $target --label "$label" --duration "$DUR" --warmup "$WARM" \
-      "${extra[@]}" "$@" --json results/.last.jsonl 2>&1 | grep -v "^\s*$" | tail -1
+      "${extra[@]}" "$@" --json results/.last.jsonl 2>&1 | grep -v "^\s*$" | tail -2
     local t1; t1=$(cpu_ticks "${pidf[@]}")
     # annotate the last JSON line with server CPU seconds and repetition
     python3 - "$OUT" "$label" "$r" "$(( t1 - t0 ))" "$(getconf CLK_TCK)" <<'PY'
@@ -58,7 +58,7 @@ PY
   done
 }
 
-sections=("$@"); [ ${#sections[@]} -eq 0 ] && sections=(single cluster iggyfair batch nosync)
+sections=("$@"); [ ${#sections[@]} -eq 0 ] && sections=(single cluster iggyfair batch nosync subs)
 for s in "${sections[@]}"; do
   case $s in
   single) # one node, fsync before ack
@@ -83,6 +83,15 @@ for s in "${sections[@]}"; do
       run "batch/iggy-persisted-rf3/b$b" iggy3 -- --producers 6 --batch $b --durability persisted
       run "batch/mesh-c2-tcp/b$b" mesh3 -- --producers 6 --batch $b --copies 2
     done ;;
+  subs) # live feed: every subscriber reads the whole stream while 6 producers write (durable-2)
+    for n in 1 4 16 32; do  # equal offered load: 6 x 100 batches/s x 100 msgs = 60k msg/s
+      run "subs/iggy-persisted-rf3/rate60k-s$n" iggy3 -- --producers 6 --rate 100 --subscribers $n --durability persisted
+      run "subs/mesh-c2-tcp/rate60k-s$n" mesh3 -- --producers 6 --rate 100 --subscribers $n --copies 2
+    done
+    run "subs/mesh-c2-iroh/rate60k-s16" mesh3 iroh -- --producers 6 --rate 100 --subscribers 16 --copies 2
+    # as fast as possible with 16 subscribers
+    run "subs/iggy-persisted-rf3/max-s16" iggy3 -- --producers 6 --subscribers 16 --durability persisted
+    run "subs/mesh-c2-tcp/max-s16" mesh3 -- --producers 6 --subscribers 16 --copies 2 ;;
   nosync) # no fsync barrier: Iggy 'replicated' vs mesh without fdatasync
     run "nosync/iggy-replicated-rf3/p6" iggy3 -- --producers 6 --durability replicated
     MESH_NO_SYNC=1 run "nosync/mesh-c2-nosync-tcp/p6" mesh3 -- --producers 6 --copies 2 ;;

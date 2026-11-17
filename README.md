@@ -51,6 +51,62 @@ Every mesh run was checked after the fact: all three nodes hold exactly the
 acknowledged event count. Iggy's topic counter matched the acknowledged count,
 except for the unknown-outcome batches noted in the SIGSTOP row.
 
+## Live feed with multiple subscribers
+
+Each subscriber receives **every** message of the stream while 6 producers
+write with durable-2 acks on 3 nodes. Subscribers are spread across the nodes.
+
+* **Iggy:** standalone `PartitionReader`s over all partitions, using long-poll fetch.
+* **Mesh:** `Subscription`s with server push of raw batches.
+
+End-to-end latency runs from the producer's timestamp before sending to the
+moment the subscriber receives the message. Medians are over 3 runs. Every
+subscriber received every acknowledged message in all 33 runs.
+
+| Fixed load, 60k msg/s | Iggy e2e p50 / p99 | Mesh (TCP) e2e p50 / p99 | Server CPU per produced msg, Iggy → mesh |
+|---|---|---|---|
+| 1 subscriber | 2.7 / 5.9 ms | **0.95 / 2.6 ms** | 17.7 → 7.2 µs |
+| 4 subscribers | 2.7 / 5.5 ms | **1.0 / 3.0 ms** | 19.5 → 6.8 µs |
+| 16 subscribers | 4.0 / 9.3 ms | **1.3 / 3.5 ms** (Iroh: 2.1 / 4.8) | 24.5 → 7.8 µs |
+| 32 subscribers | 6.6 / 18.8 ms | **1.4 / 3.3 ms** | 30.3 → 10.5 µs |
+
+| As fast as possible, 16 subscribers | Iggy | Mesh (TCP) |
+|---|---:|---:|
+| Produced (durable-2) | 90k msg/s | **284k msg/s (3.1×)** |
+| Delivered, summed over subscribers | 1.44M msg/s | **4.54M msg/s** |
+| e2e p50 / p99 | 7.1 / 15.6 ms | **2.0 / 6.1 ms** |
+
+What this shows:
+
+* **Mesh latency stays flat as subscribers are added. Iggy's grows** (p99 went
+  from 5.9 to 18.8 ms between 1 and 32 subscribers). Iggy's producers slow down
+  too, because polls compete with writes on the same shards. A mesh node keeps one
+  in-memory log, and every subscription is just a cursor into it. It pushes the
+  same refcounted batch bytes to every subscriber, so it does no per-subscriber
+  encoding and no polling round trips.
+* **Visibility is not identical.** A mesh node pushes a batch once it is durable
+  *on that node*. Iggy delivers only committed messages, which means quorum. A
+  mesh subscriber can therefore see a batch whose durable-2 ack has not yet
+  reached the producer. A "deliver at k copies" mode would make the two
+  equivalent; it is not built yet.
+* **POC limits of the feed:** there is no resume or failover of a subscription
+  to another node (resuming by per-log frontiers is the plan), and no consumer
+  groups or stored offsets.
+
+## Further performance work, ranked by expected gain
+
+| # | Change | Why | Evidence / expected |
+|---|---|---|---|
+| 1 | **Pipelining per writer** (several batches in flight per writer log) | Sequences are assigned by the writer, so in-flight batches never conflict; the store already accepts out-of-order ranges. | Closed-loop producers are latency-bound today. Expect several-× per-producer throughput. |
+| 2 | **Client-side linger batching** (combine small appends for ~0.5–1 ms) | Per-batch cost dominates small batches. | Measured: 10-message batches 61k msg/s vs 1000-message batches 743k msg/s. |
+| 3 | **Preallocated WAL segments** (fallocate + zero, recycle files) | `fdatasync` on an appending file also commits the file-size metadata. | **Measured on this disk: 27 KB fdatasync p50 297 → 123 µs (2.4×).** |
+| 4 | **Several WAL files per node** (one per core, or per NVMe queue) | A single file allows only one sync in flight, and NVMe can run many in parallel. | Raises the per-node durable ceiling on real NVMe. |
+| 5 | **Fan-out to `copies-1` peers first**, the rest later (hedged after a delay) | Today every append goes to 2 peers. For durable-2 one peer is enough on the hot path. | ~⅓ less network and replica CPU per message. |
+| 6 | **Vectored writes / zero-copy framing** | `write_loop` copies every batch into a frame buffer, once per connection. That hurts most with many subscribers. | Lower CPU per delivered message. |
+| 7 | **Thread-per-core runtime** (like Iggy's compio) and shard the store lock per log | Removes cross-thread hops (Tokio ↔ WAL thread) and one global mutex. | Matters past ~8 cores. |
+| 8 | **Iroh: several QUIC streams per peer, larger flow-control windows** | One stream means head-of-line blocking between requests. | Iroh is 30–40% behind TCP today. |
+| 9 | **Coalesce subscriber wakeups** | Every durable batch wakes every subscription. | CPU at high subscriber counts. |
+
 ## Why the mesh is faster here, and what it costs
 
 **1. The gain is in the durability path, not in a faster server.** With fsync
@@ -127,7 +183,7 @@ connectivity. Pooling several streams per peer is the obvious next optimization.
 ## Reproduce
 
 ```bash
-cargo test                       # 11 unit + 6 multi-node tests (TCP and Iroh)
+cargo test                       # 11 unit + 7 multi-node tests (TCP and Iroh, live feed)
 cargo build --release
 ```
 
@@ -139,6 +195,10 @@ mkdir -p run/bin && id=$(docker create apache/iggy:latest) && docker cp $id:/usr
 
 ```bash
 REPS=3 DUR=10 scripts/bench_suite.sh          # ~25 min -> results/suite.jsonl
+```
+
+```bash
+OUT=results/subs.jsonl scripts/bench_suite.sh subs   # live-feed section, ~15 min
 ```
 
 ```bash

@@ -252,6 +252,10 @@ impl Node {
                 Ok(Some(f)) => f,
                 _ => break,
             };
+            if f.kind == Kind::Subscribe {
+                tokio::spawn(self.clone().push_loop(f, tx.clone()));
+                continue;
+            }
             let Ok(permit) = per_conn.clone().acquire_owned().await else {
                 break;
             };
@@ -266,6 +270,41 @@ impl Node {
                 let _ = tx.send(resp).await;
                 drop(permit);
             });
+        }
+    }
+
+    /// Live feed: pushes every batch that becomes durable on this node, in
+    /// local durable order, starting at the oldest one or at "now". Each
+    /// subscription keeps its own cursor into the node's log, so a slow
+    /// subscriber only slows its own connection (bounded channel + transport
+    /// flow control) and never drops data or blocks writers.
+    async fn push_loop(self: Arc<Self>, req: Frame, tx: mpsc::Sender<Frame>) {
+        let sub: Subscribe = match serde_json::from_slice(&req.body) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Frame::new(Kind::Error, req.req_id, Bytes::from(e.to_string()))).await;
+                return;
+            }
+        };
+        let mut pos = if sub.from_start { 0 } else { self.store.durable_len() };
+        loop {
+            let notified = self.store.durable_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable(); // register before checking: no lost wakeups
+            let (batches, next) = self.store.tail(pos, sub.stream.as_deref(), 1 << 20);
+            pos = next;
+            if batches.is_empty() {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tx.closed() => return,
+                }
+                continue;
+            }
+            for b in batches {
+                if tx.send(Frame::new(Kind::Push, req.req_id, b)).await.is_err() {
+                    return;
+                }
+            }
         }
     }
 

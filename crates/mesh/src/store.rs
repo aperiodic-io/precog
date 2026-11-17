@@ -41,6 +41,8 @@ struct Inner {
     streams: HashMap<String, BTreeSet<LogId>>,
     /// Local durable order; inventory index i+1 refers to order[i].
     order: Vec<(BatchId, u32, u32)>,
+    /// Batch bytes in local durable order (shared with `logs`, refcounted).
+    order_bytes: Vec<bytes::Bytes>,
     events: u64,
     bytes: u64,
 }
@@ -48,6 +50,8 @@ struct Inner {
 #[derive(Default)]
 pub struct Store {
     inner: Mutex<Inner>,
+    /// Woken whenever a batch becomes durable (live subscriptions).
+    pub durable_notify: tokio::sync::Notify,
 }
 
 impl Store {
@@ -127,8 +131,11 @@ impl Store {
         );
         e.state.send_replace(State::Durable);
         inner.order.push((id.clone(), count, crc));
+        inner.order_bytes.push(e.batch.bytes.clone());
         inner.events += count as u64;
         inner.bytes += len as u64;
+        drop(g);
+        self.durable_notify.notify_waiters();
     }
 
     pub fn mark_failed(&self, id: &BatchId) {
@@ -170,6 +177,27 @@ impl Store {
             .map(|(i, (id, n, crc))| ((start + i + 1) as u64, id.clone(), *n, *crc))
             .collect();
         (items, end as u64, end < g.order.len())
+    }
+
+    /// Durable batches at local positions `from..`, optionally only one
+    /// stream, up to `max_bytes`. Returns the batches and the next position.
+    pub fn tail(&self, from: usize, stream: Option<&str>, max_bytes: usize) -> (Vec<bytes::Bytes>, usize) {
+        let g = self.inner.lock();
+        let mut out = Vec::new();
+        let mut size = 0;
+        let mut pos = from.min(g.order.len());
+        while pos < g.order.len() && size < max_bytes {
+            if stream.is_none_or(|s| g.order[pos].0.log.stream == s) {
+                size += g.order_bytes[pos].len();
+                out.push(g.order_bytes[pos].clone());
+            }
+            pos += 1;
+        }
+        (out, pos)
+    }
+
+    pub fn durable_len(&self) -> usize {
+        self.inner.lock().order.len()
     }
 
     pub fn totals(&self) -> (u64, u64, u64) {

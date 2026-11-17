@@ -68,3 +68,24 @@ for label, rs in groups.items():
         f"| {name} | | {t:,.0f} | | | | | | - | {ratio} |"
     )
 print("\n".join(out).lstrip("\n"))
+
+# ---- live-feed (subscriber) runs, from results/subs.jsonl if present
+import os
+sp = "results/subs.jsonl"
+if os.path.exists(sp) and path != sp:
+    srows = [json.loads(l) for l in open(sp) if l.strip()]
+    sg = OrderedDict()
+    for r in srows:
+        sg.setdefault(r["label"], []).append(r)
+    print("\n### Live feed: S subscribers each receive the whole stream (3 nodes, 6 producers, durable-2)\n")
+    print("End-to-end latency = producer stamp before send -> message handed to the subscriber. "
+          "`rate60k` = fixed 60k msg/s offered by both systems; `max` = producers as fast as acks allow.\n")
+    print("| run | subs | produced msg/s | delivered msg/s per sub | delivered total | e2e p50 ms | e2e p99 ms | e2e p99.9 ms | e2e max ms | complete | server CPU µs/produced msg |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|")
+    for label, rs in sg.items():
+        _, sysname, point = label.split("/")
+        comp = sum(1 for r in rs if r["subs_complete"].split("/")[0] == r["subs_complete"].split("/")[1].split(" ")[0])
+        cpu = med(rs, "server_cpu_us_per_msg")
+        print(f"| {sysname} {point} | {rs[0]['subscribers']} | {med(rs,'msgs_per_sec'):,.0f} | {med(rs,'sub_msgs_per_sec_each'):,.0f} | "
+              f"{med(rs,'sub_msgs_per_sec_total'):,.0f} | {ms(med(rs,'e2e_us_p50'))} | {ms(med(rs,'e2e_us_p99'))} | {ms(med(rs,'e2e_us_p999'))} | "
+              f"{ms(med(rs,'e2e_us_max'))} | {comp}/{len(rs)} runs | {cpu:.2f} |")

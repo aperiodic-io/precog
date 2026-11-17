@@ -5,6 +5,15 @@
 //! batch in flight: build B messages of S random bytes, send, wait for the
 //! acknowledgement. Latency is measured from send start to ack. Every Iggy
 //! producer owns one partition; every mesh producer owns one writer log.
+//!
+//! `--rate R` turns each producer open-loop at R batches/s (still at most one
+//! in flight), so both systems carry the same offered load.
+//!
+//! `--subscribers S` adds S live-feed readers, each receiving *every* message
+//! of the stream: Iggy standalone `PartitionReader`s over all partitions
+//! (long-poll fetch), mesh `Subscription`s (server push). Producers stamp
+//! the first 8 payload bytes with wall-clock µs, so each delivered message
+//! yields an end-to-end (produce -> subscriber) latency.
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -52,6 +61,12 @@ struct Args {
     bucket_ms: u64,
     #[arg(long)]
     json: Option<std::path::PathBuf>,
+    /// Batches per second per producer (0 = closed loop, as fast as acks allow).
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
+    /// Live subscribers, each reading the whole stream (spread over nodes).
+    #[arg(long, default_value_t = 0)]
+    subscribers: usize,
 
     // --- iggy
     /// Comma-separated iggy connection strings (one per node; producer i uses i % n).
@@ -100,6 +115,17 @@ struct Report {
     producer_max_stall_ms: Vec<u64>,
     timeline: Vec<Bucket>,
     stored_check: String,
+    subscribers: usize,
+    /// Messages per second delivered to each subscriber (median subscriber).
+    sub_msgs_per_sec_each: f64,
+    /// Sum over subscribers.
+    sub_msgs_per_sec_total: f64,
+    e2e_us_p50: u64,
+    e2e_us_p99: u64,
+    e2e_us_p999: u64,
+    e2e_us_max: u64,
+    /// Subscribers that received every acknowledged message.
+    subs_complete: String,
     args: String,
 }
 
@@ -119,6 +145,74 @@ struct Shared {
     bucket_ms: u64,
     errors: AtomicU64,
     acked_total: AtomicU64,
+    /// Wall-clock µs at which the measured window starts.
+    measure_from_wall_us: u64,
+    subs: parking_lot_free::SubStats,
+}
+
+mod parking_lot_free {
+    use hdrhistogram::Histogram;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    #[derive(Default)]
+    pub struct SubStats {
+        pub hist: Mutex<Option<Histogram<u64>>>,
+        /// Per subscriber: messages delivered in total / stamped inside the window.
+        pub total: Mutex<Vec<u64>>,
+        pub window: Mutex<Vec<u64>>,
+        pub delivered_total: AtomicU64,
+    }
+}
+
+fn wall_us() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64
+}
+
+/// Copies the template payload with the send timestamp in its first 8 bytes.
+fn stamped(template: &Bytes, ts: u64) -> Bytes {
+    let mut b = bytes::BytesMut::from(&template[..]);
+    let n = b.len().min(8);
+    b[..n].copy_from_slice(&ts.to_le_bytes()[..n]);
+    b.freeze()
+}
+
+fn stamp_of(payload: &[u8]) -> Option<u64> {
+    payload.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+}
+
+/// Records one received batch of stamped payloads.
+struct SubRecorder {
+    hist: Histogram<u64>,
+    total: u64,
+    window: u64,
+    from_us: u64,
+}
+
+impl SubRecorder {
+    fn new(sh: &Shared) -> SubRecorder {
+        SubRecorder { hist: Histogram::new_with_bounds(1, 600_000_000, 3).unwrap(), total: 0, window: 0, from_us: sh.measure_from_wall_us }
+    }
+    fn record<'a>(&mut self, payloads: impl Iterator<Item = &'a [u8]>) {
+        let now = wall_us();
+        for p in payloads {
+            self.total += 1;
+            if let Some(ts) = stamp_of(p)
+                && ts >= self.from_us
+            {
+                self.window += 1;
+                let _ = self.hist.record(now.saturating_sub(ts).max(1));
+            }
+        }
+    }
+    fn done(self, sh: &Shared) {
+        let mut h = sh.subs.hist.lock().unwrap();
+        match h.as_mut() {
+            Some(x) => x.add(&self.hist).unwrap(),
+            None => *h = Some(self.hist),
+        }
+        sh.subs.total.lock().unwrap().push(self.total);
+        sh.subs.window.lock().unwrap().push(self.window);
+    }
 }
 
 impl Shared {
@@ -158,7 +252,11 @@ async fn main() -> Result<()> {
         bucket_ms: args.bucket_ms,
         errors: AtomicU64::new(0),
         acked_total: AtomicU64::new(0),
+        measure_from_wall_us: wall_us() + args.warmup * 1_000_000,
+        subs: Default::default(),
     });
+    let sub_stop = Arc::new(AtomicBool::new(false));
+    let mut sub_handles = Vec::new();
 
     let mut handles = Vec::new();
     let stored_check;
@@ -168,6 +266,15 @@ async fn main() -> Result<()> {
             let admin = IggyClient::from_connection_string(&conns[0])?;
             admin.connect().await?;
             setup_iggy(&admin, &args).await?;
+            let parts = args.partitions.unwrap_or(args.producers as u32);
+            for s in 0..args.subscribers {
+                let c = IggyClient::from_connection_string(&conns[s % conns.len()])?;
+                c.connect().await?;
+                sub_handles.push(tokio::spawn(iggy_subscriber(c, s, parts, shared.clone(), sub_stop.clone())));
+            }
+            if args.subscribers > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             for p in 0..args.producers {
                 let c = IggyClient::from_connection_string(&conns[p % conns.len()])?;
                 c.connect().await?;
@@ -184,6 +291,7 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(total).saturating_sub(s)).await;
             shared.stop.store(true, Ordering::Release);
             let hs = join(handles).await?;
+            drain_subs(&shared, &sub_stop, sub_handles).await;
             tokio::time::sleep(Duration::from_millis(600)).await; // commit broadcast reaches all nodes
             let t = admin
                 .get_topic(&Identifier::named("bench")?, &Identifier::named("t")?)
@@ -217,6 +325,14 @@ async fn main() -> Result<()> {
                     before = before.max(s.events);
                 }
             }
+            for s in 0..args.subscribers {
+                let mc = MeshClient::new(addrs.clone(), token.clone()).await?;
+                let sub = mc.subscribe(s % addrs.len(), Some("bench"), false).await?;
+                sub_handles.push(tokio::spawn(mesh_subscriber(sub, mc, shared.clone(), sub_stop.clone())));
+            }
+            if args.subscribers > 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             for p in 0..args.producers {
                 let mut mc =
                     Arc::into_inner(MeshClient::new(addrs.clone(), token.clone()).await?).unwrap();
@@ -241,6 +357,7 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(total).saturating_sub(s)).await;
             shared.stop.store(true, Ordering::Release);
             let hs = join(handles).await?;
+            drain_subs(&shared, &sub_stop, sub_handles).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             let acked = shared.acked_total.load(Ordering::Relaxed);
             let mut per_node = Vec::new();
@@ -308,11 +425,14 @@ async fn iggy_producer(
     let (mut batches, mut msgs) = (0, 0);
     let mut stall = Stall::new(&sh);
     let mut k = partition as usize;
+    let mut pace = Pace::new(args.rate);
     while !sh.stop.load(Ordering::Acquire) {
+        pace.wait().await;
+        let ts = wall_us();
         let mut m: Vec<IggyMessage> = (0..args.batch)
             .map(|i| {
                 IggyMessage::builder()
-                    .payload(payloads[(k + i) % payloads.len()].clone())
+                    .payload(stamped(&payloads[(k + i) % payloads.len()], ts))
                     .build()
             })
             .collect::<Result<_, _>>()?;
@@ -353,13 +473,12 @@ async fn mesh_producer(
     let (mut batches, mut msgs) = (0, 0);
     let mut stall = Stall::new(&sh);
     let mut k = w.preferred;
+    let mut pace = Pace::new(args.rate);
     while !sh.stop.load(Ordering::Acquire) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_micros() as u64;
-        let evs: Vec<(u64, &[u8])> = (0..args.batch)
-            .map(|i| (now, &payloads[(k + i) % payloads.len()][..]))
-            .collect();
+        pace.wait().await;
+        let now = wall_us();
+        let owned: Vec<Bytes> = (0..args.batch).map(|i| stamped(&payloads[(k + i) % payloads.len()], now)).collect();
+        let evs: Vec<(u64, &[u8])> = owned.iter().map(|p| (now, &p[..])).collect();
         k += args.batch;
         let t0 = Instant::now();
         let bytes = w.encode(&evs)?;
@@ -383,6 +502,108 @@ async fn mesh_producer(
         }
     }
     Ok((hist, batches, msgs, stall.finish()))
+}
+
+/// Open-loop pacing: batch n is due at start + n/rate (no catch-up bursts
+/// beyond one in flight; a system that falls behind simply delivers less).
+struct Pace {
+    every: Option<Duration>,
+    next: tokio::time::Instant,
+}
+
+impl Pace {
+    fn new(rate: u64) -> Pace {
+        Pace {
+            every: (rate > 0).then(|| Duration::from_secs_f64(1.0 / rate as f64)),
+            next: tokio::time::Instant::now() + Duration::from_micros(rand::random::<u64>() % 10_000),
+        }
+    }
+    async fn wait(&mut self) {
+        if let Some(e) = self.every {
+            tokio::time::sleep_until(self.next).await;
+            self.next = (self.next + e).max(tokio::time::Instant::now() - e);
+        }
+    }
+}
+
+async fn iggy_subscriber(client: IggyClient, s: usize, parts: u32, sh: Arc<Shared>, stop: Arc<AtomicBool>) -> Result<()> {
+    let stream = Identifier::named("bench")?;
+    let topic = Identifier::named("t")?;
+    let consumer = Consumer::new(Identifier::numeric(1000 + s as u32)?);
+    let mut reader = client
+        .reader(&stream, &topic, &consumer)
+        .partitions(0..parts)
+        .start(PollingStrategy::first())
+        .options(PollOptions::wait(IggyDuration::from(Duration::from_millis(500))))
+        .build()
+        .await?;
+    let mut rec = SubRecorder::new(&sh);
+    while !stop.load(Ordering::Acquire) {
+        match tokio::time::timeout(Duration::from_millis(200), reader.next()).await {
+            Ok(Ok(batch)) => {
+                let n = batch.messages.len() as u64;
+                rec.record(batch.messages.iter().map(|m| &m.payload[..]));
+                sh.subs.delivered_total.fetch_add(n, Ordering::Relaxed);
+            }
+            Ok(Err(e)) => {
+                if sh.errors.fetch_add(1, Ordering::Relaxed) < 5 {
+                    eprintln!("iggy subscriber {s}: {e:?}");
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    rec.done(&sh);
+    let _ = reader.close().await;
+    Ok(())
+}
+
+async fn mesh_subscriber(
+    mut sub: precog_mesh::client::Subscription,
+    _mc: Arc<MeshClient>,
+    sh: Arc<Shared>,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut rec = SubRecorder::new(&sh);
+    while !stop.load(Ordering::Acquire) {
+        match tokio::time::timeout(Duration::from_millis(200), sub.next()).await {
+            Ok(Some(Ok(b))) => {
+                let evs: Vec<_> = b.events().collect();
+                rec.record(evs.iter().map(|e| &e.payload[..]));
+                sh.subs.delivered_total.fetch_add(b.count as u64, Ordering::Relaxed);
+            }
+            Ok(Some(Err(e))) => {
+                if sh.errors.fetch_add(1, Ordering::Relaxed) < 5 {
+                    eprintln!("mesh subscriber: {e}");
+                }
+            }
+            Ok(None) => bail!("subscription closed"),
+            Err(_) => {}
+        }
+    }
+    rec.done(&sh);
+    Ok(())
+}
+
+/// After producers stop, give subscribers up to 15 s to receive everything
+/// that was acknowledged, then stop them.
+async fn drain_subs(sh: &Shared, stop: &AtomicBool, handles: Vec<tokio::task::JoinHandle<Result<()>>>) {
+    if handles.is_empty() {
+        return;
+    }
+    let want = sh.acked_total.load(Ordering::Relaxed) * handles.len() as u64;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while sh.subs.delivered_total.load(Ordering::Relaxed) < want && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop.store(true, Ordering::Release);
+    for h in handles {
+        match h.await {
+            Ok(Err(e)) => eprintln!("subscriber ended: {e}"),
+            Err(e) => eprintln!("subscriber panicked: {e}"),
+            _ => {}
+        }
+    }
 }
 
 struct Stall {
@@ -468,8 +689,42 @@ async fn finish(
         producer_max_stall_ms: hs.iter().map(|h| h.3).collect(),
         timeline,
         stored_check,
+        subscribers: args.subscribers,
+        sub_msgs_per_sec_each: 0.0,
+        sub_msgs_per_sec_total: 0.0,
+        e2e_us_p50: 0,
+        e2e_us_p99: 0,
+        e2e_us_p999: 0,
+        e2e_us_max: 0,
+        subs_complete: String::new(),
         args: format!("{args:?}"),
     };
+    let mut r = r;
+    if args.subscribers > 0 {
+        let mut win = sh.subs.window.lock().unwrap().clone();
+        win.sort();
+        let acked = sh.acked_total.load(Ordering::Relaxed);
+        let totals = sh.subs.total.lock().unwrap().clone();
+        r.sub_msgs_per_sec_each = win.get(win.len() / 2).copied().unwrap_or(0) as f64 / secs;
+        r.sub_msgs_per_sec_total = win.iter().sum::<u64>() as f64 / secs;
+        if let Some(h) = sh.subs.hist.lock().unwrap().as_ref() {
+            r.e2e_us_p50 = h.value_at_quantile(0.5);
+            r.e2e_us_p99 = h.value_at_quantile(0.99);
+            r.e2e_us_p999 = h.value_at_quantile(0.999);
+            r.e2e_us_max = h.max();
+        }
+        r.subs_complete = format!(
+            "{}/{} got all {} acked (min {})",
+            totals.iter().filter(|&&t| t >= acked).count(),
+            args.subscribers,
+            acked,
+            totals.iter().min().unwrap_or(&0)
+        );
+        println!(
+            "    subs {:>3}: {:>10.0} msg/s each, {:>11.0} total  e2e p50 {:>7}us p99 {:>8}us p999 {:>8}us max {:>9}us  {}",
+            r.subscribers, r.sub_msgs_per_sec_each, r.sub_msgs_per_sec_total, r.e2e_us_p50, r.e2e_us_p99, r.e2e_us_p999, r.e2e_us_max, r.subs_complete
+        );
+    }
     println!(
         "{:<28} {:>5} prod x{:>4} x{:>5}B  {:>10.0} msg/s {:>8.1} MB/s  p50 {:>7}us p99 {:>7}us p999 {:>7}us max {:>8}us  gap {:>5}ms err {} stalls {:?} | {}",
         r.label,

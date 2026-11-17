@@ -287,3 +287,44 @@ async fn restart_recovers_from_wal() {
     assert_eq!(node.store.totals().1, 5);
     assert_eq!(node.store.frontiers(None)[0].contiguous, 5);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_subscribers_receive_everything_in_writer_order() {
+    let c = cluster(3, false, &["a", "b", "c"]);
+    for i in 0..3 {
+        start(&c, i).await;
+    }
+    let mc = client(&c).await;
+    // History written before anyone subscribes.
+    let mut w1 = Writer::new(mc.clone(), "s", "w1", 1, 0, 2);
+    for i in 0..10u64 {
+        w1.append(&[(i, b"old")]).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await; // third copies land
+    let mut replay = mc.subscribe(2, Some("s"), true).await.unwrap();
+    let mut live = mc.subscribe(1, Some("s"), false).await.unwrap();
+    let mut other = mc.subscribe(1, Some("other-stream"), false).await.unwrap();
+    // Live traffic from two writers through different nodes.
+    let mut w2 = Writer::new(mc.clone(), "s", "w2", 1, 1, 2);
+    for i in 0..50u64 {
+        w1.append(&[(100 + i, b"new")]).await.unwrap();
+        w2.append(&[(100 + i, b"new"), (101 + i, b"new2")]).await.unwrap();
+    }
+    async fn drain(s: &mut precog_mesh::client::Subscription, events: u64) -> std::collections::HashMap<String, Vec<u64>> {
+        let mut got: std::collections::HashMap<String, Vec<u64>> = Default::default();
+        let mut n = 0;
+        while n < events {
+            let b = tokio::time::timeout(Duration::from_secs(5), s.next()).await.expect("feed stalled").unwrap().unwrap();
+            n += b.count as u64;
+            got.entry(b.id.log.writer.clone()).or_default().push(b.id.first_seq);
+        }
+        got
+    }
+    let r = drain(&mut replay, 10 + 50 + 100).await;
+    assert_eq!(r["w1"], (0..60).collect::<Vec<_>>());
+    assert_eq!(r["w2"], (0..50).map(|i| i * 2).collect::<Vec<_>>());
+    let l = drain(&mut live, 50 + 100).await;
+    assert_eq!(l["w1"], (10..60).collect::<Vec<_>>(), "live feed starts at subscribe time");
+    assert_eq!(l["w2"].len(), 50);
+    assert!(tokio::time::timeout(Duration::from_millis(300), other.next()).await.is_err(), "stream filter");
+}

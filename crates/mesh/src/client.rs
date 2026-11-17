@@ -142,6 +142,82 @@ impl MeshClient {
     }
 }
 
+impl MeshClient {
+    /// Opens a live subscription on one node. Delivers every batch that
+    /// becomes durable on that node, per writer log in sequence order.
+    pub async fn subscribe(&self, node: usize, stream: Option<&str>, from_start: bool) -> Result<Subscription> {
+        let c = self.link(node).await?;
+        let body = serde_json::to_vec(&Subscribe { stream: stream.map(str::to_owned), from_start })?;
+        let rx = c.subscribe(Kind::Subscribe, Bytes::from(body), 1024).await?;
+        Ok(Subscription { rx, from_start, next: Default::default(), held: Default::default(), ready: Default::default(), _conn: c })
+    }
+}
+
+/// Client end of a live feed. Restores per-log order if a node received a
+/// log's batches out of order (possible after repair), and drops batches it
+/// has already delivered.
+pub struct Subscription {
+    rx: tokio::sync::mpsc::Receiver<Frame>,
+    /// A replay must see every log from sequence 0; a live feed joins each
+    /// log at the first batch it sees.
+    from_start: bool,
+    next: std::collections::HashMap<LogId, u64>,
+    held: std::collections::HashMap<LogId, std::collections::BTreeMap<u64, Batch>>,
+    ready: std::collections::VecDeque<Batch>,
+    _conn: Arc<RpcClient>,
+}
+
+impl Subscription {
+    /// Next in-order batch; `None` when the connection closed.
+    pub async fn next(&mut self) -> Option<Result<Batch>> {
+        loop {
+            if let Some(b) = self.ready.pop_front() {
+                return Some(Ok(b));
+            }
+            let f = self.rx.recv().await?;
+            if f.kind == Kind::Error {
+                return Some(Err(anyhow::anyhow!("subscription refused: {}", String::from_utf8_lossy(&f.body))));
+            }
+            let b = match Batch::parse(f.body) {
+                Ok(b) => b,
+                Err(e) => return Some(Err(e)),
+            };
+            self.accept(b);
+        }
+    }
+
+    fn accept(&mut self, b: Batch) {
+        let log = b.id.log.clone();
+        let start = if self.from_start { 0 } else { b.id.first_seq };
+        let next = self.next.entry(log.clone()).or_insert(start);
+        if b.end_seq() <= *next {
+            return; // already delivered
+        }
+        if b.id.first_seq != *next {
+            // A writer's new epoch may start anywhere, but within an epoch
+            // a gap means an earlier batch is still on its way.
+            self.held.entry(log).or_default().insert(b.id.first_seq, b);
+            return;
+        }
+        *next = b.end_seq();
+        self.ready.push_back(b);
+        if let Some(h) = self.held.get_mut(&log) {
+            while let Some(e) = h.first_entry() {
+                let n = self.next[&log];
+                if *e.key() < n && e.get().end_seq() <= n {
+                    e.remove();
+                } else if *e.key() == n {
+                    let b = e.remove();
+                    self.next.insert(log.clone(), b.end_seq());
+                    self.ready.push_back(b);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Single-writer handle for one writer log.
 pub struct Writer {
     pub log: LogId,

@@ -89,7 +89,7 @@ What Iggy's VSR provides and the mesh deliberately does not:
 * Security: one shared token. Over TCP a token holder can claim any peer id.
   Over Iroh, peer identity is proven by key, but there is no per-writer
   authorization.
-* There is no live-tail subscription. Repair pulls the full inventory after a restart
+* Live subscriptions (`Kind::Subscribe` / `Push`, `client::Subscription`) push each batch once it is durable on the serving node, in local durable order. The client restores per-log order. There is no resume or failover to another node yet. Repair pulls the full inventory after a restart
   (cursor 0), not Merkle ranges.
 * Iroh: one connection with one bidirectional stream per peer (head-of-line
   blocking between requests). Relay mode exists but was not exercised.

@@ -219,6 +219,10 @@ pub enum Kind {
     Error = 7,
     /// Response to `Control::Fetch`: repeated `u32 len | batch`.
     Batches = 8,
+    /// Open a live subscription (JSON `Subscribe`); answered by `Push` frames
+    /// carrying the subscription's req_id, each one raw batch.
+    Subscribe = 9,
+    Push = 10,
 }
 
 impl Kind {
@@ -232,6 +236,8 @@ impl Kind {
             6 => Kind::ControlResp,
             7 => Kind::Error,
             8 => Kind::Batches,
+            9 => Kind::Subscribe,
+            10 => Kind::Push,
             _ => bail!("unknown frame kind {v}"),
         })
     }
@@ -352,6 +358,15 @@ pub struct Hello {
     pub token: String,
     /// Set when the connecting side is a mesh node (peer link).
     pub node_id: Option<u32>,
+}
+
+/// Live subscription request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Subscribe {
+    /// Only this stream (all streams if None).
+    pub stream: Option<String>,
+    /// Start from the node's first durable batch (`true`) or from now.
+    pub from_start: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

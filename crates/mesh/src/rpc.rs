@@ -77,11 +77,13 @@ pub async fn write_loop<W: AsyncWrite + Unpin>(
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Frame>>>>;
+type Subs = Arc<Mutex<HashMap<u64, mpsc::Sender<Frame>>>>;
 
 /// Client side of a multiplexed connection.
 pub struct RpcClient {
     tx: mpsc::Sender<Frame>,
     pending: Pending,
+    subs: Subs,
     next_id: AtomicU64,
     closed: Arc<AtomicBool>,
     /// Keeps the underlying transport (e.g. an Iroh connection) alive.
@@ -96,6 +98,7 @@ impl RpcClient {
     ) -> RpcClient {
         let (tx, rx) = mpsc::channel::<Frame>(4096);
         let pending: Pending = Default::default();
+        let subs: Subs = Default::default();
         let closed = Arc::new(AtomicBool::new(false));
         {
             let closed = closed.clone();
@@ -108,12 +111,25 @@ impl RpcClient {
         }
         {
             let pending = pending.clone();
+            let subs = subs.clone();
             let closed = closed.clone();
             tokio::spawn(async move {
                 let mut r = r;
                 let mut buf = BytesMut::new();
                 loop {
                     match read_frame(&mut r, &mut buf).await {
+                        Ok(Some(f)) if f.kind == Kind::Push => {
+                            let id = f.req_id;
+                            let tx = subs.lock().get(&id).cloned();
+                            if let Some(tx) = tx {
+                                // Backpressure: a slow subscriber stalls this
+                                // connection's reader, and TCP/QUIC flow
+                                // control then stalls the server's push.
+                                if tx.send(f).await.is_err() {
+                                    subs.lock().remove(&id);
+                                }
+                            }
+                        }
                         Ok(Some(f)) => {
                             if let Some(tx) = pending.lock().remove(&f.req_id) {
                                 let _ = tx.send(f);
@@ -128,11 +144,13 @@ impl RpcClient {
                 }
                 closed.store(true, Ordering::Release);
                 pending.lock().clear(); // wakes all waiters with an error
+                subs.lock().clear(); // ends all subscriptions
             });
         }
         RpcClient {
             tx,
             pending,
+            subs,
             next_id: AtomicU64::new(1),
             closed,
             _keep: keep,
@@ -141,6 +159,20 @@ impl RpcClient {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Opens a server-push stream: sends one request and returns the
+    /// receiver of every `Push` frame carrying its req_id. The stream ends
+    /// when the connection closes.
+    pub async fn subscribe(&self, kind: Kind, body: bytes::Bytes, buffer: usize) -> Result<mpsc::Receiver<Frame>> {
+        if self.is_closed() {
+            bail!("connection closed");
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(buffer);
+        self.subs.lock().insert(id, tx);
+        self.tx.send(Frame::new(kind, id, body)).await.map_err(|_| anyhow!("connection closed"))?;
+        Ok(rx)
     }
 
     pub async fn call(&self, kind: Kind, body: bytes::Bytes, timeout: Duration) -> Result<Frame> {

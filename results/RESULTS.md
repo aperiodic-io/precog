@@ -48,19 +48,20 @@
 | iggy-replicated-rf3/p6 | 100x256B | 619,960 | 611k-644k | 158.7 | 0.56 | 4.15 | 12.80 | 4.54 | baseline |
 | mesh-c2-nosync-tcp/p6 | 100x256B | 672,110 | 646k-686k | 172.1 | 0.69 | 3.42 | 19.18 | 3.92 | 1.08x |
 
-### Failover (3 nodes, 6 producers, durable-2; node 0 faulted at t=8s)
+### Live feed: S subscribers each receive the whole stream (3 nodes, 6 producers, durable-2)
 
-| run | msg/s over run | errors | per-producer longest ack gap (ms) | stored vs acked |
-|---|---:|---:|---|---|
-| iggy-kill-n0 | 144,680 | 0 | [2363, 66, 722, 2065, 66, 576] | topic reports 3113200 messages; producers acked 3113200 |
-| iggy-stop-n0 | 138,525 | 1 | [574, 967, 30001, 1303, 598, 781] | topic reports 2770600 messages; producers acked 2770500 |
-| mesh-kill-n0 | 337,270 | 0 | [71, 57, 57, 71, 46, 57] | new events per node [n0=down n1=7484300 n2=7484300]; producers acked 7484300 |
-| mesh-stop-n0 | 349,205 | 0 | [1002, 54, 54, 1000, 54, 60] | new events per node [n0=down n1=7678200 n2=7678200]; producers acked 7678200 |
-| iggy-kill-n0 | 140,130 | 0 | [2655, 110, 85, 1807, 108, 168] | topic reports 2802800 messages; producers acked 2802800 |
-| iggy-stop-n0 | 124,995 | 2 | [30001, 702, 812, 30001, 795, 874] | topic reports 2500100 messages; producers acked 2499900 |
-| mesh-kill-n0 | 339,550 | 0 | [52, 49, 49, 52, 49, 49] | new events per node [n0=down n1=7425700 n2=7425700]; producers acked 7425700 |
-| mesh-stop-n0 | 348,135 | 0 | [1002, 66, 66, 1002, 67, 68] | new events per node [n0=down n1=7655900 n2=7655900]; producers acked 7655900 |
-| iggy-kill-n0 | 139,760 | 0 | [2582, 85, 84, 2045, 49, 64] | topic reports 2822000 messages; producers acked 2822000 |
-| iggy-stop-n0 | 127,345 | 2 | [30001, 74, 231, 30001, 267, 278] | topic reports 2547200 messages; producers acked 2547000 |
-| mesh-kill-n0 | 341,400 | 0 | [64, 45, 46, 64, 46, 48] | new events per node [n0=down n1=7554800 n2=7554800]; producers acked 7554800 |
-| mesh-stop-n0 | 352,230 | 0 | [1001, 87, 60, 1000, 86, 60] | new events per node [n0=down n1=7797200 n2=7797200]; producers acked 7797200 |
+End-to-end latency = producer stamp before send -> message handed to the subscriber. `rate60k` = fixed 60k msg/s offered by both systems; `max` = producers as fast as acks allow.
+
+| run | subs | produced msg/s | delivered msg/s per sub | delivered total | e2e p50 ms | e2e p99 ms | e2e p99.9 ms | e2e max ms | complete | server CPU µs/produced msg |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| iggy-persisted-rf3 rate60k-s1 | 1 | 60,060 | 60,060 | 60,060 | 2.68 | 5.88 | 16.85 | 29.70 | 3/3 runs | 17.70 |
+| mesh-c2-tcp rate60k-s1 | 1 | 60,060 | 60,060 | 60,060 | 0.95 | 2.64 | 23.39 | 24.56 | 3/3 runs | 7.19 |
+| iggy-persisted-rf3 rate60k-s4 | 4 | 60,040 | 60,040 | 240,160 | 2.66 | 5.51 | 10.13 | 24.34 | 3/3 runs | 19.51 |
+| mesh-c2-tcp rate60k-s4 | 4 | 60,050 | 60,050 | 240,200 | 1.03 | 3.04 | 20.94 | 23.57 | 3/3 runs | 6.76 |
+| iggy-persisted-rf3 rate60k-s16 | 16 | 60,050 | 60,050 | 960,800 | 3.98 | 9.27 | 16.54 | 31.39 | 3/3 runs | 24.54 |
+| mesh-c2-tcp rate60k-s16 | 16 | 60,060 | 60,060 | 960,960 | 1.33 | 3.46 | 18.32 | 25.57 | 3/3 runs | 7.81 |
+| iggy-persisted-rf3 rate60k-s32 | 32 | 59,920 | 59,920 | 1,917,440 | 6.57 | 18.78 | 36.67 | 291.84 | 3/3 runs | 30.27 |
+| mesh-c2-tcp rate60k-s32 | 32 | 60,050 | 60,050 | 1,921,600 | 1.38 | 3.29 | 14.57 | 23.66 | 3/3 runs | 10.54 |
+| mesh-c2-iroh rate60k-s16 | 16 | 60,050 | 60,050 | 960,800 | 2.05 | 4.76 | 7.00 | 9.91 | 3/3 runs | 18.17 |
+| iggy-persisted-rf3 max-s16 | 16 | 90,200 | 90,200 | 1,443,200 | 7.07 | 15.57 | 27.74 | 53.92 | 3/3 runs | 23.02 |
+| mesh-c2-tcp max-s16 | 16 | 283,830 | 283,830 | 4,541,280 | 1.97 | 6.11 | 15.46 | 27.45 | 3/3 runs | 5.22 |
