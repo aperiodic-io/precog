@@ -25,7 +25,7 @@ struct Table {
 
 /// 0 marks an empty slot.
 fn nz(h: u64) -> u64 {
-    h | (h == 0) as u64
+    h.max(1)
 }
 
 /// A key's digest within its stream.
@@ -112,7 +112,7 @@ impl Dedup {
             self.sized = self
                 .gens
                 .back()
-                .map_or(self.sized, |t| t.len * 8 / 7 * 11 / 10 + 1);
+                .map_or(self.sized, |t| t.len * 8 / 7 * 11 / 10);
             self.gens.push_back(Table::new(self.sized, now_s));
         }
         // by count, by age after an idle gap, and by the entry cap
@@ -247,5 +247,125 @@ mod tests {
             dups(&mut d, &[digest(stream_seed("b"), b"id-1")], 6),
             [false]
         );
+    }
+
+    /// Fresh distinct digests (never 0, which marks an empty slot).
+    fn ids(range: std::ops::Range<u64>) -> Vec<u64> {
+        range.map(|i| digest(9, &i.to_le_bytes())).collect()
+    }
+
+    #[test]
+    fn no_digest_is_the_empty_slot_marker() {
+        // a digest of 0 would read as an empty slot: never found, so never a duplicate
+        assert_ne!(nz(0), 0);
+        assert_eq!(nz(5), 5, "other digests are kept as they are");
+        assert_eq!(nz(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn an_id_is_held_for_the_window_and_forgotten_by_window_k_over_k_minus_1() {
+        // window 300 s, k = 3: generations of 150 s, three of them
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        let (p1, p2) = (digest(9, b"p1"), digest(9, b"p2"));
+        for t in 0..=600u64 {
+            // steady traffic: every second opens the generations it should
+            d.record(&ids(1_000_000 + t..1_000_001 + t), t);
+            match t {
+                149 => d.record(&[p1], t), // the last second of the first generation
+                150 => d.record(&[p2], t), // the first second of the second
+                449 => assert_eq!(dups(&mut d, &[p1], t), [true], "held the full window"),
+                450 => assert_eq!(dups(&mut d, &[p1], t), [false], "gone with its generation"),
+                599 => assert_eq!(dups(&mut d, &[p2], t), [true], "held up to 450 s"),
+                600 => assert_eq!(dups(&mut d, &[p2], t), [false], "not past 450 s"),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn after_an_idle_gap_old_ids_expire_by_age() {
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        let (p1, p2) = (digest(9, b"p1"), digest(9, b"p2"));
+        d.record(&[p1, p2], 0);
+        // no traffic in between: only the generation's age can expire it
+        assert_eq!(
+            dups(&mut d, &[p1], 449),
+            [true],
+            "within window * k / (k - 1)"
+        );
+        assert_eq!(dups(&mut d, &[p2], 450), [false], "past it");
+        assert!(!d.is_empty(), "p1, re-recorded at 450, is held");
+        assert!(Dedup::new(300, 3, 1 << 30).is_empty());
+    }
+
+    #[test]
+    fn a_table_grows_by_half_once_seven_eighths_full() {
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        d.record(&ids(0..896), 0);
+        assert_eq!(d.bytes(), 1024 * 8, "896 of 1024 slots: still at 7/8 load");
+        d.record(&ids(896..897), 0);
+        assert_eq!(d.bytes(), 1536 * 8, "one more: 1.5x");
+        assert_eq!(d.len(), 897);
+        assert_eq!(
+            dups(&mut d, &ids(0..897), 0),
+            [true; 897],
+            "nothing lost in the rehash"
+        );
+    }
+
+    #[test]
+    fn a_new_generation_is_sized_for_the_last_ones_count() {
+        let n = 10_000;
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        d.record(&ids(0..n), 0);
+        let first = d.bytes();
+        d.record(&ids(n..n + 1), 150); // opens the second generation
+        let second = (d.bytes() - first) / 8;
+        d.record(&ids(n + 1..2 * n), 150);
+        assert_eq!(
+            d.bytes() - first,
+            second * 8,
+            "the same count fits without regrowing"
+        );
+        let n = n as usize;
+        assert!(
+            second <= n * 8 / 7 * 11 / 10,
+            "at most 10% over 7/8 load: {second}"
+        );
+    }
+
+    #[test]
+    fn at_the_cap_the_oldest_share_goes_first() {
+        // a cap of 3000 ids over k = 3: a generation closes once it holds 1000
+        let mut d = Dedup::new(300, 3, 3_000);
+        for b in 0..4 {
+            d.record(&ids(b * 1000..(b + 1) * 1000), 0);
+        }
+        assert_eq!(d.len(), 3_000, "exactly the cap is kept");
+        assert_eq!(
+            dups(&mut d, &[ids(0..1)[0], ids(3999..4000)[0]], 0),
+            [false, true]
+        );
+    }
+
+    #[test]
+    fn one_batch_over_the_cap_is_dropped_at_the_next_roll_but_the_cap_itself_is_kept() {
+        let mut d = Dedup::new(300, 3, 3_000);
+        d.record(&ids(0..3_000), 0);
+        d.record(&ids(3_000..3_001), 0);
+        assert_eq!(
+            d.len(),
+            3_001,
+            "at the cap (not over it) nothing is dropped"
+        );
+        let mut d = Dedup::new(300, 3, 3_000);
+        d.record(&ids(0..5_000), 0); // one batch: a single generation over the cap
+        d.record(&ids(5_000..5_001), 0);
+        assert_eq!(
+            d.len(),
+            1,
+            "the over-full generation went, the newest stays"
+        );
+        assert_eq!(dups(&mut d, &ids(5_000..5_001), 0), [true]);
     }
 }
