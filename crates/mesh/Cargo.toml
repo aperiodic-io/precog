@@ -13,6 +13,7 @@ crc32c = "0.6"
 futures = "0.3"
 iroh = "=1.4.1"
 parking_lot = "0.12"
+precog-storage = { path = "../storage" }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,4 +22,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+gungraun = "0.19.4"
+cucumber = "0.23"
 tempfile = "3"
+
+# Feature files under tests/acceptance/features driven against real precog-node processes.
+# Not a default test target (minutes, and its runner has no `--list` for nextest):
+# run it with `cargo test -p precog-mesh --test acceptance`.
+[[test]]
+name = "acceptance"
+path = "tests/acceptance/main.rs"
+harness = false
+test = false
+
+# Instruction-count gate (CI fails a PR that adds more than 2% instructions)
+[[bench]]
+name = "gate"
+harness = false

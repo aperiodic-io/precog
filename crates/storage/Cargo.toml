@@ -1,0 +1,20 @@
+[package]
+name = "precog-storage"
+description = "Node-local durable segment log for the precog broker mesh"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+crc32c = "0.6"
+thiserror = "2"
+
+[dev-dependencies]
+gungraun = "0.19.4"
+proptest = "1"
+tempfile = "3"
+
+# Instruction-count gate (CI fails a PR that adds more than 2% instructions)
+[[bench]]
+name = "gate"
+harness = false

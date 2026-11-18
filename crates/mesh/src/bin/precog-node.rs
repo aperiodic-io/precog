@@ -33,9 +33,12 @@ enum Cmd {
         transport: String,
         #[arg(long, default_value_t = 7000)]
         base_port: u16,
-        /// Disable fdatasync (page-cache durability only).
+        /// Segment file size in MiB.
+        #[arg(long, default_value_t = 1024)]
+        segment_mb: u64,
+        /// Keep at most this many MiB of log per node (unbounded if unset).
         #[arg(long)]
-        no_sync: bool,
+        retention_mb: Option<u64>,
         #[arg(long, default_value_t = 1000)]
         rpc_timeout_ms: u64,
     },
@@ -128,7 +131,8 @@ async fn run(cmd: Cmd) -> Result<()> {
             dir,
             transport,
             base_port,
-            no_sync,
+            segment_mb,
+            retention_mb,
             rpc_timeout_ms,
         } => {
             std::fs::create_dir_all(&dir)?;
@@ -151,27 +155,25 @@ async fn run(cmd: Cmd) -> Result<()> {
             for i in 0..nodes {
                 let port = base_port + i as u16;
                 let sock = format!("127.0.0.1:{port}").parse()?;
-                let cfg = NodeConfig {
-                    id: i,
-                    domain: format!("domain-{i}"),
-                    data_dir: std::path::absolute(dir.join(format!("n{i}")))?,
-                    token: token.clone(),
-                    sync: !no_sync,
-                    listen_tcp: (transport == "tcp").then_some(sock),
-                    listen_iroh: (transport == "iroh").then_some(sock),
-                    iroh_relay: false,
-                    peers: (0..nodes)
-                        .filter(|&j| j != i)
-                        .map(|j| PeerConfig {
-                            id: j,
-                            domain: format!("domain-{j}"),
-                            addr: addrs[j as usize].clone(),
-                        })
-                        .collect(),
-                    target_copies: 3,
-                    rpc_timeout_ms,
-                    repair_interval_ms: 1000,
-                };
+                let mut cfg = NodeConfig::single(
+                    i,
+                    &format!("domain-{i}"),
+                    std::path::absolute(dir.join(format!("n{i}")))?,
+                    token.clone(),
+                );
+                cfg.listen_tcp = (transport == "tcp").then_some(sock);
+                cfg.listen_iroh = (transport == "iroh").then_some(sock);
+                cfg.peers = (0..nodes)
+                    .filter(|&j| j != i)
+                    .map(|j| PeerConfig {
+                        id: j,
+                        domain: format!("domain-{j}"),
+                        addr: addrs[j as usize].clone(),
+                    })
+                    .collect();
+                cfg.rpc_timeout_ms = rpc_timeout_ms;
+                cfg.segment_size = segment_mb << 20;
+                cfg.retention_bytes = retention_mb.map(|m| m << 20);
                 std::fs::write(
                     dir.join(format!("node-{i}.json")),
                     serde_json::to_vec_pretty(&cfg)?,

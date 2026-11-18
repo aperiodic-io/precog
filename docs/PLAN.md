@@ -130,5 +130,5 @@ O_APPEND by 1.08–1.33×; embedded databases reach 0.31–0.71× of that at 27 
 | A writer's retry lands on another node after failover | Hold-back by `(writer, epoch)` predecessor in M5; idempotent identity today |
 | Per-batch metadata in RAM grows with history | Bounded by retention; move the per-log index to disk (redb or index files) if it exceeds budget |
 | Shared WAL with mixed retention per stream | One retention policy per node in M2; per-stream segment groups if needed |
-| CI runner disk and CPU noise | Perf gate compares base and head on the same runner, median of 3, 10% band |
+| CI runner disk and CPU noise | Perf gate compares base and head on the same runner, alternating runs, best of 5, 15% band |
 | Iroh 30–40% slower than TCP | M6 multi-stream; TCP stays for trusted networks |

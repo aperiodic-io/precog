@@ -2,7 +2,7 @@
 # Start/stop precog mesh nodes on loopback.
 #   scripts/mesh.sh up <nodes> <tcp|iroh> [threads]   e.g. scripts/mesh.sh up 3 tcp 2
 #   scripts/mesh.sh kill <node> | restart <node> | stop
-# Env: MESH_NO_SYNC=1 disables fdatasync; MESH_RPC_MS peer RPC timeout.
+# Env: MESH_RPC_MS peer RPC timeout.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=target/release/precog-node
@@ -12,7 +12,7 @@ up)
   N=${2:-3}; T=${3:-tcp}; TH=${4:-2}
   rm -rf $ROOT
   extra=()
-  [ "${MESH_NO_SYNC:-0}" = 1 ] && extra+=(--no-sync)
+  [ -n "${MESH_SEGMENT_MB:-}" ] && extra+=(--segment-mb "$MESH_SEGMENT_MB")
   $BIN init --nodes "$N" --dir $ROOT --transport "$T" --base-port 7000 --rpc-timeout-ms "${MESH_RPC_MS:-1000}" "${extra[@]}" >/dev/null
   echo "$TH" > $ROOT/threads
   for i in $(seq 0 $((N-1))); do

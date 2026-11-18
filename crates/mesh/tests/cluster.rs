@@ -49,26 +49,27 @@ fn cluster(n: u32, iroh: bool, domains: &[&str]) -> Cluster {
         }
     }
     let cfgs = (0..n)
-        .map(|i| NodeConfig {
-            id: i,
-            domain: domains[i as usize].into(),
-            data_dir: dir.path().join(format!("n{i}")),
-            token: "secret-token".into(),
-            sync: true,
-            listen_tcp: (!iroh).then_some(socks[i as usize]),
-            listen_iroh: iroh.then_some(socks[i as usize]),
-            iroh_relay: false,
-            peers: (0..n)
+        .map(|i| {
+            let mut c = NodeConfig::single(
+                i,
+                domains[i as usize],
+                dir.path().join(format!("n{i}")),
+                "secret-token".into(),
+            );
+            c.listen_tcp = (!iroh).then_some(socks[i as usize]);
+            c.listen_iroh = iroh.then_some(socks[i as usize]);
+            c.peers = (0..n)
                 .filter(|&j| j != i)
                 .map(|j| PeerConfig {
                     id: j,
                     domain: domains[j as usize].into(),
                     addr: addrs[j as usize].clone(),
                 })
-                .collect(),
-            target_copies: 3,
-            rpc_timeout_ms: 500,
-            repair_interval_ms: 1_000_000, // tests trigger repair explicitly
+                .collect();
+            c.rpc_timeout_ms = 500;
+            c.repair_interval_ms = 1_000_000; // tests trigger repair explicitly
+            c.segment_size = 1 << 20;
+            c
         })
         .collect();
     Cluster {
@@ -178,6 +179,24 @@ async fn tcp_replication_degraded_and_repair() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn iroh_replication_degraded_and_repair() {
     replication_scenario(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_fails_over_to_the_next_node_when_its_preferred_one_is_down() {
+    let c = cluster(3, false, &["a", "b", "c"]);
+    // node 2 is down: a client preferring it wraps around to node 0
+    for i in 0..2 {
+        start(&c, i).await;
+    }
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let b = Batch::encode(&log, 0, &[(1, b"x")]).unwrap();
+    let r = mc.append(2, &b, 1).await.unwrap();
+    assert_eq!((r.node, r.attempts), (0, 2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -308,15 +327,26 @@ async fn live_subscribers_receive_everything_in_writer_order() {
     let mut w2 = Writer::new(mc.clone(), "s", "w2", 1, 1, 2);
     for i in 0..50u64 {
         w1.append(&[(100 + i, b"new")]).await.unwrap();
-        w2.append(&[(100 + i, b"new"), (101 + i, b"new2")]).await.unwrap();
+        w2.append(&[(100 + i, b"new"), (101 + i, b"new2")])
+            .await
+            .unwrap();
     }
-    async fn drain(s: &mut precog_mesh::client::Subscription, events: u64) -> std::collections::HashMap<String, Vec<u64>> {
+    async fn drain(
+        s: &mut precog_mesh::client::Subscription,
+        events: u64,
+    ) -> std::collections::HashMap<String, Vec<u64>> {
         let mut got: std::collections::HashMap<String, Vec<u64>> = Default::default();
         let mut n = 0;
         while n < events {
-            let b = tokio::time::timeout(Duration::from_secs(5), s.next()).await.expect("feed stalled").unwrap().unwrap();
+            let b = tokio::time::timeout(Duration::from_secs(5), s.next())
+                .await
+                .expect("feed stalled")
+                .unwrap()
+                .unwrap();
             n += b.count as u64;
-            got.entry(b.id.log.writer.clone()).or_default().push(b.id.first_seq);
+            got.entry(b.id.log.writer.clone())
+                .or_default()
+                .push(b.id.first_seq);
         }
         got
     }
@@ -324,7 +354,16 @@ async fn live_subscribers_receive_everything_in_writer_order() {
     assert_eq!(r["w1"], (0..60).collect::<Vec<_>>());
     assert_eq!(r["w2"], (0..50).map(|i| i * 2).collect::<Vec<_>>());
     let l = drain(&mut live, 50 + 100).await;
-    assert_eq!(l["w1"], (10..60).collect::<Vec<_>>(), "live feed starts at subscribe time");
+    assert_eq!(
+        l["w1"],
+        (10..60).collect::<Vec<_>>(),
+        "live feed starts at subscribe time"
+    );
     assert_eq!(l["w2"].len(), 50);
-    assert!(tokio::time::timeout(Duration::from_millis(300), other.next()).await.is_err(), "stream filter");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), other.next())
+            .await
+            .is_err(),
+        "stream filter"
+    );
 }

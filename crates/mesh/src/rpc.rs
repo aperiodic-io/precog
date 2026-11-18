@@ -164,14 +164,22 @@ impl RpcClient {
     /// Opens a server-push stream: sends one request and returns the
     /// receiver of every `Push` frame carrying its req_id. The stream ends
     /// when the connection closes.
-    pub async fn subscribe(&self, kind: Kind, body: bytes::Bytes, buffer: usize) -> Result<mpsc::Receiver<Frame>> {
+    pub async fn subscribe(
+        &self,
+        kind: Kind,
+        body: bytes::Bytes,
+        buffer: usize,
+    ) -> Result<mpsc::Receiver<Frame>> {
         if self.is_closed() {
             bail!("connection closed");
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(buffer);
         self.subs.lock().insert(id, tx);
-        self.tx.send(Frame::new(kind, id, body)).await.map_err(|_| anyhow!("connection closed"))?;
+        self.tx
+            .send(Frame::new(kind, id, body))
+            .await
+            .map_err(|_| anyhow!("connection closed"))?;
         Ok(rx)
     }
 

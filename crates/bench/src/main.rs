@@ -165,7 +165,10 @@ mod parking_lot_free {
 }
 
 fn wall_us() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
 }
 
 /// Copies the template payload with the send timestamp in its first 8 bytes.
@@ -177,7 +180,9 @@ fn stamped(template: &Bytes, ts: u64) -> Bytes {
 }
 
 fn stamp_of(payload: &[u8]) -> Option<u64> {
-    payload.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    payload
+        .get(..8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// Records one received batch of stamped payloads.
@@ -190,7 +195,12 @@ struct SubRecorder {
 
 impl SubRecorder {
     fn new(sh: &Shared) -> SubRecorder {
-        SubRecorder { hist: Histogram::new_with_bounds(1, 600_000_000, 3).unwrap(), total: 0, window: 0, from_us: sh.measure_from_wall_us }
+        SubRecorder {
+            hist: Histogram::new_with_bounds(1, 600_000_000, 3).unwrap(),
+            total: 0,
+            window: 0,
+            from_us: sh.measure_from_wall_us,
+        }
     }
     fn record<'a>(&mut self, payloads: impl Iterator<Item = &'a [u8]>) {
         let now = wall_us();
@@ -270,7 +280,13 @@ async fn main() -> Result<()> {
             for s in 0..args.subscribers {
                 let c = IggyClient::from_connection_string(&conns[s % conns.len()])?;
                 c.connect().await?;
-                sub_handles.push(tokio::spawn(iggy_subscriber(c, s, parts, shared.clone(), sub_stop.clone())));
+                sub_handles.push(tokio::spawn(iggy_subscriber(
+                    c,
+                    s,
+                    parts,
+                    shared.clone(),
+                    sub_stop.clone(),
+                )));
             }
             if args.subscribers > 0 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -328,7 +344,12 @@ async fn main() -> Result<()> {
             for s in 0..args.subscribers {
                 let mc = MeshClient::new(addrs.clone(), token.clone()).await?;
                 let sub = mc.subscribe(s % addrs.len(), Some("bench"), false).await?;
-                sub_handles.push(tokio::spawn(mesh_subscriber(sub, mc, shared.clone(), sub_stop.clone())));
+                sub_handles.push(tokio::spawn(mesh_subscriber(
+                    sub,
+                    mc,
+                    shared.clone(),
+                    sub_stop.clone(),
+                )));
             }
             if args.subscribers > 0 {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -477,7 +498,9 @@ async fn mesh_producer(
     while !sh.stop.load(Ordering::Acquire) {
         pace.wait().await;
         let now = wall_us();
-        let owned: Vec<Bytes> = (0..args.batch).map(|i| stamped(&payloads[(k + i) % payloads.len()], now)).collect();
+        let owned: Vec<Bytes> = (0..args.batch)
+            .map(|i| stamped(&payloads[(k + i) % payloads.len()], now))
+            .collect();
         let evs: Vec<(u64, &[u8])> = owned.iter().map(|p| (now, &p[..])).collect();
         k += args.batch;
         let t0 = Instant::now();
@@ -515,7 +538,8 @@ impl Pace {
     fn new(rate: u64) -> Pace {
         Pace {
             every: (rate > 0).then(|| Duration::from_secs_f64(1.0 / rate as f64)),
-            next: tokio::time::Instant::now() + Duration::from_micros(rand::random::<u64>() % 10_000),
+            next: tokio::time::Instant::now()
+                + Duration::from_micros(rand::random::<u64>() % 10_000),
         }
     }
     async fn wait(&mut self) {
@@ -526,7 +550,13 @@ impl Pace {
     }
 }
 
-async fn iggy_subscriber(client: IggyClient, s: usize, parts: u32, sh: Arc<Shared>, stop: Arc<AtomicBool>) -> Result<()> {
+async fn iggy_subscriber(
+    client: IggyClient,
+    s: usize,
+    parts: u32,
+    sh: Arc<Shared>,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
     let stream = Identifier::named("bench")?;
     let topic = Identifier::named("t")?;
     let consumer = Consumer::new(Identifier::numeric(1000 + s as u32)?);
@@ -534,7 +564,9 @@ async fn iggy_subscriber(client: IggyClient, s: usize, parts: u32, sh: Arc<Share
         .reader(&stream, &topic, &consumer)
         .partitions(0..parts)
         .start(PollingStrategy::first())
-        .options(PollOptions::wait(IggyDuration::from(Duration::from_millis(500))))
+        .options(PollOptions::wait(IggyDuration::from(
+            Duration::from_millis(500),
+        )))
         .build()
         .await?;
     let mut rec = SubRecorder::new(&sh);
@@ -570,7 +602,9 @@ async fn mesh_subscriber(
             Ok(Some(Ok(b))) => {
                 let evs: Vec<_> = b.events().collect();
                 rec.record(evs.iter().map(|e| &e.payload[..]));
-                sh.subs.delivered_total.fetch_add(b.count as u64, Ordering::Relaxed);
+                sh.subs
+                    .delivered_total
+                    .fetch_add(b.count as u64, Ordering::Relaxed);
             }
             Ok(Some(Err(e))) => {
                 if sh.errors.fetch_add(1, Ordering::Relaxed) < 5 {
@@ -587,7 +621,11 @@ async fn mesh_subscriber(
 
 /// After producers stop, give subscribers up to 15 s to receive everything
 /// that was acknowledged, then stop them.
-async fn drain_subs(sh: &Shared, stop: &AtomicBool, handles: Vec<tokio::task::JoinHandle<Result<()>>>) {
+async fn drain_subs(
+    sh: &Shared,
+    stop: &AtomicBool,
+    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+) {
     if handles.is_empty() {
         return;
     }
@@ -722,7 +760,14 @@ async fn finish(
         );
         println!(
             "    subs {:>3}: {:>10.0} msg/s each, {:>11.0} total  e2e p50 {:>7}us p99 {:>8}us p999 {:>8}us max {:>9}us  {}",
-            r.subscribers, r.sub_msgs_per_sec_each, r.sub_msgs_per_sec_total, r.e2e_us_p50, r.e2e_us_p99, r.e2e_us_p999, r.e2e_us_max, r.subs_complete
+            r.subscribers,
+            r.sub_msgs_per_sec_each,
+            r.sub_msgs_per_sec_total,
+            r.e2e_us_p50,
+            r.e2e_us_p99,
+            r.e2e_us_p999,
+            r.e2e_us_max,
+            r.subs_complete
         );
     }
     println!(

@@ -37,9 +37,6 @@ pub struct NodeConfig {
     pub domain: String,
     pub data_dir: PathBuf,
     pub token: String,
-    /// fdatasync before acknowledging (false = page-cache durability only).
-    #[serde(default = "yes")]
-    pub sync: bool,
     pub listen_tcp: Option<SocketAddr>,
     pub listen_iroh: Option<SocketAddr>,
     #[serde(default)]
@@ -52,10 +49,67 @@ pub struct NodeConfig {
     pub rpc_timeout_ms: u64,
     #[serde(default = "repair_ms")]
     pub repair_interval_ms: u64,
+    /// Segment file size of the node's log (header page included).
+    #[serde(default = "segment_size")]
+    pub segment_size: u64,
+    /// Keep at most this many bytes of log (oldest sealed segments go first).
+    #[serde(default)]
+    pub retention_bytes: Option<u64>,
+    /// Drop sealed segments whose newest batch is older than this.
+    #[serde(default)]
+    pub retention_ms: Option<u64>,
+    /// How often retention runs.
+    #[serde(default = "retention_interval_ms")]
+    pub retention_interval_ms: u64,
+    /// Recent batches kept in memory for subscribers.
+    #[serde(default = "tail_cache_bytes")]
+    pub tail_cache_bytes: usize,
+    /// Fault injection for tests.
+    #[serde(skip)]
+    pub storage_failpoints: precog_storage::Failpoints,
 }
 
-fn yes() -> bool {
-    true
+impl NodeConfig {
+    /// A node with no peers and default settings.
+    pub fn single(id: u32, domain: &str, data_dir: PathBuf, token: String) -> NodeConfig {
+        NodeConfig {
+            id,
+            domain: domain.into(),
+            data_dir,
+            token,
+            listen_tcp: None,
+            listen_iroh: None,
+            iroh_relay: false,
+            peers: vec![],
+            target_copies: three(),
+            rpc_timeout_ms: rpc_ms(),
+            repair_interval_ms: repair_ms(),
+            segment_size: segment_size(),
+            retention_bytes: None,
+            retention_ms: None,
+            retention_interval_ms: retention_interval_ms(),
+            tail_cache_bytes: tail_cache_bytes(),
+            storage_failpoints: Default::default(),
+        }
+    }
+
+    fn storage(&self) -> precog_storage::Config {
+        let mut c = precog_storage::Config::new(self.data_dir.join("log"));
+        c.segment_size = self.segment_size;
+        c.tail_cache_bytes = self.tail_cache_bytes;
+        c.failpoints = self.storage_failpoints.clone();
+        c
+    }
+}
+
+fn segment_size() -> u64 {
+    1 << 30
+}
+fn retention_interval_ms() -> u64 {
+    10_000
+}
+fn tail_cache_bytes() -> usize {
+    64 << 20
 }
 fn three() -> u8 {
     3
@@ -104,15 +158,11 @@ impl Node {
     pub async fn open(cfg: NodeConfig) -> Result<(Arc<Node>, Option<iroh::Endpoint>)> {
         anyhow::ensure!(cfg.id < 32, "node id must be < 32");
         anyhow::ensure!(cfg.peers.len() <= 31, "too many peers");
-        let (wal, rec) = Wal::open(&cfg.data_dir, cfg.sync)?;
-        let n = rec.batches.len();
-        let store = Store::load(rec.batches)?;
-        tracing::info!(
-            node = cfg.id,
-            batches = n,
-            truncated = rec.truncated_bytes,
-            "recovered WAL"
-        );
+        std::fs::create_dir_all(&cfg.data_dir)?;
+        let (wal, entries) = Wal::open(cfg.storage())?;
+        let n = entries.len();
+        let store = Store::load(wal.reader.clone(), entries)?;
+        tracing::info!(node = cfg.id, batches = n, "recovered log");
         let endpoint = match cfg.listen_iroh {
             Some(bind) => {
                 let sk = load_or_create_secret(&cfg.data_dir.join("iroh.secret"))?;
@@ -169,7 +219,59 @@ impl Node {
                 }
             }
         });
-        std::future::pending::<()>().await;
+        let n = node.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(n.cfg.retention_interval_ms.max(10)))
+                    .await;
+                if let Err(e) = n.apply_retention().await {
+                    tracing::error!("retention: {e}");
+                }
+            }
+        });
+        // A storage fault fences the log (fsyncgate): restart and recover rather than run on.
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if node.is_fatal() {
+                tracing::error!("storage fault: exiting so the node restarts and recovers");
+                std::process::exit(70);
+            }
+        }
+    }
+
+    pub fn status(&self) -> Status {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (batches, events, bytes) = self.store.totals();
+        let w = &self.wal.stats;
+        Status {
+            node_id: self.cfg.id,
+            domain: self.cfg.domain.clone(),
+            batches,
+            events,
+            bytes,
+            wal_bytes: w.bytes.load(Relaxed),
+            fsyncs: w.syncs.load(Relaxed),
+            segments: w.segments.load(Relaxed),
+            recovery_scanned_bytes: w.recovery_scanned_bytes.load(Relaxed),
+            logs: self.store.frontiers(None),
+        }
+    }
+
+    /// The storage layer hit a fatal error; nothing more is acknowledged until restart.
+    pub fn is_fatal(&self) -> bool {
+        self.wal.fatal.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Applies the configured retention to the log and forgets trimmed batches.
+    pub async fn apply_retention(&self) -> Result<()> {
+        if self.cfg.retention_bytes.is_none() && self.cfg.retention_ms.is_none() {
+            return Ok(());
+        }
+        let floor = self
+            .wal
+            .retain(self.cfg.retention_bytes, self.cfg.retention_ms)
+            .await?;
+        self.store.trim(floor);
         Ok(())
     }
 
@@ -282,11 +384,21 @@ impl Node {
         let sub: Subscribe = match serde_json::from_slice(&req.body) {
             Ok(s) => s,
             Err(e) => {
-                let _ = tx.send(Frame::new(Kind::Error, req.req_id, Bytes::from(e.to_string()))).await;
+                let _ = tx
+                    .send(Frame::new(
+                        Kind::Error,
+                        req.req_id,
+                        Bytes::from(e.to_string()),
+                    ))
+                    .await;
                 return;
             }
         };
-        let mut pos = if sub.from_start { 0 } else { self.store.durable_len() };
+        let mut pos = if sub.from_start {
+            0
+        } else {
+            self.store.durable_len()
+        };
         loop {
             let notified = self.store.durable_notify.notified();
             tokio::pin!(notified);
@@ -301,7 +413,11 @@ impl Node {
                 continue;
             }
             for b in batches {
-                if tx.send(Frame::new(Kind::Push, req.req_id, b)).await.is_err() {
+                if tx
+                    .send(Frame::new(Kind::Push, req.req_id, b))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -381,27 +497,7 @@ impl Node {
 
     async fn control(self: &Arc<Self>, c: Control, _ident: Ident) -> Result<ControlResp> {
         Ok(match c {
-            Control::Status => {
-                let (batches, events, bytes) = self.store.totals();
-                ControlResp::Status(Status {
-                    node_id: self.cfg.id,
-                    domain: self.cfg.domain.clone(),
-                    batches,
-                    events,
-                    bytes,
-                    wal_bytes: self
-                        .wal
-                        .stats
-                        .bytes
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    fsyncs: self
-                        .wal
-                        .stats
-                        .syncs
-                        .load(std::sync::atomic::Ordering::Relaxed),
-                    logs: self.store.frontiers(None),
-                })
-            }
+            Control::Status => ControlResp::Status(self.status()),
             Control::Read {
                 stream,
                 from_time_us,
@@ -429,9 +525,9 @@ impl Node {
         loop {
             match self.store.reserve(batch) {
                 Reserve::New => {
-                    return match self.wal.append(batch.bytes.clone()).await {
-                        Ok(()) => {
-                            self.store.mark_durable(&batch.id);
+                    return match self.wal.append(batch.clone()).await {
+                        Ok(lsn) => {
+                            self.store.mark_durable(&batch.id, lsn);
                             Ok(Local::Stored)
                         }
                         Err(e) => {
@@ -453,6 +549,12 @@ impl Node {
                     }
                 },
                 Reserve::Conflict(e) => return Ok(Local::Conflict(e)),
+                Reserve::Expired => {
+                    return Ok(Local::Conflict(format!(
+                        "{:?} seq {} is below the retention floor",
+                        batch.id.log, batch.id.first_seq
+                    )));
+                }
             }
         }
     }
