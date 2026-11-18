@@ -151,6 +151,21 @@ impl Client {
         }
     }
 
+    /// Stores `cursor` as `group`'s position on `stream`: a reader that reads ahead of what it
+    /// has made durable (the archiver, until its upload is acknowledged) commits the cursor it
+    /// kept for the durable part instead of its consumer's.
+    pub async fn commit(&self, group: &str, stream: &str, cursor: &Cursor) -> Result<()> {
+        let c = Control::Commit {
+            group: group.into(),
+            stream: stream.into(),
+            cursor: cursor_to_wire(cursor, stream),
+        };
+        match self.control(self.preferred(stream), &c).await?.1 {
+            ControlResp::Committed => Ok(()),
+            r => bail!("unexpected {r:?}"),
+        }
+    }
+
     /// A compacted stream's newest value of every key, by key.
     pub async fn latest(&self, stream: &str) -> Result<Vec<(Vec<u8>, Bytes)>> {
         match self
@@ -310,16 +325,8 @@ impl Consumer {
     pub async fn commit(&self) -> Result<()> {
         let group = self
             .group
-            .clone()
+            .as_deref()
             .context("a consumer_at has no group to commit to")?;
-        let c = Control::Commit {
-            group,
-            stream: self.stream.clone(),
-            cursor: cursor_to_wire(&self.cursor, &self.stream),
-        };
-        match self.client.control(self.node, &c).await?.1 {
-            ControlResp::Committed => Ok(()),
-            r => bail!("unexpected {r:?}"),
-        }
+        self.client.commit(group, &self.stream, &self.cursor).await
     }
 }
