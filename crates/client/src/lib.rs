@@ -130,7 +130,7 @@ impl Client {
         };
         let c = match start {
             Start::Beginning => return Ok(Cursor::new()),
-            Start::End => at(u64::MAX),
+            Start::End => return self.end(stream).await,
             Start::Time(t) => at(t),
             Start::Committed { or } => {
                 let q = Control::Position {
@@ -164,6 +164,38 @@ impl Client {
             ControlResp::Committed => Ok(()),
             r => bail!("unexpected {r:?}"),
         }
+    }
+
+    /// Where `stream` ends: every acknowledged event is before this cursor. An acked batch is on 2
+    /// of 3 nodes, so one node's end can be short (a node just restarted, or repairing); the ends
+    /// of any 2 nodes, merged per writer log, cover every acked batch.
+    pub async fn end(&self, stream: &str) -> Result<Cursor> {
+        let n = self.mc.node_count();
+        let need = n.min(2);
+        let q = Control::CursorAt {
+            stream: stream.into(),
+            time_ms: u64::MAX,
+        };
+        let start = self.preferred(stream);
+        let (mut end, mut answered, mut last) = (Cursor::new(), 0, None);
+        for i in 0..n {
+            match self.mc.control((start + i) % n, &q).await {
+                Ok(ControlResp::Cursor { cursor: Some(w) }) => {
+                    for (log, seq) in cursor_from_wire(w, stream) {
+                        let e = end.entry(log).or_insert(0);
+                        *e = (*e).max(seq);
+                    }
+                    answered += 1;
+                    if answered == need {
+                        return Ok(end);
+                    }
+                }
+                Ok(r) => last = Some(anyhow::anyhow!("unexpected {r:?}")),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("no nodes")))
+            .with_context(|| format!("the end of {stream} needs {need} nodes, {answered} answered"))
     }
 
     /// A compacted stream's newest value of every key, by key.

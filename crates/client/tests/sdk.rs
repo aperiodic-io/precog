@@ -8,12 +8,6 @@ use precog_mesh::node::{Node, NodeConfig, PeerConfig, StreamConfig};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-struct Cluster {
-    addrs: Vec<String>,
-    _nodes: Vec<Arc<Node>>,
-    _dir: tempfile::TempDir,
-}
-
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -22,49 +16,70 @@ fn free_port() -> u16 {
         .port()
 }
 
+struct Cluster {
+    addrs: Vec<String>,
+    ports: Vec<u16>,
+    _nodes: Vec<Arc<Node>>,
+    _dir: tempfile::TempDir,
+}
+
+/// Starts node `i` of the three; `repair_ms` is how often it repairs from its peers.
+async fn start(c: &mut Cluster, i: u32, repair_ms: u64) {
+    let mut cfg = NodeConfig::single(
+        i,
+        &format!("d{i}"),
+        c._dir.path().join(format!("n{i}")),
+        "tok".into(),
+    );
+    cfg.listen_tcp = Some(
+        format!("127.0.0.1:{}", c.ports[i as usize])
+            .parse()
+            .unwrap(),
+    );
+    cfg.peers = (0..3)
+        .filter(|&j| j != i)
+        .map(|j| PeerConfig {
+            id: j,
+            domain: format!("d{j}"),
+            addr: c.addrs[j as usize].clone(),
+        })
+        .collect();
+    cfg.rpc_timeout_ms = 300;
+    cfg.repair_interval_ms = repair_ms;
+    cfg.segment_size = 1 << 20;
+    cfg.streams.insert(
+        "state".into(),
+        StreamConfig {
+            compacted: true,
+            ..Default::default()
+        },
+    );
+    let n = Node::open(cfg).await.unwrap();
+    n.spawn_listeners().await.unwrap();
+    c._nodes.push(n);
+}
+
 /// Nodes `up` of three are started; the others' addresses stay dead.
 async fn cluster(up: &[u32]) -> Cluster {
-    let dir = tempfile::tempdir().unwrap();
     let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
-    let addrs: Vec<String> = ports
-        .iter()
-        .map(|p| format!("tcp://127.0.0.1:{p}"))
-        .collect();
-    let mut nodes = vec![];
+    let mut c = Cluster {
+        addrs: ports
+            .iter()
+            .map(|p| format!("tcp://127.0.0.1:{p}"))
+            .collect(),
+        ports,
+        _nodes: vec![],
+        _dir: tempfile::tempdir().unwrap(),
+    };
     for &i in up {
-        let mut c = NodeConfig::single(
+        start(
+            &mut c,
             i,
-            &format!("d{i}"),
-            dir.path().join(format!("n{i}")),
-            "tok".into(),
-        );
-        c.listen_tcp = Some(format!("127.0.0.1:{}", ports[i as usize]).parse().unwrap());
-        c.peers = (0..3)
-            .filter(|&j| j != i)
-            .map(|j| PeerConfig {
-                id: j,
-                domain: format!("d{j}"),
-                addr: addrs[j as usize].clone(),
-            })
-            .collect();
-        c.rpc_timeout_ms = 300;
-        c.segment_size = 1 << 20;
-        c.streams.insert(
-            "state".into(),
-            StreamConfig {
-                compacted: true,
-                ..Default::default()
-            },
-        );
-        let n = Node::open(c).await.unwrap();
-        n.spawn_listeners().await.unwrap();
-        nodes.push(n);
+            NodeConfig::single(0, "", "".into(), "".into()).repair_interval_ms,
+        )
+        .await;
     }
-    Cluster {
-        addrs,
-        _nodes: nodes,
-        _dir: dir,
-    }
+    c
 }
 
 fn names(evs: &[Event]) -> Vec<String> {
@@ -322,5 +337,37 @@ async fn producers_compress_by_default_and_readers_decompress() {
     assert!(
         bytes < 2 * a,
         "stored {bytes} bytes for {a} + {a} payload bytes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_of_a_stream_is_every_acked_event_even_when_one_node_is_behind() {
+    // Why: an acked batch is on 2 of 3 nodes, not on all 3. A reader that takes one node's end
+    // as the stream's end (brrrrr's replay, a new group at Start::End) would stop short, or skip
+    // events, whenever that node is behind: just restarted, or repairing.
+    let mut c = cluster(&[1, 2]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    // a stream whose clients ask node 0 first: the node that will be behind
+    let stream = (0..)
+        .map(|i| format!("raw.trades.{i}"))
+        .find(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()) % 3 == 0)
+        .unwrap();
+    let mut p = client.producer(&stream, "w");
+    for i in 0..40u64 {
+        p.send(i, format!("id{i}").as_bytes(), b"x");
+        if i % 10 == 9 {
+            p.flush().await.unwrap();
+        }
+    }
+    p.sync().await.unwrap();
+    start(&mut c, 0, 3_600_000).await; // empty, and no repair within the test
+
+    let end = client.end(&stream).await.unwrap();
+    assert_eq!(end.values().sum::<u64>(), 40, "every acked event: {end:?}");
+    let at_end = client.consumer(&stream, "g", Start::End).await.unwrap();
+    assert_eq!(
+        at_end.cursor(),
+        &end,
+        "a new group at the end skips nothing it should not"
     );
 }
