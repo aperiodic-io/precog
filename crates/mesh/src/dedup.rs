@@ -32,7 +32,7 @@ impl Hasher for Pass {
 pub struct Dedup {
     window_s: u64,
     max_entries: usize,
-    /// digest -> the second it was last seen; an entry past the window counts as absent
+    /// digest -> the second it was last seen, plus one; an entry past the window counts as absent
     seen: HashMap<u64, u32, BuildHasherDefault<Pass>>,
     /// recorded (replicated) digests not yet indexed
     pending: Vec<(u64, u32)>,
@@ -124,10 +124,6 @@ impl Dedup {
         }
     }
 
-    fn fresh(&self, t: u32, now_s: u64) -> bool {
-        (t as u64) >= self.oldest_s && now_s.saturating_sub(t as u64) <= self.window_s
-    }
-
     /// Every quarter window, drops expired entries in one pass; at the cap, the oldest quarter
     /// of what is kept too (the window shortens instead of memory growing).
     fn sweep(&mut self, now_s: u64) {
@@ -141,7 +137,7 @@ impl Dedup {
             self.oldest_s += (now_s.saturating_sub(self.oldest_s) / 4).max(1);
         }
         let oldest = self.oldest_s;
-        self.seen.retain(|_, t| *t as u64 >= oldest);
+        self.seen.retain(|_, t| (*t - 1) as u64 >= oldest);
         self.swept_s = now_s;
     }
 
@@ -150,14 +146,17 @@ impl Dedup {
     pub fn check(&mut self, digests: &[u64], now_s: u64, dup: &mut Vec<bool>) {
         self.started_s.get_or_insert(now_s);
         for (h, t) in self.pending.drain(..) {
-            self.seen.insert(h, t); // what this node recorded as a replica
+            self.seen.insert(h, t + 1); // what this node recorded as a replica
         }
         self.sweep(now_s);
         dup.clear();
+        let oldest = self.oldest_s.max(now_s.saturating_sub(self.window_s));
         for &h in digests {
-            let fresh = self.seen.get(&h).is_some_and(|&t| self.fresh(t, now_s));
+            // one probe: a new id (the common case) is inserted where the lookup ended
+            let t = self.seen.entry(h).or_insert(0); // stored as second + 1: 0 is never seen
+            let fresh = *t != 0 && (*t - 1) as u64 >= oldest;
             if !fresh {
-                self.seen.insert(h, now_s as u32);
+                *t = now_s as u32 + 1;
             }
             dup.push(fresh);
         }
