@@ -19,7 +19,7 @@ work=$(mktemp -d)
 
 down() { for i in 0 1 2; do docker rm -f "cmp-$i" >/dev/null 2>&1 || true; done; }
 cpu_ns() { local t=0; for i in 0 1 2; do id=$(docker inspect -f '{{.Id}}' "cmp-$i"); t=$((t + $(cat /sys/fs/cgroup/cpuacct/docker/$id/cpuacct.usage))); done; echo $t; }
-trap 'down; rm -rf "$work"' EXIT
+trap '[ -n "${KEEP:-}" ] || down; rm -rf "$work"' EXIT
 docker network inspect "$NET" >/dev/null 2>&1 || docker network create --subnet "$SUBNET" "$NET" >/dev/null
 down
 
@@ -39,7 +39,7 @@ PY
   for i in 0 1 2; do
     docker run -d --name "cmp-$i" --hostname "cmp-$i" --network "$NET" --ip "$(ip $i)" --cpus 1 --memory 4000m \
       -v "$work/cluster.json:/etc/precog/cluster.json:ro" --entrypoint precog-node precog-bench \
-      serve --config /etc/precog/cluster.json --member-from-hostname >/dev/null
+      serve --config /etc/precog/cluster.json --member-from-hostname ${THREADS:+--threads $THREADS} >/dev/null
   done
   sleep 3
   nodes="tcp://$(ip 0):7000,tcp://$(ip 1):7000,tcp://$(ip 2):7000"

@@ -1,15 +1,16 @@
 //! Broker-side dedup: drops an event whose dedup key was seen within the window on this node.
 //!
-//! The index is a few generations of hash sets of 64-bit digests (`xxh3(key)` seeded by the
-//! stream), each sized for the last one's count; the oldest is dropped whole. The sets are std's
-//! SwissTable with the digest as its own hash: 16 tags compared per probe, so a new id (the common
-//! case) is rejected fast even when full. Chosen by measurement (`results/dedup.md`, row H, and
-//! the broker profile: open addressing at 7/8 load cost 22% of a replica's CPU in long probe
-//! runs). ~28 bytes per live id; an id is remembered for at least the window (up to
-//! window * k / (k - 1)). At `max_entries` the oldest generation goes early: the window shortens
-//! instead of memory growing (`effective_window_s` reports it).
+//! One map per stream from a key's 64-bit digest (`xxh3(key)` seeded by the stream) to the second
+//! it was last seen: one lookup per event (a new id, the common case, misses once instead of once
+//! per generation). It is std's SwissTable with the digest as its own hash. Expired entries count
+//! as absent and are dropped in one pass every quarter window. Chosen by measurement
+//! (`results/dedup.md` and the broker profile in bench/compare: open addressing at 7/8 load, then
+//! three generations of sets, cost 22% and 11% of a node's CPU). A node that only replicates a
+//! stream appends the origin's kept ids and indexes them at the stream's next check. At
+//! `max_entries` the oldest quarter goes: the window shortens instead of memory growing
+//! (`effective_window_s` reports it).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// The digest is already xxh3: hash it no further.
@@ -28,14 +29,18 @@ impl Hasher for Pass {
     }
 }
 
-type Set = HashSet<u64, BuildHasherDefault<Pass>>;
-
 pub struct Dedup {
-    k: usize,
-    span_s: u64,
+    window_s: u64,
     max_entries: usize,
-    /// (start, indexed digests, recorded digests not yet indexed) per generation
-    gens: VecDeque<(u64, Set, Vec<u64>)>,
+    /// digest -> the second it was last seen; an entry past the window counts as absent
+    seen: HashMap<u64, u32, BuildHasherDefault<Pass>>,
+    /// recorded (replicated) digests not yet indexed
+    pending: Vec<(u64, u32)>,
+    swept_s: u64,
+    /// the oldest second any kept entry may carry (the window, or less after the cap bit)
+    oldest_s: u64,
+    /// when this index first saw an id
+    started_s: Option<u64>,
 }
 
 /// One index per stream (a node accepts some streams and replicates others; a replica only
@@ -104,62 +109,73 @@ pub fn stream_seed(stream: &str) -> u64 {
 }
 
 impl Dedup {
-    /// `k` generations (at least 2) over `window_s`, at most `max_entries` ids.
-    pub fn new(window_s: u64, k: usize, max_entries: usize) -> Dedup {
-        assert!(k >= 2 && window_s > 0);
+    /// Remembers ids for `window_s`, at most `max_entries` of them. (`_k` is kept for callers
+    /// that tuned the old generations; one map with a timestamp per id needs no generations.)
+    pub fn new(window_s: u64, _k: usize, max_entries: usize) -> Dedup {
+        assert!(window_s > 0);
         Dedup {
-            k,
-            span_s: window_s.div_ceil(k as u64 - 1),
+            window_s,
             max_entries,
-            gens: VecDeque::new(),
+            seen: HashMap::default(),
+            pending: vec![],
+            swept_s: 0,
+            oldest_s: 0,
+            started_s: None,
         }
     }
 
-    fn roll(&mut self, now_s: u64) {
-        // a new generation each span, or early once the newest holds its share of the cap
-        if self.gens.back().is_none_or(|(t, s, p)| {
-            now_s >= t + self.span_s || s.len() + p.len() >= self.max_entries / self.k
-        }) {
-            self.gens.push_back((now_s, Set::default(), vec![]));
+    fn fresh(&self, t: u32, now_s: u64) -> bool {
+        (t as u64) >= self.oldest_s && now_s.saturating_sub(t as u64) <= self.window_s
+    }
+
+    /// Every quarter window, drops expired entries in one pass; at the cap, the oldest quarter
+    /// of what is kept too (the window shortens instead of memory growing).
+    fn sweep(&mut self, now_s: u64) {
+        let full = self.seen.len() > self.max_entries;
+        if !full && now_s < self.swept_s + (self.window_s / 4).max(1) {
+            return;
         }
-        // by count, by age after an idle gap, and by the entry cap
-        while self.gens.len() > self.k
-            || self
-                .gens
-                .front()
-                .is_some_and(|(t, _, _)| now_s >= t + self.span_s * self.k as u64)
-            || (self.gens.len() > 1 && self.len() > self.max_entries)
-        {
-            self.gens.pop_front();
+        let window_start = now_s.saturating_sub(self.window_s);
+        self.oldest_s = self.oldest_s.max(window_start);
+        if full {
+            self.oldest_s += (now_s.saturating_sub(self.oldest_s) / 4).max(1);
         }
+        let oldest = self.oldest_s;
+        self.seen.retain(|_, t| *t as u64 >= oldest);
+        self.swept_s = now_s;
     }
 
     /// For each digest in order: was it seen within the window (a duplicate)? New ones are
     /// recorded, so a batch's later events see its earlier ones.
     pub fn check(&mut self, digests: &[u64], now_s: u64, dup: &mut Vec<bool>) {
-        self.roll(now_s);
-        for (_, set, pending) in &mut self.gens {
-            set.extend(pending.drain(..)); // what this node recorded as a replica
+        self.started_s.get_or_insert(now_s);
+        for (h, t) in self.pending.drain(..) {
+            self.seen.insert(h, t); // what this node recorded as a replica
         }
+        self.sweep(now_s);
         dup.clear();
         for &h in digests {
-            let seen = self.gens.iter().rev().any(|(_, s, _)| s.contains(&h));
-            if !seen {
-                self.gens.back_mut().unwrap().1.insert(h);
+            let fresh = self.seen.get(&h).is_some_and(|&t| self.fresh(t, now_s));
+            if !fresh {
+                self.seen.insert(h, now_s as u32);
             }
-            dup.push(seen);
+            dup.push(fresh);
         }
     }
 
     /// Records digests without asking (replicated copies, a restart's rebuild): appended, and
     /// indexed by the next `check` (a node that only replicates the stream never pays for it).
     pub fn record(&mut self, digests: &[u64], now_s: u64) {
-        self.roll(now_s);
-        self.gens.back_mut().unwrap().2.extend_from_slice(digests);
+        self.started_s.get_or_insert(now_s);
+        if self.pending.len() >= self.max_entries {
+            self.pending.drain(..self.pending.len() / 4); // the oldest quarter: the window shortens
+        }
+        self.pending
+            .extend(digests.iter().map(|&h| (h, now_s as u32)));
     }
 
     pub fn len(&self) -> usize {
-        self.gens.iter().map(|(_, s, p)| s.len() + p.len()).sum()
+        self.seen.len() + self.pending.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -168,9 +184,8 @@ impl Dedup {
 
     /// How far back ids are remembered now: the window, or less once the cap bites.
     pub fn effective_window_s(&self, now_s: u64) -> u64 {
-        self.gens
-            .front()
-            .map_or(0, |(t, _, _)| now_s.saturating_sub(*t))
+        let since = self.oldest_s.max(self.started_s.unwrap_or(now_s));
+        now_s.saturating_sub(since).min(self.window_s)
     }
 }
 
@@ -253,19 +268,13 @@ mod tests {
         let mut d = Dedup::new(300, 3, 1 << 30);
         let ids: Vec<u64> = (0..1000u64).map(|i| digest(3, &i.to_le_bytes())).collect();
         d.record(&ids, 5);
-        let (_, set, pending) = d.gens.back().unwrap();
-        assert!(
-            set.is_empty() && pending.len() == 1000,
-            "{} {}",
-            set.len(),
-            pending.len()
-        );
+        assert!(d.seen.is_empty() && d.pending.len() == 1000);
         assert_eq!(d.len(), 1000);
         assert!(
             dups(&mut d, &ids, 6).iter().all(|&x| x),
             "a node taking over still drops them"
         );
-        assert!(d.gens.iter().all(|(_, _, p)| p.is_empty()));
+        assert!(d.pending.is_empty());
     }
 
     #[test]
