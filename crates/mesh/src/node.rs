@@ -720,8 +720,8 @@ impl Node {
                 let mut dup = vec![];
                 d.check(&hs, now_s(), &mut dup);
                 claimed = dup.contains(&false);
-                let n = dup.iter().filter(|&&x| x).count();
-                if n > 0 {
+                if dup.contains(&true) {
+                    let n = dup.iter().filter(|&&x| x).count();
                     let mut drop = vec![false; batch.count as usize];
                     for (&(i, _), &x) in ds.iter().zip(&dup) {
                         drop[i] = x;
