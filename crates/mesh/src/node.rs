@@ -7,6 +7,7 @@
 //! by the writer's sequence numbers, and logs never have to be ordered relative
 //! to each other at write time. Readers merge logs by event time.
 
+use crate::dedup::{self, Dedup};
 use crate::proto::*;
 use crate::rpc::{BoxRead, BoxWrite, RpcClient, read_frame, write_loop};
 use crate::store::{Reserve, State, Store};
@@ -21,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
@@ -61,6 +63,13 @@ pub struct NodeConfig {
     /// Recent batches kept in memory for subscribers.
     #[serde(default = "tail_cache_bytes")]
     pub tail_cache_bytes: usize,
+    /// Drop an event whose dedup key this node saw within this window (live-ingestion: 5
+    /// minutes); `None` turns dedup off. Events without a key are never dropped.
+    #[serde(default = "dedup_window_ms")]
+    pub dedup_window_ms: Option<u64>,
+    /// At most this many dedup ids (~15 bytes each); past it the window shortens.
+    #[serde(default = "dedup_max_entries")]
+    pub dedup_max_entries: usize,
     /// Fault injection for tests.
     #[serde(skip)]
     pub storage_failpoints: precog_storage::Failpoints,
@@ -83,6 +92,8 @@ impl NodeConfig {
             retention_bytes: None,
             retention_ms: None,
             retention_interval_ms: retention_interval_ms(),
+            dedup_window_ms: dedup_window_ms(),
+            dedup_max_entries: dedup_max_entries(),
             tail_cache_bytes: tail_cache_bytes(),
             storage_failpoints: Default::default(),
         }
@@ -99,6 +110,12 @@ impl NodeConfig {
 
 fn segment_size() -> u64 {
     1 << 30
+}
+fn dedup_window_ms() -> Option<u64> {
+    Some(300_000)
+}
+fn dedup_max_entries() -> usize {
+    16_000_000
 }
 fn retention_interval_ms() -> u64 {
     10_000
@@ -132,6 +149,33 @@ pub struct Node {
     repair_cursor: parking_lot::Mutex<HashMap<u32, u64>>,
     repair_lock: tokio::sync::Mutex<()>,
     inflight: Semaphore,
+    /// Held while a client batch is deduplicated and queued to the log, so ids are claimed in
+    /// log order: a batch whose duplicates were dropped is durable only after the batches that
+    /// claimed them (the log commits in order and fences on any write error).
+    dedup: parking_lot::Mutex<Option<Dedup>>,
+    dedup_dropped: AtomicU64,
+}
+
+/// The digests of a batch's keyed events, with their positions.
+fn digests(batch: &Batch) -> Vec<(usize, u64)> {
+    let seed = dedup::stream_seed(&batch.id.log.stream);
+    batch
+        .keys()
+        .enumerate()
+        .filter_map(|(i, k)| Some((i, dedup::digest(seed, k?))))
+        .collect()
+}
+
+fn now_s() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// A batch queued to the log by `begin_local`; `claimed`: it took dedup ids.
+struct Queued {
+    rx: oneshot::Receiver<Result<u64, String>>,
+    claimed: bool,
 }
 
 enum Local {
@@ -153,7 +197,31 @@ impl Node {
         std::fs::create_dir_all(&cfg.data_dir)?;
         let (wal, entries) = Wal::open(cfg.storage())?;
         let n = entries.len();
+        let mut dedup = cfg
+            .dedup_window_ms
+            .map(|w| Dedup::new(w.div_ceil(1000).max(1), 3, cfg.dedup_max_entries));
+        // the last window of the log rebuilds the index (bounded: the window, not the log)
+        let recent: Vec<_> = match cfg.dedup_window_ms {
+            Some(w) => {
+                let since = (now_s() * 1000).saturating_sub(w);
+                entries
+                    .iter()
+                    .filter(|e| e.meta.time_ms >= since)
+                    .map(|e| e.lsn)
+                    .collect()
+            }
+            None => vec![],
+        };
         let store = Store::load(wal.reader.clone(), entries)?;
+        if let Some(d) = dedup.as_mut() {
+            for lsn in recent {
+                if let Some(r) = wal.reader.read(lsn)? {
+                    let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
+                    let ds: Vec<u64> = digests(&b).into_iter().map(|(_, h)| h).collect();
+                    d.record(&ds, now_s());
+                }
+            }
+        }
         tracing::info!(node = cfg.id, batches = n, "recovered log");
         let mut peers = Vec::new();
         for p in &cfg.peers {
@@ -175,6 +243,8 @@ impl Node {
             repair_cursor: Default::default(),
             repair_lock: Default::default(),
             inflight: Semaphore::new(16_384),
+            dedup: parking_lot::Mutex::new(dedup),
+            dedup_dropped: AtomicU64::new(0),
         });
         Ok(node)
     }
@@ -215,6 +285,11 @@ impl Node {
     }
 
     pub fn status(&self) -> Status {
+        let (dedup_entries, dedup_window_s) = self
+            .dedup
+            .lock()
+            .as_ref()
+            .map_or((0, 0), |d| (d.len() as u64, d.effective_window_s(now_s())));
         use std::sync::atomic::Ordering::Relaxed;
         let (batches, events, bytes) = self.store.totals();
         let w = &self.wal.stats;
@@ -228,6 +303,9 @@ impl Node {
             fsyncs: w.syncs.load(Relaxed),
             segments: w.segments.load(Relaxed),
             recovery_scanned_bytes: w.recovery_scanned_bytes.load(Relaxed),
+            dedup_dropped: self.dedup_dropped.load(Relaxed),
+            dedup_entries,
+            dedup_window_s,
             logs: self.store.frontiers(None),
         }
     }
@@ -460,6 +538,69 @@ impl Node {
     }
 
     /// Writes the batch to the local WAL unless an identical copy exists.
+    /// A client batch: if it is new, drops its duplicate events and queues it to the log, both
+    /// under the dedup lock (ids are claimed in log order). Returns the batch to store and
+    /// replicate, and its queued write; `None` leaves it to `store_local` (a retry, a conflict).
+    fn begin_local(&self, batch: Batch) -> Result<(Batch, Option<Queued>)> {
+        let mut g = self.dedup.lock();
+        if !matches!(self.store.reserve(&batch), Reserve::New) {
+            return Ok((batch, None)); // reserve only peeked: store_local reserves again
+        }
+        let mut batch = batch;
+        let mut claimed = false;
+        if let Some(d) = g.as_mut() {
+            let ds = digests(&batch);
+            if !ds.is_empty() {
+                let hs: Vec<u64> = ds.iter().map(|&(_, h)| h).collect();
+                let mut dup = vec![];
+                d.check(&hs, now_s(), &mut dup);
+                claimed = dup.contains(&false);
+                let n = dup.iter().filter(|&&x| x).count();
+                if n > 0 {
+                    let mut drop = vec![false; batch.count as usize];
+                    for (&(i, _), &x) in ds.iter().zip(&dup) {
+                        drop[i] = x;
+                    }
+                    let ident = batch.id.clone();
+                    batch = Batch::parse(batch.without(&drop)?)?;
+                    debug_assert_eq!(batch.id, ident);
+                    self.dedup_dropped.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        match self.wal.submit(batch.clone()) {
+            Ok(rx) => Ok((batch, Some(Queued { rx, claimed }))),
+            Err(e) => {
+                self.store.mark_failed(&batch.id);
+                if claimed {
+                    self.wal.fatal.store(true, Ordering::Release);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Waits for `begin_local`'s write, or stores the batch the ordinary way.
+    async fn finish_local(&self, batch: &Batch, submitted: Option<Queued>) -> Result<Local> {
+        let Some(Queued { rx, claimed }) = submitted else {
+            return self.store_local(batch).await;
+        };
+        match Wal::durable(rx).await {
+            Ok(lsn) => {
+                self.store.mark_durable(&batch.id, lsn);
+                Ok(Local::Stored)
+            }
+            Err(e) => {
+                self.store.mark_failed(&batch.id);
+                if claimed {
+                    // its ids stay claimed in the index: fence, and recover the index from the log
+                    self.wal.fatal.store(true, Ordering::Release);
+                }
+                Err(e)
+            }
+        }
+    }
+
     async fn store_local(&self, batch: &Batch) -> Result<Local> {
         loop {
             match self.store.reserve(batch) {
@@ -513,6 +654,12 @@ impl Node {
         let Ok(batch) = Batch::parse(bytes) else {
             return ack;
         };
+        // the origin decided; record the ids it kept, so this node dedups too after a failover
+        if let Some(d) = self.dedup.lock().as_mut() {
+            let ds: Vec<u64> = digests(&batch).into_iter().map(|(_, h)| h).collect();
+            d.record(&ds, now_s());
+        }
+        ack.crc = batch.ident; // the origin compares identities, not the rewritten bytes' CRC
         match self.store_local(&batch).await {
             Ok(Local::Stored) => ack.status = AckStatus::Ok,
             Ok(Local::Duplicate) => ack.status = AckStatus::Duplicate,
@@ -570,6 +717,16 @@ impl Node {
         if copies == 0 || copies as usize > targets.len() + 1 {
             return reject; // cannot possibly satisfy: no side effects yet
         }
+        let (batch, submitted) = match self.begin_local(batch) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("local store failed: {e}");
+                return Ack {
+                    status: AckStatus::Unknown,
+                    ..reject
+                };
+            }
+        };
         let (tx, rx) = oneshot::channel::<Ack>();
         let node = self.clone();
         tokio::spawn(async move {
@@ -581,10 +738,10 @@ impl Node {
             {
                 let node = node.clone();
                 let batch = batch.clone();
-                futs.push(
-                    Box::pin(async move { R::Local(node.store_local(&batch).await) })
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send>>,
-                );
+                futs.push(Box::pin(
+                    async move { R::Local(node.finish_local(&batch, submitted).await) },
+                )
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send>>);
             }
             let body = encode_replicate(node.cfg.id, &batch.bytes);
             for p in targets {

@@ -4,10 +4,10 @@
 //! cost per event includes the hash. A resend repeats one of the producer's 64 latest ids.
 //!
 //!   cargo run --release -p precog-lab --bin dedup [-- --rate N --window S]
+use precog_lab::dedup::SwissGenerations;
 use precog_lab::dedup::{
     Dedup, Generations, GenerationsPrefetch, MapFifo, Nothing, Packed, Stamped, StampedPrefetch,
 };
-use precog_lab::dedup::SwissGenerations;
 use std::time::Instant;
 
 fn main() {

@@ -179,19 +179,28 @@ symbol keys, a per-event dedup header, 0% and 20% resends) against the pinned fo
 Both brokers run in the same harness on the same machine; results go in `results/` with the
 commands to reproduce them.
 
-### 7.4 Dedup design
+### 7.4 Dedup design (built: `crates/mesh/src/dedup.rs`, chosen in `results/dedup.md`)
 
-- **Where:** at ingest, on the node that accepts the append. Copies replicated from a peer carry
-  the origin's decision and are never deduplicated again, so every node stores the same batches.
-  The fork's crashes came from rebuilding its index by replaying the whole log; Precog rebuilds
-  from the last window only, through the per-log time index.
-- **Routing:** producers send every event of a stream to the same preferred node (by stream), so
-  both producer replicas' copies of one event meet one index. During a failover two nodes may
-  each keep one copy: the same at-least-once outcome as the fork's evictions, which live-ingestion's
-  readers already tolerate.
-- **Index:** per stream, a ring of time buckets (window / 8 each), each an open-addressing table
-  of 64-bit hashes (xxh3) of the dedup key: 8 bytes per entry instead of ~37, no allocation per
-  entry, expiry by dropping a whole bucket. A lookup probes the live buckets. A false positive
-  (dropping a distinct event) has probability n / 2⁶⁴ per event, about 10⁻¹² at 8M live keys.
-  Memory is capped per node; at the cap the oldest bucket goes first, so the window shortens
-  instead of the node failing, and a metric reports the effective window.
+- **Where:** at ingest, on the node that accepts a client append, after the batch's identity
+  check (a retry or a conflicting batch claims nothing). A duplicate event becomes a tombstone
+  (batch format 2): its bytes are dropped before replication, the writer's sequence stays
+  contiguous, and the rewritten batch keeps the original's checksum as its identity, so a
+  producer's retry of the bytes it sent still matches on every node. Dedup on read was measured
+  out: it would carry the producer replicas' ~50% duplicates through replication and every reader.
+- **Ack still means durable:** ids are claimed and the batch queued to the log under one lock, so
+  claim order is log order; the log commits in order and fences on any write error, so a batch
+  whose duplicates were dropped is durable only after the batches that claimed them. A claimed
+  batch whose write fails fences the node; the restart rebuilds the index from the log.
+- **Replicas:** a replicated copy is stored as the origin decided, and its kept ids are recorded,
+  so every node's index is warm and a failover keeps deduplicating.
+- **Restart:** the index is rebuilt from the last window of the log only (the fork crashed
+  rebuilding from the whole log).
+- **Index:** generations of exact-sized open-addressing tables of xxh3 digests (seeded by the
+  stream), batch-prefetched, k = 3: ~15 bytes per live id (the fork: 14) at ~100-250 ns per event.
+  An id is remembered for at least the window. At `dedup_max_entries` (default 16M) the oldest
+  generation goes early: the window shortens instead of memory growing; `status` reports
+  `dedup_entries` and the effective `dedup_window_s`. False positives: n / 2^64 per event.
+- **Opt-in by key:** events without a key are never dropped (live-ingestion's state topics send
+  none). `dedup_window_ms` defaults to 5 minutes; `None` turns dedup off.
+- **Known limit:** during a failover two nodes may each keep one copy of an event (the fork's
+  evictions have the same outcome); live-ingestion's readers already tolerate duplicates.

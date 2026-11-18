@@ -81,6 +81,9 @@ pub struct Batch {
     events_off: usize,
     /// Format 1: events without keys.
     v1: bool,
+    /// The batch's identity checksum: its own CRC, or the CRC of the batch it was rewritten from
+    /// (dedup tombstones), so a producer's retry of the original bytes still matches.
+    pub ident: u32,
 }
 
 impl Batch {
@@ -97,11 +100,17 @@ impl Batch {
         events: &[(u64, &[u8], &[u8])],
     ) -> Result<Bytes> {
         let events: Vec<RawEvent<'_>> = events.iter().map(|&(t, k, p)| (t, Some((k, p)))).collect();
-        Self::encode_events(log, first_seq, &events)
+        Self::encode_events(log, first_seq, 0, &events)
     }
 
     /// `None` is a tombstone.
-    fn encode_events(log: &LogId, first_seq: u64, events: &[RawEvent<'_>]) -> Result<Bytes> {
+    /// `ident` 0: the batch is its own identity.
+    fn encode_events(
+        log: &LogId,
+        first_seq: u64,
+        ident: u32,
+        events: &[RawEvent<'_>],
+    ) -> Result<Bytes> {
         ensure!(!events.is_empty(), "empty batch");
         ensure!(
             events.len() as u64 <= MAX_EVENTS_PER_BATCH as u64,
@@ -128,7 +137,7 @@ impl Batch {
             .iter()
             .map(|(_, e)| 14 + e.map_or(0, |(k, p)| k.len() + p.len()))
             .sum();
-        let len = 4 + 2 + log.stream.len() + 2 + log.writer.len() + 8 + 8 + 4 + payload + 4;
+        let len = 4 + 2 + log.stream.len() + 2 + log.writer.len() + 8 + 8 + 4 + 4 + payload + 4;
         ensure!(len <= MAX_BATCH_BYTES, "batch too large ({len} bytes)");
         let mut b = BytesMut::with_capacity(len);
         b.put_slice(BATCH_MAGIC);
@@ -139,6 +148,7 @@ impl Batch {
         b.put_u64_le(log.epoch);
         b.put_u64_le(first_seq);
         b.put_u32_le(events.len() as u32);
+        b.put_u32_le(ident);
         for (t, e) in events {
             b.put_u64_le(*t);
             let (k, p) = e.unwrap_or((b"", b""));
@@ -174,6 +184,15 @@ impl Batch {
         let epoch = c.get_u64_le();
         let first_seq = c.get_u64_le();
         let count = c.get_u32_le();
+        let ident = if v1 {
+            0
+        } else {
+            ensure!(c.remaining() >= 4, "truncated header");
+            c.get_u32_le()
+        };
+        // ponytail: a batch whose own CRC is 0 (1 in 2^32) cannot be named as an identity, so a
+        // retry of it after a dedup rewrite is refused as a conflict; widen ident if that matters
+        let ident = if ident == 0 { crc } else { ident };
         ensure!(
             count > 0 && count <= MAX_EVENTS_PER_BATCH,
             "bad event count"
@@ -202,6 +221,7 @@ impl Batch {
             bytes,
             events_off,
             v1,
+            ident,
         })
     }
 
@@ -234,7 +254,7 @@ impl Batch {
             .zip(drop)
             .map(|((t, e), &d)| (t, e.filter(|_| !d)))
             .collect();
-        Self::encode_events(&self.id.log, self.id.first_seq, &events)
+        Self::encode_events(&self.id.log, self.id.first_seq, self.ident, &events)
     }
 
     pub fn end_seq(&self) -> u64 {
@@ -542,6 +562,14 @@ pub struct Status {
     /// Bytes the last startup had to scan to recover (only the active segment).
     #[serde(default)]
     pub recovery_scanned_bytes: u64,
+    /// Events dropped as duplicates of an event seen within the dedup window.
+    #[serde(default)]
+    pub dedup_dropped: u64,
+    /// Dedup ids held, and how far back they reach (the window, or less at the entry cap).
+    #[serde(default)]
+    pub dedup_entries: u64,
+    #[serde(default)]
+    pub dedup_window_s: u64,
     pub logs: Vec<Frontier>,
 }
 
@@ -647,6 +675,21 @@ mod tests {
         // dropping nothing returns the batch as it was
         assert_eq!(p.without(&[false, false, false]).unwrap(), b);
         assert!(p.without(&[true]).is_err(), "one flag per event");
+    }
+
+    #[test]
+    fn a_batch_keeps_its_identity_when_events_are_dropped() {
+        // A producer's retry of the bytes it sent must match what the broker stored after dedup,
+        // on every node: the rewritten batch carries the original's checksum as its identity.
+        let b = Batch::encode_keyed(&log(), 0, &[(1, b"a", b"x"), (2, b"b", b"y")]).unwrap();
+        let p = Batch::parse(b.clone()).unwrap();
+        assert_eq!(p.ident, batch_crc(&b));
+        let f = Batch::parse(p.without(&[true, false]).unwrap()).unwrap();
+        assert_ne!(batch_crc(&f.bytes), batch_crc(&b));
+        assert_eq!(f.ident, p.ident);
+        // dropping more from an already rewritten batch keeps the first identity
+        let g = Batch::parse(f.without(&[false, true]).unwrap()).unwrap();
+        assert_eq!(g.ident, p.ident);
     }
 
     #[test]

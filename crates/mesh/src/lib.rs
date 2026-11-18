@@ -3,6 +3,7 @@
 //! See `docs/ARCHITECTURE.md` at the repository root.
 
 pub mod client;
+pub mod dedup;
 pub mod node;
 pub mod proto;
 pub mod rpc;

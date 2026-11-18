@@ -9,7 +9,7 @@
 //! ponytail: ~150 bytes of RAM per retained batch; move the per-log index to disk (redb or the
 //! segment index files) if retention keeps more than ~10M batches per node.
 
-use crate::proto::{Batch, BatchId, Event, Frontier, LogId, batch_crc, decode_log_key};
+use crate::proto::{Batch, BatchId, Event, Frontier, LogId, decode_log_key};
 use parking_lot::Mutex;
 use precog_storage::{Lsn, Reader};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -39,7 +39,7 @@ impl Shape {
         Shape {
             end: b.end_seq(),
             count: b.count,
-            crc: batch_crc(&b.bytes),
+            crc: b.ident,
             len: b.bytes.len() as u32,
         }
     }
@@ -437,7 +437,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::encode_log_key;
+    use crate::proto::{batch_crc, encode_log_key};
     use bytes::Bytes;
     use precog_storage::record::Meta;
 
