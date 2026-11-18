@@ -154,3 +154,27 @@ async fn a_snapshot_of_an_unknown_version_is_refused_even_with_a_valid_checksum(
         .expect("must not start on a snapshot of another version");
     assert!(format!("{e:#}").contains("unknown version"), "{e:#}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_that_cannot_be_read_stops_the_node() {
+    // only a missing snapshot means "no state yet": starting empty on any other read error
+    // would serve a compacted stream without the keys retention already dropped from the log
+    let d = tempfile::tempdir().unwrap();
+    {
+        let node = Node::open(config(d.path())).await.unwrap();
+        put(&node, "state", 0, &[("k1", "v1")]).await;
+        node.apply_retention().await.unwrap();
+    }
+    let snap = std::fs::read_dir(d.path().join("compact"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(&snap).unwrap();
+    std::fs::create_dir(&snap).unwrap(); // reading it fails, but not with NotFound
+    assert!(
+        Node::open(config(d.path())).await.is_err(),
+        "must not start without its snapshot"
+    );
+}
