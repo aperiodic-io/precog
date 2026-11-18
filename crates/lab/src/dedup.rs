@@ -107,7 +107,10 @@ impl Dedup for Generations {
         {
             // size the new table like the last full one, so it rarely grows
             // a new generation sized for the last one's count at 7/8 load, plus 10%
-            self.sized = self.tables.back().map_or(self.sized, |t| t.len * 8 / 7 * 11 / 10 + 1);
+            self.sized = self
+                .tables
+                .back()
+                .map_or(self.sized, |t| t.len * 8 / 7 * 11 / 10 + 1);
             self.tables.push_back(Table::new(self.sized, now_s));
             // by count, and by age after an idle gap
             while self.tables.len() > self.k
@@ -424,7 +427,12 @@ pub struct SwissGenerations {
 impl SwissGenerations {
     pub fn new(k: usize, window_s: u32) -> SwissGenerations {
         assert!(k >= 2);
-        SwissGenerations { k, span_s: window_s.div_ceil(k as u32 - 1), sets: VecDeque::new(), sized: 1024 }
+        SwissGenerations {
+            k,
+            span_s: window_s.div_ceil(k as u32 - 1),
+            sets: VecDeque::new(),
+            sized: 1024,
+        }
     }
 }
 
@@ -433,10 +441,25 @@ impl Dedup for SwissGenerations {
         format!("H swiss generations k={}", self.k)
     }
     fn seen(&mut self, h: u64, now_s: u32) -> bool {
-        if self.sets.back().is_none_or(|(t, _)| now_s >= t + self.span_s) {
-            self.sized = self.sets.back().map_or(self.sized, |(_, s)| s.len() * 11 / 10 + 1);
-            self.sets.push_back((now_s, Set::with_capacity_and_hasher(self.sized, Default::default())));
-            while self.sets.len() > self.k || self.sets.front().is_some_and(|(t, _)| now_s >= t + self.span_s * self.k as u32) {
+        if self
+            .sets
+            .back()
+            .is_none_or(|(t, _)| now_s >= t + self.span_s)
+        {
+            self.sized = self
+                .sets
+                .back()
+                .map_or(self.sized, |(_, s)| s.len() * 11 / 10 + 1);
+            self.sets.push_back((
+                now_s,
+                Set::with_capacity_and_hasher(self.sized, Default::default()),
+            ));
+            while self.sets.len() > self.k
+                || self
+                    .sets
+                    .front()
+                    .is_some_and(|(t, _)| now_s >= t + self.span_s * self.k as u32)
+            {
                 self.sets.pop_front();
             }
         }
