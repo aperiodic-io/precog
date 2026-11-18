@@ -132,3 +132,67 @@ O_APPEND by 1.08–1.33×; embedded databases reach 0.31–0.71× of that at 27 
 | Shared WAL with mixed retention per stream | One retention policy per node in M2; per-stream segment groups if needed |
 | CI runner disk and CPU noise | Perf gate compares base and head on the same runner, alternating runs, best of 5, 15% band |
 | Iroh 30–40% slower than TCP | M6 multi-stream; TCP stays for trusted networks |
+
+## 7. Replacing `redpanda-raw-internal` (live-ingestion)
+
+Decided with the owner (2026-11-18): Precog replaces live-ingestion's raw cluster first, through
+its **native protocol** (clients change; no Kafka wire compatibility). `redpanda-metrics-out`
+(customer-facing: TLS, SASL/SCRAM, ACLs, quotas) and `redpanda-metrics` stay on Redpanda until
+this is done. Precog must be at least **3× Redpanda** on all three measures in §7.3.
+
+### 7.1 What talks to the raw cluster today (production manifests, 2026-11-18)
+
+| Client | Repo, language | Count | Uses |
+|---|---|---|---|
+| Producers | `live-producers`, Go (franz-go) | 35 Deployments, 2 replicas each | produce `raw.<datatype>.<exchange>` keyed by symbol, `acks=all`, idempotence off, zstd, `redpanda-dedup-key` header per event; compacted state topics |
+| Raw archivers | `archiver`, Rust | 44 | consumer group per topic, commit only after the Parquet upload; a new group starts at `now - 2h` (`rpk group seek` init container) |
+| Metric pipelines | `brrrrr` (via `fastka`), Rust | 21 | read every partition of their raw topics; positions in brrrrr's own checkpoints (keyed `(topic, partition) → offset`); sorts each source by event time with a 50 ms hold (ADR-0013), so per-writer order is enough |
+| derived-seed | `live-ingestion/cmd/derived_seed`, Go | 4 | reads raw topics |
+| Offset seeding | `rpk` image | 46 init containers | `rpk group seek --to now-2h` |
+| Topic management | `topicsync` (kadm) | Job + hourly CronJob | declares topics: partitions, RF 3, `retention.bytes`, `retention.ms`, `cleanup.policy` (`delete`, `compact` for state topics), `segment.bytes`, dedup window and header; never deletes |
+| Lag monitoring | kafka-exporter + vmalert rules | | per-group lag, "every raw topic has a live consumer" |
+| Dedup | Redpanda fork (`dream-faster/redpanda`) | every raw topic | `redpanda.dedup.window.ms = 300000` keyed by the `redpanda-dedup-key` header; index capped at 8M entries/partition, 16M/shard, ~37 B/entry |
+
+### 7.2 What Precog adds for it
+
+| ID | Feature | Done when |
+|---|---|---|
+| R1 | Streams declared with retention by bytes and time each (per-stream segment groups or per-stream trimming of a shared log) | Two streams with different retention on one node keep exactly their own |
+| R2 | Resumable cursors (M3): a position is a per-writer frontier `{(writer, epoch) → next seq}`, valid on every node; start at the beginning, the end, or a time (`now - 2h`) through a per-log time index | A reader killed and resumed on another node loses and repeats nothing (acceptance) |
+| R3 | Named consumer positions (groups), stored and replicated by the mesh, committed by the reader after its upload | An archiver restarted on another node resumes at its commit; a new group starts at `now - 2h` |
+| R4 | Dedup by an event-key header within a window (§7.4) | Same drop rate as the fork on its own loadgen; bounded memory; no full-log replay on restart |
+| R5 | Compacted streams (latest record per key) for the producers' state topics | A reader of a compacted stream sees the newest value of every key after restart and retention |
+| R6 | Clients: Go (live-producers, derived-seed) and Rust (archiver, brrrrr source like its `iggy.rs`) | Each repo's tests pass against a local Precog; dual-write shadow on staging |
+| R7 | Operations: StatefulSet and chart, Prometheus metrics (append, fsync, repair, dedup, per-group lag), a declarative stream config applied like topicsync (never deletes), replacing the kafka-exporter rules | Staging runs on Precog for 7 days with the alerts green |
+| R8 | Cutover: producers dual-write, readers switch one by one, Redpanda raw cluster retired | Archive parity (row counts per hour) between the two paths for 72 h |
+
+### 7.3 The 3× target
+
+Measured on the raw brokers' size (1 CPU, 4 GiB each, 3 nodes, 3 copies, every append durable on
+at least 2 before the ack), dedup on, readers attached, with
+`live-ingestion/benchmarks/redpanda-dedup/loadgen`'s workload shape (concurrent producer workers,
+symbol keys, a per-event dedup header, 0% and 20% resends) against the pinned fork image:
+
+1. sustained append throughput ≥ 3× Redpanda's;
+2. throughput per broker CPU core ≥ 3×;
+3. p99 ack latency at staging's peak rate ≤ ⅓ of Redpanda's.
+
+Both brokers run in the same harness on the same machine; results go in `results/` with the
+commands to reproduce them.
+
+### 7.4 Dedup design
+
+- **Where:** at ingest, on the node that accepts the append. Copies replicated from a peer carry
+  the origin's decision and are never deduplicated again, so every node stores the same batches.
+  The fork's crashes came from rebuilding its index by replaying the whole log; Precog rebuilds
+  from the last window only, through the per-log time index.
+- **Routing:** producers send every event of a stream to the same preferred node (by stream), so
+  both producer replicas' copies of one event meet one index. During a failover two nodes may
+  each keep one copy: the same at-least-once outcome as the fork's evictions, which live-ingestion's
+  readers already tolerate.
+- **Index:** per stream, a ring of time buckets (window / 8 each), each an open-addressing table
+  of 64-bit hashes (xxh3) of the dedup key: 8 bytes per entry instead of ~37, no allocation per
+  entry, expiry by dropping a whole bucket. A lookup probes the live buckets. A false positive
+  (dropping a distinct event) has probability n / 2⁶⁴ per event, about 10⁻¹² at 8M live keys.
+  Memory is capped per node; at the cap the oldest bucket goes first, so the window shortens
+  instead of the node failing, and a metric reports the effective window.
