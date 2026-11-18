@@ -521,10 +521,11 @@ pub enum Control {
         from_time_us: u64,
         limit: u32,
     },
-    /// Batch ids this node made durable after local index `after`.
-    Inventory {
-        after: u64,
-        limit: u32,
+    /// One writer log's batches from `from_seq`, answered as `Kind::Batches` (repair).
+    FetchLog {
+        log: LogId,
+        from_seq: u64,
+        max_bytes: u32,
     },
     /// Raw batch bytes for the given ids (missing ones are skipped).
     Fetch {
@@ -570,11 +571,6 @@ pub enum ControlResp {
     Read {
         events: Vec<Event>,
         coverage: Vec<Frontier>,
-    },
-    Inventory {
-        items: Vec<(u64, BatchId, u32, u32)>,
-        next: u64,
-        more: bool,
     },
     Repair {
         fetched: u64,

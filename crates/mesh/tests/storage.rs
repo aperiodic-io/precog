@@ -73,8 +73,16 @@ async fn retention_trims_the_log_and_the_metadata() {
     node.apply_retention().await.unwrap();
     let (batches, _, _) = node.store.totals();
     assert!(batches < 400 && batches > 50, "kept {batches}");
-    let (items, _, _) = node.store.inventory(0, 10);
-    assert!(items[0].0 > 0, "inventory starts after the trimmed prefix");
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let served = node.store.log_batches(&log, 0, 1 << 20);
+    assert!(
+        Batch::parse(served[0].clone()).unwrap().id.first_seq > 0,
+        "repair serves after the trimmed prefix"
+    );
     let id = |seq| BatchId {
         log: LogId {
             stream: "s".into(),
