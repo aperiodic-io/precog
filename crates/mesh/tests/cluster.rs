@@ -363,3 +363,25 @@ async fn a_replicas_dedup_index_is_warm_so_a_failover_still_drops_duplicates() {
     assert_eq!(got.len(), 3, "{got:?}");
     assert!(nodes[1].status().dedup_dropped >= 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_position_committed_through_one_node_is_read_on_another() {
+    let c = cluster(3, &["a", "b", "c"]);
+    let nodes: Vec<_> = futures::future::join_all((0..3).map(|i| start(&c, i))).await;
+    let log = LogId {
+        stream: "raw.trades.x".into(),
+        writer: "p".into(),
+        epoch: 1,
+    };
+    let pos: precog_mesh::store::Cursor = [(log, 42)].into_iter().collect();
+    nodes[0]
+        .commit_position("archiver", "raw.trades.x", &pos)
+        .await
+        .unwrap();
+    // replicated to at least one peer before the commit returns; repair brings the third
+    let held = nodes
+        .iter()
+        .filter(|n| n.position("archiver", "raw.trades.x") == Some(pos.clone()))
+        .count();
+    assert!(held >= 2, "{held}");
+}
