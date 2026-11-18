@@ -1,0 +1,17 @@
+[package]
+name = "precog-client"
+version = "0.1.0"
+edition = "2024"
+description = "Rust SDK for Precog: producers with dedup keys, readers with cursors valid on every node"
+
+[dependencies]
+precog-mesh = { path = "../mesh" }
+anyhow = "1"
+bytes = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
