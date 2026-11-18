@@ -28,6 +28,17 @@ pub const BATCH_MAGIC: &[u8; 4] = b"PCB2";
 const BATCH_MAGIC_V1: &[u8; 4] = b"PCB1";
 /// A payload length that marks a dropped event (no key, no payload).
 const TOMBSTONE: u32 = u32::MAX;
+/// Format 2 with every payload in one lz4 block after the event columns (keys stay outside it,
+/// so the broker deduplicates without decompressing): header as PCB2, raw length u32, then
+/// (time u64, key len u16, payload len u32, key) per event, block len u32, block, CRC-32C.
+pub const BATCH_MAGIC_Z: &[u8; 4] = b"PCZ2";
+/// In PCZ2, a payload length with this bit set is a dropped event: its bytes stay in the block
+/// (dropping never recompresses), its key is gone, readers skip it.
+const DROPPED: u32 = 1 << 31;
+/// An event as `walk` yields it: (seq, time, key, payload).
+type Walked<'a> = (u64, u64, &'a [u8], Bytes);
+/// A PCZ2 event column: (time, key, payload length, dropped).
+type ZColumn<'a> = (u64, &'a [u8], u32, bool);
 /// `(time, Some((key, payload)))`, or `(time, None)` for a tombstone.
 type RawEvent<'a> = (u64, Option<(&'a [u8], &'a [u8])>);
 pub const MAX_KEY: usize = 1024;
@@ -81,6 +92,8 @@ pub struct Batch {
     events_off: usize,
     /// Format 1: events without keys.
     v1: bool,
+    /// PCZ2: (offset of the block, uncompressed payload bytes).
+    z: Option<(usize, u32)>,
     /// The batch's identity checksum: its own CRC, or the CRC of the batch it was rewritten from
     /// (dedup tombstones), so a producer's retry of the original bytes still matches.
     pub ident: u32,
@@ -176,7 +189,11 @@ impl Batch {
         ensure!(crc32c::crc32c(body) == crc, "batch checksum mismatch");
         let mut c = body;
         let v1 = &c[..4] == BATCH_MAGIC_V1;
-        ensure!(v1 || &c[..4] == BATCH_MAGIC, "bad batch magic");
+        let compressed = &c[..4] == BATCH_MAGIC_Z;
+        ensure!(
+            v1 || compressed || &c[..4] == BATCH_MAGIC,
+            "bad batch magic"
+        );
         c.advance(4);
         let stream = take_str(&mut c)?;
         let writer = take_str(&mut c)?;
@@ -200,14 +217,45 @@ impl Batch {
         first_seq
             .checked_add(count as u64)
             .context("sequence overflow")?;
+        let raw_len = if compressed {
+            ensure!(c.remaining() >= 4, "truncated header");
+            c.get_u32_le()
+        } else {
+            0
+        };
         let events_off = body.len() - c.remaining();
-        for _ in 0..count {
-            let (k, n) = take_event(&mut c, v1)?;
-            let n = k + n.unwrap_or(0);
-            ensure!(c.remaining() >= n, "truncated payload");
-            c.advance(n);
+        let mut z = None;
+        if compressed {
+            let mut sum = 0u64;
+            for _ in 0..count {
+                ensure!(c.remaining() >= 14, "truncated event");
+                c.advance(8);
+                let (k, n) = (c.get_u16_le() as usize, c.get_u32_le());
+                ensure!(
+                    k <= MAX_KEY && (n & DROPPED == 0 || k == 0),
+                    "bad event column"
+                );
+                ensure!(c.remaining() >= k, "truncated key");
+                c.advance(k);
+                sum += (n & !DROPPED) as u64;
+            }
+            ensure!(
+                sum == raw_len as u64 && raw_len as usize <= MAX_BATCH_BYTES * 4,
+                "bad raw length"
+            );
+            ensure!(c.remaining() >= 4, "truncated block");
+            let n = c.get_u32_le() as usize;
+            ensure!(c.remaining() == n, "bad block length");
+            z = Some((body.len() - n, raw_len));
+        } else {
+            for _ in 0..count {
+                let (k, n) = take_event(&mut c, v1)?;
+                let n = k + n.unwrap_or(0);
+                ensure!(c.remaining() >= n, "truncated payload");
+                c.advance(n);
+            }
+            ensure!(c.remaining() == 0, "trailing bytes in batch");
         }
-        ensure!(c.remaining() == 0, "trailing bytes in batch");
         Ok(Batch {
             id: BatchId {
                 log: LogId {
@@ -221,8 +269,147 @@ impl Batch {
             bytes,
             events_off,
             v1,
+            z,
             ident,
         })
+    }
+
+    /// Events of `(time, dedup key, payload)` with every payload in one lz4 block (PCZ2).
+    pub fn encode_compressed(
+        log: &LogId,
+        first_seq: u64,
+        events: &[(u64, &[u8], &[u8])],
+    ) -> Result<Bytes> {
+        let raw: Vec<u8> = events
+            .iter()
+            .flat_map(|(_, _, p)| p.iter().copied())
+            .collect();
+        let cols: Vec<ZColumn<'_>> = events
+            .iter()
+            .map(|&(t, k, p)| (t, k, p.len() as u32, false))
+            .collect();
+        Self::encode_z(
+            log,
+            first_seq,
+            0,
+            &cols,
+            raw.len() as u32,
+            &lz4_flex::block::compress(&raw),
+        )
+    }
+
+    fn encode_z(
+        log: &LogId,
+        first_seq: u64,
+        ident: u32,
+        cols: &[ZColumn<'_>],
+        raw_len: u32,
+        block: &[u8],
+    ) -> Result<Bytes> {
+        ensure!(
+            !cols.is_empty() && cols.len() <= MAX_EVENTS_PER_BATCH as usize,
+            "bad event count"
+        );
+        ensure!(
+            !log.stream.is_empty() && !log.writer.is_empty(),
+            "empty name"
+        );
+        ensure!(
+            log.stream.len() <= MAX_NAME && log.writer.len() <= MAX_NAME,
+            "name too long"
+        );
+        first_seq
+            .checked_add(cols.len() as u64)
+            .context("sequence overflow")?;
+        let mut b = BytesMut::with_capacity(64 + cols.len() * 24 + block.len());
+        b.put_slice(BATCH_MAGIC_Z);
+        for n in [&log.stream, &log.writer] {
+            b.put_u16_le(n.len() as u16);
+            b.put_slice(n.as_bytes());
+        }
+        b.put_u64_le(log.epoch);
+        b.put_u64_le(first_seq);
+        b.put_u32_le(cols.len() as u32);
+        b.put_u32_le(ident);
+        b.put_u32_le(raw_len);
+        for &(t, k, n, dropped) in cols {
+            ensure!(
+                k.len() <= MAX_KEY && n & DROPPED == 0,
+                "dedup key or payload too long"
+            );
+            b.put_u64_le(t);
+            let k = if dropped { &b""[..] } else { k };
+            b.put_u16_le(k.len() as u16);
+            b.put_u32_le(if dropped { n | DROPPED } else { n });
+            b.put_slice(k);
+        }
+        b.put_u32_le(block.len() as u32);
+        b.put_slice(block);
+        ensure!(b.len() + 4 <= MAX_BATCH_BYTES, "batch too large");
+        let crc = crc32c::crc32c(&b);
+        b.put_u32_le(crc);
+        Ok(b.freeze())
+    }
+
+    /// PCZ2 event columns.
+    fn columns(&self) -> impl Iterator<Item = ZColumn<'_>> + '_ {
+        let mut c = &self.bytes[self.events_off..];
+        (0..self.count).map(move |_| {
+            let t = c.get_u64_le();
+            let (k, n) = (c.get_u16_le() as usize, c.get_u32_le());
+            let key = &c[..k];
+            c.advance(k);
+            (t, key, n & !DROPPED, n & DROPPED != 0)
+        })
+    }
+
+    /// Every event but dropped ones as (seq, time, key, payload); decompresses a PCZ2 block.
+    fn walk(&self) -> Result<Vec<Walked<'_>>> {
+        let first = self.id.first_seq;
+        let Some((off, raw_len)) = self.z else {
+            return Ok(self
+                .raw()
+                .enumerate()
+                .filter_map(|(i, (t, e))| {
+                    e.map(|(k, p)| (first + i as u64, t, k, self.bytes.slice_ref(p)))
+                })
+                .collect());
+        };
+        let block = &self.bytes[off..self.bytes.len() - 4];
+        let raw = Bytes::from(
+            lz4_flex::block::decompress(block, raw_len as usize)
+                .context("damaged compressed block")?,
+        );
+        anyhow::ensure!(
+            raw.len() == raw_len as usize,
+            "compressed block has the wrong length"
+        );
+        let mut at = 0usize;
+        let mut out = Vec::with_capacity(self.count as usize);
+        for (i, (t, k, n, dropped)) in self.columns().enumerate() {
+            let n = n as usize;
+            if !dropped {
+                out.push((first + i as u64, t, k, raw.slice(at..at + n)));
+            }
+            at += n;
+        }
+        Ok(out)
+    }
+
+    /// The batch's events without dropped ones; an error if a compressed block is damaged.
+    pub fn try_events(&self) -> Result<Vec<Event>> {
+        Ok(self
+            .walk()?
+            .into_iter()
+            .map(|(seq, t, _, payload)| Event {
+                stream: self.id.log.stream.clone(),
+                writer: self.id.log.writer.clone(),
+                epoch: self.id.log.epoch,
+                seq,
+                event_time_us: t,
+                payload,
+            })
+            .collect())
     }
 
     /// `(time, key, payload)` of every event, `None` for a tombstone.
@@ -238,22 +425,49 @@ impl Batch {
     }
 
     /// `(key, payload)` of every event but tombstones; an empty key for keyless events.
-    pub fn keyed(&self) -> impl Iterator<Item = (&[u8], Bytes)> + '_ {
-        self.raw()
-            .filter_map(|(_, e)| e.map(|(k, p)| (k, self.bytes.slice_ref(p))))
+    pub fn keyed(&self) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        Ok(self
+            .walk()?
+            .into_iter()
+            .map(|(_, _, k, p)| (k.to_vec(), p))
+            .collect())
     }
 
-    /// Each event's dedup key; `None` for no key or a tombstone.
-    pub fn keys(&self) -> impl Iterator<Item = Option<&[u8]>> + '_ {
-        self.raw()
-            .map(|(_, e)| e.map(|(k, _)| k).filter(|k| !k.is_empty()))
+    /// Each event's dedup key; `None` for no key or a dropped event. Never decompresses.
+    pub fn keys(&self) -> Box<dyn Iterator<Item = Option<&[u8]>> + '_> {
+        if self.z.is_some() {
+            return Box::new(
+                self.columns()
+                    .map(|(_, k, _, dropped)| Some(k).filter(|k| !dropped && !k.is_empty())),
+            );
+        }
+        Box::new(
+            self.raw()
+                .map(|(_, e)| e.map(|(k, _)| k).filter(|k| !k.is_empty())),
+        )
     }
 
-    /// This batch with the flagged events replaced by tombstones (same identity and sequence).
+    /// This batch with the flagged events dropped (same identity and sequence numbers). A PCZ2
+    /// block is kept as it is: dropping never recompresses.
     pub fn without(&self, drop: &[bool]) -> Result<Bytes> {
         ensure!(drop.len() == self.count as usize, "one flag per event");
         if !drop.contains(&true) {
             return Ok(self.bytes.clone());
+        }
+        if let Some((off, raw_len)) = self.z {
+            let cols: Vec<ZColumn<'_>> = self
+                .columns()
+                .zip(drop)
+                .map(|((t, k, n, d), &x)| (t, k, n, d || x))
+                .collect();
+            return Self::encode_z(
+                &self.id.log,
+                self.id.first_seq,
+                self.ident,
+                &cols,
+                raw_len,
+                &self.bytes[off..self.bytes.len() - 4],
+            );
         }
         let events: Vec<_> = self
             .raw()
@@ -267,19 +481,10 @@ impl Batch {
         self.id.first_seq + self.count as u64
     }
 
-    /// The batch's events, without tombstones.
-    pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
-        self.raw().enumerate().filter_map(move |(i, (t, e))| {
-            let (_, p) = e?;
-            Some(Event {
-                stream: self.id.log.stream.clone(),
-                writer: self.id.log.writer.clone(),
-                epoch: self.id.log.epoch,
-                seq: self.id.first_seq + i as u64,
-                event_time_us: t,
-                payload: self.bytes.slice_ref(p),
-            })
-        })
+    /// The batch's events, without dropped ones. A damaged compressed block (only a broken
+    /// producer can write one: the CRC covers it) yields none; `try_events` reports it.
+    pub fn events(&self) -> impl Iterator<Item = Event> + use<> {
+        self.try_events().unwrap_or_default().into_iter()
     }
 }
 
@@ -728,6 +933,68 @@ mod tests {
         // dropping more from an already rewritten batch keeps the first identity
         let g = Batch::parse(f.without(&[false, true]).unwrap()).unwrap();
         assert_eq!(g.ident, p.ident);
+    }
+
+    fn trades(n: u64) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
+        (0..n)
+            .map(|i| {
+                let p = format!(r#"{{"exchange":"binance","symbol":"BTCUSDT","trade_id":{i},"price":"6{i}.25","qty":"0.0{i}","side":"buy"}}"#);
+                (i, format!("id{i}").into_bytes(), p.into_bytes())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compressed_batches_read_back_and_dedup_needs_no_decompression() {
+        let evs = trades(200);
+        let refs: Vec<(u64, &[u8], &[u8])> =
+            evs.iter().map(|(t, k, p)| (*t, &k[..], &p[..])).collect();
+        let plain = Batch::encode_keyed(&log(), 7, &refs).unwrap();
+        let z = Batch::encode_compressed(&log(), 7, &refs).unwrap();
+        assert!(z.len() * 2 < plain.len(), "{} vs {}", z.len(), plain.len());
+        let b = Batch::parse(z).unwrap();
+        assert_eq!((b.count, b.end_seq()), (200, 207));
+        let keys: Vec<&[u8]> = b.keys().map(|k| k.unwrap()).collect();
+        assert_eq!(keys[3], b"id3");
+        let got = b.try_events().unwrap();
+        assert_eq!(got.len(), 200);
+        assert_eq!((got[5].seq, &got[5].payload[..]), (12, &evs[5].2[..]));
+        // dedup drops events without recompressing: same block, events hidden, identity kept
+        let mut drop = vec![false; 200];
+        drop[0] = true;
+        drop[199] = true;
+        let f = Batch::parse(b.without(&drop).unwrap()).unwrap();
+        assert_eq!((f.ident, f.count), (b.ident, 200));
+        let kept = f.try_events().unwrap();
+        assert_eq!(kept.len(), 198);
+        assert_eq!((kept[0].seq, &kept[0].payload[..]), (8, &evs[1].2[..]));
+        assert_eq!(f.keys().filter(|k| k.is_some()).count(), 198);
+    }
+
+    #[test]
+    fn a_damaged_compressed_block_is_an_error_not_silence() {
+        let evs = trades(10);
+        let refs: Vec<(u64, &[u8], &[u8])> =
+            evs.iter().map(|(t, k, p)| (*t, &k[..], &p[..])).collect();
+        let z = Batch::encode_compressed(&log(), 0, &refs).unwrap();
+        for i in 0..z.len() {
+            let mut v = z.to_vec();
+            v[i] ^= 0x40;
+            assert!(
+                Batch::parse(Bytes::from(v)).is_err(),
+                "flip at {i} undetected"
+            );
+        }
+        // a producer bug: garbage block under a valid checksum
+        let mut v = z[..z.len() - 4].to_vec();
+        let n = v.len();
+        for x in &mut v[n - 8..] {
+            *x = 0xff;
+        }
+        let c = crc32c::crc32c(&v);
+        v.extend_from_slice(&c.to_le_bytes());
+        let b = Batch::parse(Bytes::from(v)).unwrap();
+        assert!(b.try_events().is_err());
     }
 
     #[test]

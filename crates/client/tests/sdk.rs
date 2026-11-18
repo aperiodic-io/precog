@@ -245,3 +245,41 @@ fn dedup_ids_travel_as_8_byte_hashes() {
         "no id: never deduplicated"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn producers_compress_by_default_and_readers_decompress() {
+    let c = cluster(&[0, 1, 2]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    let mut p = client.producer("raw.trades.x", "producer-a");
+    let mut plain = client.producer("raw.trades.x", "producer-b");
+    plain.set_compression(false);
+    for i in 0..100u64 {
+        let payload =
+            format!(r#"{{"exchange":"binance","symbol":"BTCUSDT","trade_id":{i},"side":"buy"}}"#);
+        p.send(i, format!("a{i}").as_bytes(), payload.as_bytes());
+        plain.send(i, format!("b{i}").as_bytes(), payload.as_bytes());
+    }
+    p.sync().await.unwrap();
+    plain.sync().await.unwrap();
+    let st = |n: usize| c._nodes[n].status();
+    let bytes = st(0).bytes;
+    let mut r = client.consumer_at("raw.trades.x", Default::default());
+    let evs = r.poll(1 << 20).await.unwrap();
+    assert_eq!(evs.len(), 200);
+    assert_eq!(
+        evs.iter()
+            .filter(|e| e.payload.starts_with(b"{\"exchange\""))
+            .count(),
+        200
+    );
+    // the compressed writer's batch is the smaller of the two
+    let a: u64 = evs
+        .iter()
+        .filter(|e| e.writer == "producer-a")
+        .map(|e| e.payload.len() as u64)
+        .sum();
+    assert!(
+        bytes < 2 * a,
+        "stored {bytes} bytes for {a} + {a} payload bytes"
+    );
+}

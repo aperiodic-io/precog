@@ -101,6 +101,7 @@ impl Client {
             bytes: 0,
             copies: self.mc.node_count().min(2) as u8,
             in_flight: tokio::task::JoinSet::new(),
+            compress: true,
         }
     }
 
@@ -180,9 +181,16 @@ pub struct Producer {
     bytes: usize,
     copies: u8,
     in_flight: tokio::task::JoinSet<Result<()>>,
+    compress: bool,
 }
 
 impl Producer {
+    /// Payloads go as one lz4 block per batch (the default: about a third of the bytes to send,
+    /// store and replicate, at ~0.2 us/record of client CPU); the broker never decompresses.
+    pub fn set_compression(&mut self, on: bool) {
+        self.compress = on;
+    }
+
     /// Buffers an event with its dedup id (live-ingestion's `redpanda-dedup-key`; empty: never
     /// deduplicated), sent as its 8-byte hash. `flush` sends it; flush when `is_full`.
     pub fn send(&mut self, time_us: u64, dedup_id: &[u8], payload: &[u8]) {
@@ -229,7 +237,11 @@ impl Producer {
             .iter()
             .map(|(t, k, p)| (*t, &k[..], &p[..]))
             .collect();
-        let b = Batch::encode_keyed(&self.log, self.next_seq, &evs)?;
+        let b = if self.compress {
+            Batch::encode_compressed(&self.log, self.next_seq, &evs)?
+        } else {
+            Batch::encode_keyed(&self.log, self.next_seq, &evs)?
+        };
         let (mc, copies) = (self.client.mc.clone(), self.copies);
         let preferred = self.client.preferred(&self.log.stream);
         self.in_flight
@@ -283,7 +295,7 @@ impl Consumer {
             anyhow::ensure!(body.remaining() >= len, "truncated batches");
             let b = Batch::parse(body.split_to(len))?;
             let from = self.cursor.get(&b.id.log).copied().unwrap_or(0);
-            out.extend(b.events().filter(|e| e.seq >= from));
+            out.extend(b.try_events()?.into_iter().filter(|e| e.seq >= from));
             self.cursor.insert(b.id.log.clone(), b.end_seq());
         }
         Ok(out)

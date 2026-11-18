@@ -33,7 +33,7 @@ peers = [{"id": i, "domain": f"d{i}", "addr": f"tcp://172.31.78.{10+i}:7000"} fo
 json.dump({"id": 0, "domain": "", "data_dir": "/var/lib/precog", "token": "in-cluster",
            "listen_tcp": "0.0.0.0:7000", "peers": peers, "target_copies": 3,
            "segment_size": 268435456, "dedup_window_ms": 300000,
-           "retention_bytes": 1252698794, "retention_interval_ms": 1000,
+           "retention_bytes": int(__import__("os").environ.get("RETENTION", "1252698794")), "retention_interval_ms": 1000,
            "repair_interval_ms": int(__import__("os").environ.get("REPAIR_MS", "1000"))}, open(sys.argv[1], "w"))
 PY
   for i in 0 1 2; do

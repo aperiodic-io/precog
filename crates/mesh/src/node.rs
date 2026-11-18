@@ -284,9 +284,21 @@ fn digests(batch: &Batch) -> Vec<(usize, u64)> {
 
 /// Applies a durable batch at `lsn` to a compacted stream's newest values.
 fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
-    for (k, p) in batch.keyed() {
-        if m.get(k).is_none_or(|(l, _)| *l <= lsn) {
-            m.insert(k.to_vec(), (lsn, p));
+    let kvs = match batch.keyed() {
+        Ok(kvs) => kvs,
+        Err(e) => {
+            // the CRC held, so its producer wrote it this way; the log keeps it as written
+            tracing::error!(
+                "compacted stream {}: batch {:?} unreadable: {e}",
+                batch.id.log.stream,
+                batch.id
+            );
+            return;
+        }
+    };
+    for (k, p) in kvs {
+        if m.get(&k).is_none_or(|(l, _)| *l <= lsn) {
+            m.insert(k, (lsn, p));
         }
     }
 }

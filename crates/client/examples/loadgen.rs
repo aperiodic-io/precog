@@ -32,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
     let batch: usize = arg(&args, "--batch", 50);
     let rate: f64 = arg(&args, "--rate", 0.0);
     let label: String = arg(&args, "--label", "run".to_string());
+    // like franz-go's default snappy on the Redpanda side: payloads compressed per batch
+    let compress: u8 = arg(&args, "--compress", 1);
     let addrs = nodes
         .split(',')
         .map(|a| a.parse())
@@ -93,7 +95,11 @@ async fn main() -> anyhow::Result<()> {
                 let n = evs.len();
                 let size: usize = evs.iter().map(|(_, k, v)| k.len() + v.len()).sum();
                 let refs: Vec<(u64, &[u8], &[u8])> = evs.iter().map(|(t, k, v)| (*t, &k[..], &v[..])).collect();
-                let b = Batch::encode_keyed(&log, seq, &refs).unwrap();
+                let b = if compress == 1 {
+                    Batch::encode_compressed(&log, seq, &refs).unwrap()
+                } else {
+                    Batch::encode_keyed(&log, seq, &refs).unwrap()
+                };
                 seq += n as u64;
                 let permit = permits.clone().acquire_many_owned(n as u32).await.unwrap();
                 let (mc, acked, bytes, errors, lat) = (mc.clone(), acked.clone(), bytes.clone(), errors.clone(), lat.clone());
@@ -140,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
         serde_json::json!({"label": label, "throughput_records_per_sec": acked.load(Relaxed) as f64 / secs,
             "throughput_mb_per_sec": bytes.load(Relaxed) as f64 / secs / 1e6, "latency_p50_ms": q(0.50),
             "latency_p99_ms": q(0.99), "errors": errors.load(Relaxed), "dedup_dropped_total": dropped,
-            "producers": producers, "batch": batch, "in_flight": in_flight, "dup_rate": dup_rate, "rate": rate})
+            "producers": producers, "batch": batch, "compress": compress, "in_flight": in_flight, "dup_rate": dup_rate, "rate": rate})
     );
     Ok(())
 }
