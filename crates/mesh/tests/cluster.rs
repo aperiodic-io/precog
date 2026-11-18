@@ -11,23 +11,24 @@ use std::time::Duration;
 struct Cluster {
     cfgs: Vec<NodeConfig>,
     addrs: Vec<Addr>,
+    /// Each node's port, held until the node listens on it, so no other test takes it in
+    /// between: bound with SO_REUSEADDR (as the node binds) but not listening, so a node not
+    /// started yet still refuses connections.
+    reserved: std::sync::Mutex<Vec<Option<tokio::net::TcpSocket>>>,
     _dir: tempfile::TempDir,
-}
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 fn cluster(n: u32, domains: &[&str]) -> Cluster {
     let dir = tempfile::tempdir().unwrap();
     let mut addrs = Vec::new();
     let mut socks = Vec::new();
+    let mut sockets = Vec::new();
     for _ in 0..n {
-        let port = free_port();
+        let s = tokio::net::TcpSocket::new_v4().unwrap();
+        s.set_reuseaddr(true).unwrap();
+        s.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = s.local_addr().unwrap().port();
+        sockets.push(Some(s));
         socks.push(format!("127.0.0.1:{port}").parse().unwrap());
         addrs.push(format!("tcp://127.0.0.1:{port}"));
     }
@@ -57,6 +58,7 @@ fn cluster(n: u32, domains: &[&str]) -> Cluster {
     Cluster {
         cfgs,
         addrs: addrs.iter().map(|a| a.parse().unwrap()).collect(),
+        reserved: std::sync::Mutex::new(sockets),
         _dir: dir,
     }
 }
@@ -64,6 +66,7 @@ fn cluster(n: u32, domains: &[&str]) -> Cluster {
 async fn start(c: &Cluster, i: usize) -> Arc<Node> {
     let node = Node::open(c.cfgs[i].clone()).await.unwrap();
     node.spawn_listeners().await.unwrap();
+    c.reserved.lock().unwrap()[i] = None; // the node holds the port now
     node
 }
 
