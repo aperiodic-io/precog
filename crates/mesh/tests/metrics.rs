@@ -68,3 +68,29 @@ async fn metrics_report_appends_dedup_and_storage_and_health_follows_the_fence()
     );
     assert_eq!(get(addr, "/nope").await.0, 404);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metrics_report_each_groups_lag_behind_its_stream() {
+    // what kafka-exporter gives live-ingestion's alerts today: per consumer group and topic, lag
+    let d = tempfile::tempdir().unwrap();
+    let mut c = NodeConfig::single(0, "a", d.path().to_path_buf(), "tok".into());
+    c.segment_size = 1 << 20;
+    let node = Node::open(c).await.unwrap();
+    let log = LogId {
+        stream: "raw.trades.x".into(),
+        writer: "p".into(),
+        epoch: 1,
+    };
+    for seq in (0..10).step_by(2) {
+        let b = Batch::encode(&log, seq, &[(1, b"a"), (2, b"b")]).unwrap();
+        assert!(node.append(1, b).await.is_success());
+    }
+    let pos: precog_mesh::store::Cursor = [(log, 6)].into_iter().collect();
+    node.commit_position("raw-archiver-trades-x", "raw.trades.x", &pos)
+        .await
+        .unwrap();
+    let m = node.metrics();
+    let lag = r#"precog_group_lag_events{group="raw-archiver-trades-x",stream="raw.trades.x"} 4"#;
+    assert!(m.lines().any(|l| l == lag), "missing {lag:?} in\n{m}");
+    assert!(m.contains(r#"precog_group_commit_age_seconds{group="raw-archiver-trades-x",stream="raw.trades.x"} "#), "{m}");
+}
