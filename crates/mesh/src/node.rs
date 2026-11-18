@@ -835,6 +835,22 @@ impl Node {
                     }
                     return Ok(Frame::new(Kind::Batches, id, out.freeze()));
                 }
+                if let Control::ReadCursor {
+                    stream,
+                    cursor,
+                    max_bytes,
+                } = &c
+                {
+                    let cursor = crate::store::cursor_from_wire(cursor.clone(), stream);
+                    let max = (*max_bytes as usize).min(MAX_FRAME_BYTES / 2);
+                    let (batches, _) = self.store.read_cursor(stream, &cursor, max);
+                    let mut out = BytesMut::new();
+                    for b in batches {
+                        out.put_u32_le(b.len() as u32);
+                        out.put_slice(&b);
+                    }
+                    return Ok(Frame::new(Kind::Batches, id, out.freeze()));
+                }
                 let resp = self.control(c, ident).await?;
                 Ok(Frame::new(
                     Kind::ControlResp,
@@ -867,11 +883,41 @@ impl Node {
                 let (fetched, errors) = self.repair_pass().await;
                 ControlResp::Repair { fetched, errors }
             }
-            Control::Fetch { .. } => unreachable!(),
+            Control::Fetch { .. } | Control::ReadCursor { .. } => unreachable!(),
+            Control::CursorAt { stream, time_ms } => {
+                let c = self.store.cursor_at(&stream, time_ms);
+                ControlResp::Cursor {
+                    cursor: Some(crate::store::cursor_to_wire(&c, &stream)),
+                }
+            }
+            Control::Commit {
+                group,
+                stream,
+                cursor,
+            } => {
+                self.commit_position(
+                    &group,
+                    &stream,
+                    &crate::store::cursor_from_wire(cursor, &stream),
+                )
+                .await?;
+                ControlResp::Committed
+            }
+            Control::Position { group, stream } => ControlResp::Cursor {
+                cursor: self
+                    .position(&group, &stream)
+                    .map(|c| crate::store::cursor_to_wire(&c, &stream)),
+            },
+            Control::Latest { stream } => ControlResp::Latest {
+                entries: self
+                    .latest(&stream)
+                    .into_iter()
+                    .map(|(k, v)| (k, v.to_vec()))
+                    .collect(),
+            },
         })
     }
 
-    /// Writes the batch to the local WAL unless an identical copy exists.
     /// A client batch: if it is new, drops its duplicate events and queues it to the log, both
     /// under the dedup lock (ids are claimed in log order). Returns the batch to store and
     /// replicate, and its queued write; `None` leaves it to `store_local` (a retry, a conflict).
@@ -1126,7 +1172,10 @@ impl Node {
                         tracing::debug!("peer {pid} replicate failed: {e}")
                     }
                 }
+                // the accepting node's own copy is always one of them: reads here see the batch
+                // right after the ack, and dedup's ordering argument holds (see begin_local)
                 if domains.len() >= copies as usize
+                    && nodes & (1 << node.cfg.id) != 0
                     && let Some(tx) = tx.take()
                 {
                     // Early completion; remaining copies finish in this task.

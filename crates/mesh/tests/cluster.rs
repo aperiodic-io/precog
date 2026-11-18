@@ -385,3 +385,20 @@ async fn a_position_committed_through_one_node_is_read_on_another() {
         .count();
     assert!(held >= 2, "{held}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_append_is_acknowledged_only_once_the_accepting_node_holds_it() {
+    // Two peers holding a batch is not enough: the accepting node's own copy must be durable
+    // (reads there right after the ack see it, and a batch whose duplicates were dropped is acked
+    // only after the batches that claimed them, which the accepting node's log orders).
+    let mut c = cluster(3, &["a", "b", "c"]);
+    c.cfgs[0].storage_failpoints.fail_data_sync_after = Some(0);
+    let _nodes: Vec<_> = futures::future::join_all((0..3).map(|i| start(&c, i))).await;
+    let mc = client(&c).await;
+    let log = LogId { stream: "s".into(), writer: "w".into(), epoch: 1 };
+    let b = Batch::encode(&log, 0, &[(1, b"x")]).unwrap();
+    let ack = mc.call(0, Kind::Append, encode_append(2, &b)).await.unwrap();
+    let ack = precog_mesh::node::parse_frame_ack(&ack).unwrap();
+    assert!(!ack.is_success(), "acknowledged without the accepting node's copy: {ack:?}");
+}
+
