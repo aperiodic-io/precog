@@ -8,17 +8,21 @@ use precog_mesh::node::{Node, NodeConfig, PeerConfig, StreamConfig};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A free port, held (bound with SO_REUSEADDR, as the node binds, but not listening, so a node
+/// not started refuses connections) while the socket lives, so no test running in parallel
+/// takes it before its node binds it.
+fn reserve() -> tokio::net::TcpSocket {
+    let s = tokio::net::TcpSocket::new_v4().unwrap();
+    s.set_reuseaddr(true).unwrap();
+    s.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    s
 }
 
 struct Cluster {
     addrs: Vec<String>,
     ports: Vec<u16>,
+    /// held until each node listens; those of nodes not started stay dead
+    reserved: Vec<Option<tokio::net::TcpSocket>>,
     _nodes: Vec<Arc<Node>>,
     _dir: tempfile::TempDir,
 }
@@ -56,13 +60,19 @@ async fn start(c: &mut Cluster, i: u32, repair_ms: u64) {
     );
     let n = Node::open(cfg).await.unwrap();
     n.spawn_listeners().await.unwrap();
+    c.reserved[i as usize] = None; // the node holds the port now
     c._nodes.push(n);
 }
 
 /// Nodes `up` of three are started; the others' addresses stay dead.
 async fn cluster(up: &[u32]) -> Cluster {
-    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let reserved: Vec<_> = (0..3).map(|_| Some(reserve())).collect();
+    let ports: Vec<u16> = reserved
+        .iter()
+        .map(|s| s.as_ref().unwrap().local_addr().unwrap().port())
+        .collect();
     let mut c = Cluster {
+        reserved,
         addrs: ports
             .iter()
             .map(|p| format!("tcp://127.0.0.1:{p}"))
