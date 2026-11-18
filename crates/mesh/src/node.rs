@@ -223,7 +223,7 @@ fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
         let pl = u32::from_le_bytes(take(4)?.try_into()?) as usize;
         m.insert(k, (lsn, Bytes::copy_from_slice(take(pl)?)));
     }
-    if !take(0)?.is_empty() || !c.is_empty() {
+    if !c.is_empty() {
         return Err(fail());
     }
     Ok(m)
