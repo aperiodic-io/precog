@@ -87,6 +87,10 @@ struct StreamLog {
     bytes: u64,
 }
 
+/// A reader's position in a stream, valid on every node: per writer log, the next sequence to
+/// read. A log missing from it is read from its start.
+pub type Cursor = BTreeMap<LogId, u64>;
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -395,6 +399,98 @@ impl Store {
             .filter_map(|(lsn, _)| self.read_batch(lsn).map(|b| b.bytes))
             .collect();
         (out, next)
+    }
+
+    /// The stream's durable batches the cursor has not covered, in this node's order, up to about
+    /// `max_bytes`, and the cursor past them. A writer's batch waits until its predecessor is
+    /// here (per-writer order); nothing is skipped (only LSNs below `contiguous` are read).
+    pub fn read_cursor(
+        &self,
+        stream: &str,
+        cursor: &Cursor,
+        max_bytes: usize,
+    ) -> (Vec<bytes::Bytes>, Cursor) {
+        let mut next = cursor.clone();
+        let lsns: Vec<Lsn> = {
+            let g = self.inner.lock();
+            let (Some(sl), Some(logs)) = (g.by_stream.get(stream), g.streams.get(stream)) else {
+                return (vec![], next);
+            };
+            let from = |log: &LogId| {
+                cursor
+                    .get(log)
+                    .copied()
+                    .unwrap_or_else(|| g.trimmed.get(log).copied().unwrap_or(0))
+            };
+            // start at the earliest LSN of an unread batch of any of the stream's logs
+            let start = logs
+                .iter()
+                .filter_map(|log| {
+                    let (map, c) = (g.logs.get(log)?, from(log));
+                    let e = map
+                        .range(..=c)
+                        .next_back()
+                        .filter(|(_, e)| e.shape.end > c)
+                        .or_else(|| map.range(c..).next());
+                    e?.1.lsn
+                })
+                .min();
+            let Some(start) = start else {
+                return (vec![], next);
+            };
+            let (mut size, mut out, mut blocked) = (0usize, vec![], BTreeSet::new());
+            for (&lsn, (log, _, len)) in sl.order.range(start..g.contiguous.max(start)) {
+                if size >= max_bytes {
+                    break;
+                }
+                let id = &g.order[&lsn].0;
+                let c = next.get(log).copied().unwrap_or_else(|| from(log));
+                let end = g.logs[log][&id.first_seq].shape.end;
+                if blocked.contains(log) || end <= c {
+                    continue;
+                }
+                if id.first_seq > c {
+                    blocked.insert(log.clone()); // its predecessor is not here yet
+                    continue;
+                }
+                next.insert(log.clone(), end);
+                size += *len as usize;
+                out.push(lsn);
+            }
+            out
+        };
+        let bytes = lsns
+            .into_iter()
+            .filter_map(|lsn| self.read_batch(lsn).map(|b| b.bytes))
+            .collect();
+        (bytes, next)
+    }
+
+    /// A cursor at the first batch this node logged at or after `time_ms`; `u64::MAX`: the end.
+    pub fn cursor_at(&self, stream: &str, time_ms: u64) -> Cursor {
+        let g = self.inner.lock();
+        let mut c = Cursor::new();
+        if let Some(sl) = g.by_stream.get(stream) {
+            for (lsn, (log, t, _)) in &sl.order {
+                if *t >= time_ms && !c.contains_key(log) {
+                    c.insert(log.clone(), g.order[lsn].0.first_seq);
+                }
+            }
+        }
+        for log in g.streams.get(stream).into_iter().flatten() {
+            if !c.contains_key(log) {
+                let end = g
+                    .logs
+                    .get(log)
+                    .and_then(|m| m.values().filter_map(|e| e.lsn.map(|_| e.shape.end)).max());
+                c.insert(
+                    log.clone(),
+                    end.unwrap_or(0)
+                        .max(g.trimmed.get(log).copied().unwrap_or(0)),
+                );
+            }
+        }
+        c
     }
 
     /// The LSN a subscription "from now" starts at.
@@ -844,5 +940,135 @@ mod tests {
         );
         assert_eq!(t.s.trim_stream("a", None, Some(60_000), now + 61_000), 4);
         assert_eq!(t.s.totals().0, 0);
+    }
+
+    fn drain(s: &Store, stream: &str, mut c: Cursor, max: usize) -> (Vec<BatchId>, Cursor) {
+        let mut got = vec![];
+        loop {
+            let (bs, next) = s.read_cursor(stream, &c, max);
+            if bs.is_empty() {
+                return (got, c);
+            }
+            got.extend(bs.into_iter().map(|b| Batch::parse(b).unwrap().id));
+            c = next;
+        }
+    }
+
+    #[test]
+    fn a_cursor_reads_every_batch_once_in_writer_order_in_small_steps() {
+        let mut t = store();
+        for i in 0..6 {
+            for w in ["w1", "w2"] {
+                let x = on("s", w, i);
+                t.s.reserve(&x);
+                t.durable(&x);
+            }
+        }
+        let one = on("s", "w1", 0).bytes.len();
+        let (got, c) = drain(&t.s, "s", Cursor::new(), 3 * one);
+        assert_eq!(got.len(), 12);
+        for w in ["w1", "w2"] {
+            let seqs: Vec<u64> = got
+                .iter()
+                .filter(|id| id.log.writer == w)
+                .map(|id| id.first_seq)
+                .collect();
+            assert_eq!(seqs, (0..6).collect::<Vec<_>>(), "{w}");
+        }
+        assert_eq!(c.values().copied().collect::<Vec<_>>(), [6, 6]);
+        assert!(
+            t.s.read_cursor("s", &c, 1 << 20).0.is_empty(),
+            "nothing more"
+        );
+    }
+
+    #[test]
+    fn a_cursor_from_one_node_resumes_exactly_on_another() {
+        // two nodes hold the same batches in different LSN orders
+        let (mut a, mut b) = (store(), store());
+        let xs: Vec<Batch> = (0..8)
+            .flat_map(|i| [on("s", "w1", i), on("s", "w2", i)])
+            .collect();
+        for x in &xs {
+            a.s.reserve(x);
+            a.durable(x);
+        }
+        for x in xs
+            .iter()
+            .rev()
+            .filter(|x| x.id.log.writer == "w2")
+            .chain(xs.iter().filter(|x| x.id.log.writer == "w1"))
+        {
+            b.s.reserve(x);
+            b.durable(x);
+        }
+        let one = xs[0].bytes.len();
+        let (first, c) = a.s.read_cursor("s", &Cursor::new(), 5 * one);
+        let (rest, _) = drain(&b.s, "s", c, 3 * one);
+        let mut all: Vec<BatchId> = first
+            .into_iter()
+            .map(|b| Batch::parse(b).unwrap().id)
+            .chain(rest)
+            .collect();
+        assert_eq!(all.len(), 16, "nothing lost or repeated");
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 16);
+    }
+
+    #[test]
+    fn a_writers_batch_waits_until_its_predecessor_is_here() {
+        let mut t = store();
+        let xs: Vec<Batch> = (0..3).map(|i| on("s", "w", i)).collect();
+        for x in [&xs[0], &xs[2]] {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        let (got, c) = drain(&t.s, "s", Cursor::new(), 1 << 20);
+        assert_eq!(
+            got.iter().map(|i| i.first_seq).collect::<Vec<_>>(),
+            [0],
+            "seq 2 waits for 1"
+        );
+        t.s.reserve(&xs[1]);
+        t.durable(&xs[1]);
+        let (got, _) = drain(&t.s, "s", c, 1 << 20);
+        assert_eq!(got.iter().map(|i| i.first_seq).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn a_cursor_can_start_at_the_end_or_at_a_time() {
+        let mut t = store();
+        for i in 0..3 {
+            let x = on("s", "w", i);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let since = now_ms();
+        for i in 3..5 {
+            let x = on("s", "w", i);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        let at = t.s.cursor_at("s", since);
+        assert_eq!(
+            drain(&t.s, "s", at, 1 << 20)
+                .0
+                .iter()
+                .map(|i| i.first_seq)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+        let end = t.s.cursor_at("s", u64::MAX);
+        assert!(drain(&t.s, "s", end.clone(), 1 << 20).0.is_empty());
+        let x = on("s", "w", 5);
+        t.s.reserve(&x);
+        t.durable(&x);
+        assert_eq!(
+            drain(&t.s, "s", end, 1 << 20).0.len(),
+            1,
+            "the end cursor sees what comes next"
+        );
     }
 }
