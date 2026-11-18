@@ -144,6 +144,7 @@ impl Enc {
             h.extend_from_slice(&log.epoch.to_le_bytes());
             h.extend_from_slice(&first_seq.to_le_bytes());
             h.extend_from_slice(&(recs.len() as u32).to_le_bytes());
+            h.extend_from_slice(&0u32.to_le_bytes()); // ident: the batch is its own identity
             for r in recs {
                 h.extend_from_slice(&r.time_us.to_le_bytes());
                 h.extend_from_slice(&(r.id.len() as u16).to_le_bytes());
@@ -278,7 +279,7 @@ fn pcb2<'a>(names: bool, b: &'a [u8], mut f: impl FnMut(Rec<'a>)) -> Result<Batc
         let ids = take(&mut c, 8)?;
         (stream_id, writer_id) = (u32_at(ids, 0), u32_at(ids, 4));
     }
-    let h = take(&mut c, 20)?;
+    let h = take(&mut c, 24)?; // ... count u32, ident u32 (PCB2 since dedup)
     let (epoch, first_seq, count) = (u64_at(h, 0), u64_at(h, 8), u32_at(h, 16));
     ensure!(count > 0 && count <= MAX_COUNT, "bad event count");
     ensure!(
