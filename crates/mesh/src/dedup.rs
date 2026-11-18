@@ -115,13 +115,14 @@ impl Dedup {
                 .map_or(self.sized, |t| t.len * 8 / 7 * 11 / 10);
             self.gens.push_back(Table::new(self.sized, now_s));
         }
-        // by count, by age after an idle gap, and by the entry cap
+        // by count, by age after an idle gap, and by the entry cap (never the newest: it is
+        // new, or under its share of the cap)
         while self.gens.len() > self.k
             || self
                 .gens
                 .front()
                 .is_some_and(|t| now_s >= t.start_s + self.span_s * self.k as u64)
-            || (self.gens.len() > 1 && self.len() > self.max_entries)
+            || self.len() > self.max_entries
         {
             self.gens.pop_front();
         }
@@ -274,7 +275,10 @@ mod tests {
                 149 => d.record(&[p1], t), // the last second of the first generation
                 150 => d.record(&[p2], t), // the first second of the second
                 449 => assert_eq!(dups(&mut d, &[p1], t), [true], "held the full window"),
-                450 => assert_eq!(dups(&mut d, &[p1], t), [false], "gone with its generation"),
+                450 => {
+                    assert_eq!(dups(&mut d, &[p1], t), [false], "gone with its generation");
+                    assert_eq!(d.effective_window_s(t), 300, "the window is what is held");
+                }
                 599 => assert_eq!(dups(&mut d, &[p2], t), [true], "held up to 450 s"),
                 600 => assert_eq!(dups(&mut d, &[p2], t), [false], "not past 450 s"),
                 _ => {}
@@ -321,12 +325,9 @@ mod tests {
         let first = d.bytes();
         d.record(&ids(n..n + 1), 150); // opens the second generation
         let second = (d.bytes() - first) / 8;
-        d.record(&ids(n + 1..2 * n), 150);
-        assert_eq!(
-            d.bytes() - first,
-            second * 8,
-            "the same count fits without regrowing"
-        );
+        // the same count, and a little more (traffic grows), fits without regrowing
+        d.record(&ids(n + 1..2 * n + n / 20), 150);
+        assert_eq!(d.bytes() - first, second * 8, "5% more fits");
         let n = n as usize;
         assert!(
             second <= n * 8 / 7 * 11 / 10,
