@@ -18,6 +18,18 @@ use std::sync::Arc;
 pub use precog_mesh::proto::Event;
 pub use precog_mesh::store::{Cursor, now_ms};
 
+/// Batches a producer keeps waiting for their acks (the protocol POCs: pipelining 1.8x).
+pub const MAX_IN_FLIGHT: usize = 8;
+
+/// A dedup id as it travels: its 8-byte xxh3 (an empty id stays empty: never deduplicated).
+pub fn dedup_key(id: &[u8]) -> Vec<u8> {
+    if id.is_empty() {
+        vec![]
+    } else {
+        xxhash_rust::xxh3::xxh3_64(id).to_le_bytes().to_vec()
+    }
+}
+
 /// Events per batch before `send` asks for a flush (`Producer::is_full`).
 pub const MAX_BATCH_EVENTS: usize = 4096;
 /// Bytes per batch before `send` asks for a flush.
@@ -88,6 +100,7 @@ impl Client {
             events: vec![],
             bytes: 0,
             copies: self.mc.node_count().min(2) as u8,
+            in_flight: tokio::task::JoinSet::new(),
         }
     }
 
@@ -166,24 +179,50 @@ pub struct Producer {
     events: Vec<(u64, Vec<u8>, Vec<u8>)>,
     bytes: usize,
     copies: u8,
+    in_flight: tokio::task::JoinSet<Result<()>>,
 }
 
 impl Producer {
-    /// Buffers an event (`time_us`, dedup `key` (empty: never deduplicated), `payload`); `flush`
-    /// appends it. Flush when `is_full`.
-    pub fn send(&mut self, time_us: u64, key: &[u8], payload: &[u8]) {
+    /// Buffers an event with its dedup id (live-ingestion's `redpanda-dedup-key`; empty: never
+    /// deduplicated), sent as its 8-byte hash. `flush` sends it; flush when `is_full`.
+    pub fn send(&mut self, time_us: u64, dedup_id: &[u8], payload: &[u8]) {
+        let key = dedup_key(dedup_id);
+        self.put(time_us, &key, payload);
+    }
+
+    /// Buffers an event of a compacted stream: `key` is its compaction key, kept as is.
+    pub fn put(&mut self, time_us: u64, key: &[u8], payload: &[u8]) {
         self.bytes += 14 + key.len() + payload.len();
         self.events.push((time_us, key.to_vec(), payload.to_vec()));
+    }
+
+    /// Batches sent and not yet acknowledged.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Waits until every batch sent so far is acknowledged (durable on `copies` nodes).
+    pub async fn sync(&mut self) -> Result<()> {
+        self.flush().await?;
+        while let Some(r) = self.in_flight.join_next().await {
+            r??;
+        }
+        Ok(())
     }
 
     pub fn is_full(&self) -> bool {
         self.events.len() >= MAX_BATCH_EVENTS || self.bytes >= MAX_BATCH_BYTES
     }
 
-    /// Appends the buffered events as one batch, durable on `copies` nodes when it returns.
+    /// Sends the buffered events as one batch, keeping up to `MAX_IN_FLIGHT` batches waiting
+    /// for their acks (it waits for the oldest beyond that); `sync` waits for all of them. A
+    /// failed append is retried with the same bytes, which is idempotent.
     pub async fn flush(&mut self) -> Result<()> {
         if self.events.is_empty() {
             return Ok(());
+        }
+        while self.in_flight.len() >= MAX_IN_FLIGHT {
+            self.in_flight.join_next().await.unwrap()??;
         }
         let evs: Vec<(u64, &[u8], &[u8])> = self
             .events
@@ -191,8 +230,10 @@ impl Producer {
             .map(|(t, k, p)| (*t, &k[..], &p[..]))
             .collect();
         let b = Batch::encode_keyed(&self.log, self.next_seq, &evs)?;
+        let (mc, copies) = (self.client.mc.clone(), self.copies);
         let preferred = self.client.preferred(&self.log.stream);
-        self.client.mc.append(preferred, &b, self.copies).await?;
+        self.in_flight
+            .spawn(async move { mc.append(preferred, &b, copies).await.map(|_| ()) });
         self.next_seq += self.events.len() as u64;
         self.events.clear();
         self.bytes = 0;

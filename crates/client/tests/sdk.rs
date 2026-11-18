@@ -84,8 +84,8 @@ async fn replicas_publish_the_same_events_and_a_reader_sees_each_once_in_writer_
         a.send(i, id.as_bytes(), format!("t{i}").as_bytes());
         b.send(i, id.as_bytes(), format!("t{i}").as_bytes());
         if i % 10 == 9 {
-            a.flush().await.unwrap();
-            b.flush().await.unwrap();
+            a.sync().await.unwrap();
+            b.sync().await.unwrap();
         }
     }
     let mut r = client
@@ -124,7 +124,7 @@ async fn a_committed_position_resumes_on_another_node_losing_and_repeating_nothi
     for i in 0..40u64 {
         p.send(i, format!("id{i}").as_bytes(), format!("t{i}").as_bytes());
         if i % 5 == 4 {
-            p.flush().await.unwrap(); // batches of 5: the read unit
+            p.sync().await.unwrap(); // batches of 5: the read unit
         }
     }
     let mut r = client
@@ -166,11 +166,11 @@ async fn a_new_group_can_start_at_a_time_and_compacted_state_is_served() {
     let client = Client::connect(&c.addrs, "tok").unwrap();
     let mut p = client.producer("raw.trades.x", "producer-a");
     p.send(1, b"old", b"old");
-    p.flush().await.unwrap();
+    p.sync().await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let since = precog_client::now_ms();
     p.send(2, b"new", b"new");
-    p.flush().await.unwrap();
+    p.sync().await.unwrap();
     let mut r = client
         .consumer(
             "raw.trades.x",
@@ -183,10 +183,10 @@ async fn a_new_group_can_start_at_a_time_and_compacted_state_is_served() {
         .unwrap();
     assert_eq!(names(&r.poll(1 << 20).await.unwrap()), ["new"]);
     let mut s = client.producer("state", "collector");
-    s.send(1, b"k1", b"v1");
-    s.send(2, b"k1", b"v2");
-    s.send(3, b"k2", b"w");
-    s.flush().await.unwrap();
+    s.put(1, b"k1", b"v1");
+    s.put(2, b"k1", b"v2");
+    s.put(3, b"k2", b"w");
+    s.sync().await.unwrap();
     let latest = client.latest("state").await.unwrap();
     assert_eq!(
         latest,
@@ -194,5 +194,54 @@ async fn a_new_group_can_start_at_a_time_and_compacted_state_is_served() {
             (b"k1".to_vec(), b"v2".to_vec().into()),
             (b"k2".to_vec(), b"w".to_vec().into())
         ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_producer_keeps_several_batches_in_flight_and_sync_waits_for_all() {
+    let c = cluster(&[0, 1, 2]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    let mut p = client.producer("raw.trades.x", "producer-a");
+    for i in 0..200u64 {
+        p.send(i, format!("id{i}").as_bytes(), format!("t{i}").as_bytes());
+        if i % 10 == 9 {
+            p.flush().await.unwrap(); // queues the batch; at most 8 wait for their acks
+            assert!(p.in_flight() <= 8);
+        }
+    }
+    p.sync().await.unwrap();
+    assert_eq!(p.in_flight(), 0);
+    let mut r = client.consumer_at("raw.trades.x", Default::default());
+    let mut got = vec![];
+    loop {
+        let evs = r.poll(1 << 20).await.unwrap();
+        if evs.is_empty() {
+            break;
+        }
+        got.extend(evs);
+    }
+    assert_eq!(
+        names(&got),
+        (0..200).map(|i| format!("t{i}")).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn dedup_ids_travel_as_8_byte_hashes() {
+    assert_eq!(
+        precog_client::dedup_key(b"binance-futures-p3-123456").len(),
+        8
+    );
+    assert_eq!(
+        precog_client::dedup_key(b"a"),
+        precog_client::dedup_key(b"a")
+    );
+    assert_ne!(
+        precog_client::dedup_key(b"a"),
+        precog_client::dedup_key(b"b")
+    );
+    assert!(
+        precog_client::dedup_key(b"").is_empty(),
+        "no id: never deduplicated"
     );
 }
