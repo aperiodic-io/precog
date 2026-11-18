@@ -100,10 +100,45 @@ pub struct Batch {
 }
 
 impl Batch {
+    /// Events without dedup keys: format 1, which has no key or tombstone fields to write or check.
     pub fn encode(log: &LogId, first_seq: u64, events: &[(u64, &[u8])]) -> Result<Bytes> {
-        let keyless: Vec<(u64, &[u8], &[u8])> =
-            events.iter().map(|&(t, p)| (t, &b""[..], p)).collect();
-        Self::encode_keyed(log, first_seq, &keyless)
+        ensure!(!events.is_empty(), "empty batch");
+        ensure!(
+            events.len() as u64 <= MAX_EVENTS_PER_BATCH as u64,
+            "too many events"
+        );
+        ensure!(
+            log.stream.len() <= MAX_NAME && log.writer.len() <= MAX_NAME,
+            "name too long"
+        );
+        ensure!(
+            !log.stream.is_empty() && !log.writer.is_empty(),
+            "empty name"
+        );
+        first_seq
+            .checked_add(events.len() as u64)
+            .context("sequence overflow")?;
+        let payload: usize = events.iter().map(|(_, p)| 12 + p.len()).sum();
+        let len = 4 + 2 + log.stream.len() + 2 + log.writer.len() + 8 + 8 + 4 + payload + 4;
+        ensure!(len <= MAX_BATCH_BYTES, "batch too large ({len} bytes)");
+        let mut b = BytesMut::with_capacity(len);
+        b.put_slice(BATCH_MAGIC_V1);
+        b.put_u16_le(log.stream.len() as u16);
+        b.put_slice(log.stream.as_bytes());
+        b.put_u16_le(log.writer.len() as u16);
+        b.put_slice(log.writer.as_bytes());
+        b.put_u64_le(log.epoch);
+        b.put_u64_le(first_seq);
+        b.put_u32_le(events.len() as u32);
+        for (t, p) in events {
+            b.put_u64_le(*t);
+            b.put_u32_le(p.len() as u32);
+            b.put_slice(p);
+        }
+        let crc = crc32c::crc32c(&b);
+        b.put_u32_le(crc);
+        debug_assert_eq!(b.len(), len);
+        Ok(b.freeze())
     }
 
     /// Events of `(time, dedup key, payload)`; an empty key is never deduplicated.
@@ -249,8 +284,17 @@ impl Batch {
             z = Some((body.len() - n, raw_len));
         } else {
             for _ in 0..count {
-                let (k, n) = take_event(&mut c, v1)?;
-                let n = k + n.unwrap_or(0);
+                let n = if v1 {
+                    // format 1: time and payload length only
+                    ensure!(c.remaining() >= 12, "truncated event");
+                    c.advance(8);
+                    let n = c.get_u32_le();
+                    ensure!(n != TOMBSTONE, "bad payload length");
+                    n as usize
+                } else {
+                    let (k, n) = take_event(&mut c, false)?;
+                    k + n.unwrap_or(0)
+                };
                 ensure!(c.remaining() >= n, "truncated payload");
                 c.advance(n);
             }
