@@ -1,0 +1,23 @@
+{
+  "label": "rp-dup20",
+  "image": "",
+  "topic": "raw.bench.trades",
+  "producers": 8,
+  "symbols": 24,
+  "dup_rate": 0.2,
+  "measured_seconds": 30,
+  "sent_records": 4283911,
+  "sent_bytes": 1039889010,
+  "send_errors": 0,
+  "throughput_records_per_sec": 142797.03333333333,
+  "throughput_mb_per_sec": 33.0571813583374,
+  "total_run_records_acked": 4877929,
+  "broker_appended_records": 3901786,
+  "dedup_dropped_records": 976143,
+  "dedup_dropped_pct": 20.01142288048883,
+  "latency_mean_ms": 12.218459040562065,
+  "latency_p50_ms": 11.566481999999999,
+  "latency_p95_ms": 15.860790999999999,
+  "latency_p99_ms": 19.055885,
+  "latency_max_ms": 891.937253
+}
