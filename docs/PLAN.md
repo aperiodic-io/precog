@@ -165,6 +165,12 @@ this is done. Precog must be at least **3× Redpanda** on all three measures in 
 | R7 | Operations: StatefulSet and chart, Prometheus metrics (append, fsync, repair, dedup, per-group lag), a declarative stream config applied like topicsync (never deletes), replacing the kafka-exporter rules | Staging runs on Precog for 7 days with the alerts green |
 | R8 | Cutover: producers dual-write, readers switch one by one, Redpanda raw cluster retired | Archive parity (row counts per hour) between the two paths for 72 h |
 
+Status (2026-11-18): R1 (PR #4), R2 + R3 (PR #6), R4 (PRs #3, #10), R5 (PR #5), the Rust SDK (PR #8),
+operations without the per-group lag metric (PR #7) and the live-ingestion stream config
+(aperiodic-io/live-ingestion#1383) are built. Left before the cutover: the Go client and its
+live-producers backend, the archiver's and brrrrr's Precog sources, per-group lag metrics and the
+alert rules, then R8 on staging.
+
 ### 7.3 The 3× target
 
 Measured on the raw brokers' size (1 CPU, 4 GiB each, 3 nodes, 3 copies, every append durable on
