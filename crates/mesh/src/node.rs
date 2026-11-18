@@ -40,6 +40,9 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub token: String,
     pub listen_tcp: Option<SocketAddr>,
+    /// Prometheus `/metrics` and `/health` (503 once storage is fenced) over plain HTTP.
+    #[serde(default)]
+    pub listen_metrics: Option<SocketAddr>,
     pub peers: Vec<PeerConfig>,
     /// Copies the node tries to create for every append (including its own).
     #[serde(default = "three")]
@@ -88,6 +91,7 @@ impl NodeConfig {
             data_dir,
             token,
             listen_tcp: None,
+            listen_metrics: None,
             peers: vec![],
             target_copies: three(),
             rpc_timeout_ms: rpc_ms(),
@@ -104,6 +108,21 @@ impl NodeConfig {
         }
     }
 
+    /// This config for member `id` of a cluster whose `peers` list every node, itself included:
+    /// takes its id and failure domain, and keeps the others as peers (one ConfigMap for a
+    /// whole StatefulSet).
+    pub fn for_member(mut self, id: u32) -> Result<NodeConfig> {
+        let me = self
+            .peers
+            .iter()
+            .position(|p| p.id == id)
+            .with_context(|| format!("node {id} is not in the peer list"))?;
+        let me = self.peers.remove(me);
+        self.id = id;
+        self.domain = me.domain;
+        Ok(self)
+    }
+
     fn storage(&self) -> precog_storage::Config {
         let mut c = precog_storage::Config::new(self.data_dir.join("log"));
         c.segment_size = self.segment_size;
@@ -116,6 +135,15 @@ impl NodeConfig {
 fn segment_size() -> u64 {
     1 << 30
 }
+/// A StatefulSet pod's ordinal from its hostname (`precog-2` -> 2).
+pub fn ordinal(hostname: &str) -> Result<u32> {
+    let (_, n) = hostname
+        .rsplit_once('-')
+        .with_context(|| format!("no ordinal in hostname {hostname:?}"))?;
+    n.parse()
+        .with_context(|| format!("no ordinal in hostname {hostname:?}"))
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StreamConfig {
     /// Keep at most this many bytes of the stream (its oldest batches go first).
@@ -562,7 +590,79 @@ impl Node {
         Ok(())
     }
 
+    /// Prometheus text exposition of `status()`.
+    pub fn metrics(&self) -> String {
+        let s = self.status();
+        let rows: [(&str, &str, u64); 11] = [
+            ("precog_batches", "gauge", s.batches),
+            ("precog_events", "gauge", s.events),
+            ("precog_bytes", "gauge", s.bytes),
+            ("precog_wal_bytes", "gauge", s.wal_bytes),
+            ("precog_fsyncs_total", "counter", s.fsyncs),
+            ("precog_segments", "gauge", s.segments),
+            (
+                "precog_recovery_scanned_bytes",
+                "gauge",
+                s.recovery_scanned_bytes,
+            ),
+            ("precog_dedup_dropped_total", "counter", s.dedup_dropped),
+            ("precog_dedup_entries", "gauge", s.dedup_entries),
+            ("precog_dedup_window_seconds", "gauge", s.dedup_window_s),
+            ("precog_fatal", "gauge", self.is_fatal() as u64),
+        ];
+        let mut out = String::new();
+        for (name, kind, v) in rows {
+            out.push_str(&format!("# TYPE {name} {kind}\n{name} {v}\n"));
+        }
+        out
+    }
+
+    async fn serve_http(self: Arc<Self>, mut s: tokio::net::TcpStream) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 8192];
+        let mut n = 0;
+        while !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+            anyhow::ensure!(n < buf.len(), "request too large");
+            let k = s.read(&mut buf[n..]).await?;
+            anyhow::ensure!(k > 0, "closed");
+            n += k;
+        }
+        let path = std::str::from_utf8(&buf[..n])?
+            .split(' ')
+            .nth(1)
+            .unwrap_or("");
+        let (code, body) = match path {
+            "/metrics" => ("200 OK", self.metrics()),
+            "/health" if self.is_fatal() => ("503 Service Unavailable", "storage fenced\n".into()),
+            "/health" => ("200 OK", "ok\n".into()),
+            _ => ("404 Not Found", String::new()),
+        };
+        let head = format!(
+            "HTTP/1.1 {code}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        s.write_all(head.as_bytes()).await?;
+        s.write_all(body.as_bytes()).await?;
+        Ok(())
+    }
+
     pub async fn spawn_listeners(self: &Arc<Self>) -> Result<()> {
+        if let Some(addr) = self.cfg.listen_metrics {
+            let l = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind metrics {addr}"))?;
+            let node = self.clone();
+            tokio::spawn(async move {
+                while let Ok((s, _)) = l.accept().await {
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = node.serve_http(s).await {
+                            tracing::debug!("metrics request: {e}");
+                        }
+                    });
+                }
+            });
+        }
         if let Some(addr) = self.cfg.listen_tcp {
             let l = tokio::net::TcpListener::bind(addr)
                 .await
