@@ -94,3 +94,31 @@ async fn metrics_report_each_groups_lag_behind_its_stream() {
     assert!(m.lines().any(|l| l == lag), "missing {lag:?} in\n{m}");
     assert!(m.contains(r#"precog_group_commit_age_seconds{group="raw-archiver-trades-x",stream="raw.trades.x"} "#), "{m}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_split_across_tcp_writes_is_read_whole() {
+    // a probe's request can arrive in pieces: the path is read only once the headers end
+    let d = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut c = NodeConfig::single(0, "a", d.path().to_path_buf(), "tok".into());
+    c.segment_size = 1 << 20;
+    c.listen_metrics = Some(format!("127.0.0.1:{port}").parse().unwrap());
+    let node = Node::open(c).await.unwrap();
+    node.spawn_listeners().await.unwrap();
+    let mut s = tokio::net::TcpStream::connect(node.cfg.listen_metrics.unwrap())
+        .await
+        .unwrap();
+    s.set_nodelay(true).unwrap();
+    s.write_all(b"GET /hea").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    s.write_all(b"lth HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+}
