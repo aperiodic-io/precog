@@ -2,7 +2,8 @@
 //!
 //! One OS thread owns the segment log. Every append queued while the previous group's
 //! `fdatasync` runs joins the next group, so syncs per second are bounded by the disk, not
-//! by the request rate. Retention runs on the same thread between groups. A storage fault
+//! by the request rate. With write caching (`Config::flush_delay_ms`) a group is acknowledged
+//! once written, and the thread runs the deferred fsync when it falls due, idle or not. Retention runs on the same thread between groups. A storage fault
 //! (`precog_storage::Error::Fatal`) sets `fatal`: every later append fails, and the node
 //! must restart and recover.
 
@@ -140,10 +141,29 @@ fn writer(
     loop {
         let first = match pending.take() {
             Some(r) => r,
-            None => match rx.recv() {
-                Ok(r) => r,
-                Err(_) => return,
-            },
+            None => {
+                let next = match log.flush_due() {
+                    None => rx.recv().map_err(|_| true),
+                    Some(due) => rx
+                        .recv_timeout(due.saturating_duration_since(std::time::Instant::now()))
+                        .map_err(|e| e == std::sync::mpsc::RecvTimeoutError::Disconnected),
+                };
+                match next {
+                    Ok(r) => r,
+                    Err(true) => {
+                        let _ = log.flush();
+                        return;
+                    }
+                    Err(false) => {
+                        if let Err(e) = log.flush() {
+                            tracing::error!("storage flush failed: {e}");
+                        }
+                        fatal.store(log.is_fenced(), Ordering::Release);
+                        stats.syncs.store(log.stats().syncs, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+            }
         };
         match first {
             Req::Retain {

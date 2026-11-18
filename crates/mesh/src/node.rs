@@ -63,6 +63,14 @@ pub struct NodeConfig {
     /// How often retention runs.
     #[serde(default = "retention_interval_ms")]
     pub retention_interval_ms: u64,
+    /// Write caching, as live-ingestion's Redpanda runs it (`write_caching_default`): 0 fsyncs
+    /// every group commit before acknowledging; otherwise a batch is acknowledged once written
+    /// (on `target_copies` nodes, durability then rests on the replicas) and the fsync follows
+    /// within this many ms, or once `flush_bytes` are unsynced.
+    #[serde(default)]
+    pub flush_delay_ms: u64,
+    #[serde(default = "flush_bytes")]
+    pub flush_bytes: u64,
     /// Recent batches kept in memory for subscribers.
     #[serde(default = "tail_cache_bytes")]
     pub tail_cache_bytes: usize,
@@ -105,6 +113,8 @@ impl NodeConfig {
             streams: HashMap::new(),
             dedup_max_entries: dedup_max_entries(),
             tail_cache_bytes: tail_cache_bytes(),
+            flush_delay_ms: 0,
+            flush_bytes: flush_bytes(),
             storage_failpoints: Default::default(),
         }
     }
@@ -128,9 +138,15 @@ impl NodeConfig {
         let mut c = precog_storage::Config::new(self.data_dir.join("log"));
         c.segment_size = self.segment_size;
         c.tail_cache_bytes = self.tail_cache_bytes;
+        c.flush_delay_ms = self.flush_delay_ms;
+        c.flush_bytes = self.flush_bytes;
         c.failpoints = self.storage_failpoints.clone();
         c
     }
+}
+
+fn flush_bytes() -> u64 {
+    256 << 10 // Redpanda's raft_replica_max_pending_flush_bytes
 }
 
 fn segment_size() -> u64 {

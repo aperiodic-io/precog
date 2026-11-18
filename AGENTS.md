@@ -46,6 +46,11 @@ Each invariant has tests that fail if it breaks. Keep them failing for the right
   storage group commit returns only after `fdatasync` succeeds. An fsync error is fatal: the log
   refuses all further writes (`Error::Fatal`), and the node must restart and recover. Never retry
   an fsync and then ack.
+  The one exception is opt-in write caching (`flush_delay_ms > 0`, Redpanda's
+  `write_caching_default` as live-ingestion runs it). A batch is acknowledged once written on
+  `target_copies` nodes, durability rests on the replicas until the deferred fsync (within the
+  delay, before a segment is sealed), and a failed deferred fsync is just as fatal. The default
+  (`0`) keeps the rule above.
 - **Records are self-validating.** Every record carries magic, length, CRC-32C, the segment
   generation and the start offset of its group. Recovery truncates only a torn final group and
   fails closed on damage that is followed by a later group.

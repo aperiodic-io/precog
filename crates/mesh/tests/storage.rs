@@ -224,3 +224,32 @@ fn one_cluster_config_serves_every_statefulset_member() {
     assert_eq!(precog_mesh::node::ordinal("precog-12").unwrap(), 12);
     assert!(precog_mesh::node::ordinal("precog").is_err());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_caching_acks_before_the_fsync_and_flushes_an_idle_node_within_the_delay() {
+    // Why: live-ingestion's Redpanda runs write caching (ack after replication, fsync on a 100 ms /
+    // 256 KiB cadence); Precog configured the same way must ack without an fsync per batch, and
+    // still sync a quiet node's last batches within the delay, not only when more arrive.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    c.segment_size = 1 << 20;
+    c.flush_delay_ms = 100;
+    c.flush_bytes = 1 << 20;
+    let node = Node::open(c).await.unwrap();
+    let t = std::time::Instant::now();
+    append_n(&node, "w", 50, 100).await;
+    assert_eq!(
+        node.status().fsyncs,
+        0,
+        "50 batches acknowledged without an fsync"
+    );
+    let deadline = t + std::time::Duration::from_secs(2);
+    while node.status().fsyncs == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "an idle node never flushed"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(t.elapsed() >= std::time::Duration::from_millis(100));
+}
