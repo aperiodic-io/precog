@@ -411,3 +411,66 @@ async fn an_append_is_acknowledged_only_once_the_accepting_node_holds_it() {
         "acknowledged without the accepting node's copy: {ack:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cursor_read_over_rpc_answers_in_frames_that_fit() {
+    // a reader asking for "everything" over a backlog larger than a frame gets it in steps:
+    // one oversized answer would be refused by its own transport, and the reader would stall
+    let mut c = cluster(1, &["a"]);
+    c.cfgs[0].segment_size = 64 << 20;
+    let _node = start(&c, 0).await;
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let big = vec![7u8; 1 << 20];
+    for seq in 0..20 {
+        let b = Batch::encode(&log, seq, &[(seq, &big[..])]).unwrap();
+        mc.append(0, &b, 1).await.unwrap();
+    }
+    let ControlResp::Cursor {
+        cursor: Some(start),
+    } = mc
+        .control(
+            0,
+            &Control::CursorAt {
+                stream: "s".into(),
+                time_ms: 0,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("no cursor")
+    };
+    assert_eq!(start, [("w".to_string(), 1, 0)], "the stream's start");
+    let read = Control::ReadCursor {
+        stream: "s".into(),
+        cursor: start,
+        max_bytes: u32::MAX,
+    };
+    let f = mc
+        .call(
+            0,
+            Kind::Control,
+            Bytes::from(serde_json::to_vec(&read).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.kind, Kind::Batches);
+    let mut body = &f.body[..];
+    let mut n = 0;
+    while !body.is_empty() {
+        let len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+        body = &body[4 + len..];
+        n += 1;
+    }
+    assert!((1..20).contains(&n), "{n} of 20 batches in one answer");
+    assert!(
+        f.body.len() <= MAX_FRAME_BYTES / 2 + (1 << 21),
+        "{}",
+        f.body.len()
+    );
+}
