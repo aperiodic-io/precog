@@ -434,12 +434,20 @@ async fn retention_ran(_w: &mut Mesh, _i: usize) {
 
 #[when(regex = r"^repair has run on every node$")]
 async fn repair(w: &mut Mesh) {
+    // A peer that was just restarted stays marked down for its backoff, and a repair meanwhile
+    // reports it: repair has run once it completes without errors, which must happen within the
+    // deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     for i in 0..w.n {
-        match w.client().control(i, &Control::Repair).await.unwrap() {
-            ControlResp::Repair { errors, .. } => {
-                assert!(errors.is_empty(), "node {i}: {errors:?}")
+        loop {
+            match w.client().control(i, &Control::Repair).await.unwrap() {
+                ControlResp::Repair { errors, .. } if errors.is_empty() => break,
+                ControlResp::Repair { errors, .. } => {
+                    assert!(std::time::Instant::now() < deadline, "node {i}: {errors:?}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                r => panic!("{r:?}"),
             }
-            r => panic!("{r:?}"),
         }
     }
 }
