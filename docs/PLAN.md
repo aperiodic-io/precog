@@ -146,7 +146,7 @@ this is done. Precog must be at least **3× Redpanda** on all three measures in 
 | Producers | `live-producers`, Go (franz-go) | 35 Deployments, 2 replicas each | produce `raw.<datatype>.<exchange>` keyed by symbol, `acks=all`, idempotence off, zstd, `redpanda-dedup-key` header per event; compacted state topics |
 | Raw archivers | `archiver`, Rust | 44 | consumer group per topic, commit only after the Parquet upload; a new group starts at `now - 2h` (`rpk group seek` init container) |
 | Metric pipelines | `brrrrr` (via `fastka`), Rust | 21 | read every partition of their raw topics; positions in brrrrr's own checkpoints (keyed `(topic, partition) → offset`); sorts each source by event time with a 50 ms hold (ADR-0013), so per-writer order is enough |
-| derived-seed | `live-ingestion/cmd/derived_seed`, Go | 4 | reads raw topics |
+| Collectors (web-ranking, compute) | `live-producers` `rust/crates/lp-collector-app`, Rust (fastka) | 5 | publish raw records with dedup ids; keep per-source state in compacted topics (`StateStore`) |
 | Offset seeding | `rpk` image | 46 init containers | `rpk group seek --to now-2h` |
 | Topic management | `topicsync` (kadm) | Job + hourly CronJob | declares topics: partitions, RF 3, `retention.bytes`, `retention.ms`, `cleanup.policy` (`delete`, `compact` for state topics), `segment.bytes`, dedup window and header; never deletes |
 | Lag monitoring | kafka-exporter + vmalert rules | | per-group lag, "every raw topic has a live consumer" |
@@ -161,15 +161,16 @@ this is done. Precog must be at least **3× Redpanda** on all three measures in 
 | R3 | Named consumer positions (groups), stored and replicated by the mesh, committed by the reader after its upload | An archiver restarted on another node resumes at its commit; a new group starts at `now - 2h` |
 | R4 | Dedup by an event-key header within a window (§7.4) | Same drop rate as the fork on its own loadgen; bounded memory; no full-log replay on restart |
 | R5 | Compacted streams (latest record per key) for the producers' state topics | A reader of a compacted stream sees the newest value of every key after restart and retention |
-| R6 | Clients: Go (live-producers, derived-seed) and Rust (archiver, brrrrr source like its `iggy.rs`) | Each repo's tests pass against a local Precog; dual-write shadow on staging |
+| R6 | Clients: Go (live-producers) and Rust (archiver, brrrrr source like its `iggy.rs`, the collectors' sink and state store) | Each repo's tests pass against a local Precog; dual-write shadow on staging |
 | R7 | Operations: StatefulSet and chart, Prometheus metrics (append, fsync, repair, dedup, per-group lag), a declarative stream config applied like topicsync (never deletes), replacing the kafka-exporter rules | Staging runs on Precog for 7 days with the alerts green |
 | R8 | Cutover: producers dual-write, readers switch one by one, Redpanda raw cluster retired | Archive parity (row counts per hour) between the two paths for 72 h |
 
 Status (2026-11-18): R1 (PR #4), R2 + R3 (PR #6), R4 (PRs #3, #10), R5 (PR #5), the Rust SDK (PR #8),
 operations without the per-group lag metric (PR #7) and the live-ingestion stream config
-(aperiodic-io/live-ingestion#1383) are built. Left before the cutover: the Go client and its
-live-producers backend, the archiver's and brrrrr's Precog sources, per-group lag metrics and the
-alert rules, then R8 on staging.
+(aperiodic-io/live-ingestion#1383) are built. Built since: per-group lag metrics (PR #11), the Go client (PR #12) and live-producers' precog sink
+(aperiodic-io/live-producers#196). Left before the cutover: the archiver's and brrrrr's Precog
+sources, the collectors' sink and state store, the alert rules, then R8 on staging. (derived-seed
+reads the metric clusters, not the raw one: no change.)
 
 ### 7.3 The 3× target
 
