@@ -7,6 +7,7 @@
 use precog_lab::dedup::{
     Dedup, Generations, GenerationsPrefetch, MapFifo, Nothing, Packed, Stamped, StampedPrefetch,
 };
+use precog_lab::dedup::SwissGenerations;
 use std::time::Instant;
 
 fn main() {
@@ -25,6 +26,8 @@ fn main() {
         let make: Vec<Box<dyn Fn() -> Box<dyn Dedup>>> = vec![
             Box::new(move || Box::new(Nothing)),
             Box::new(move || Box::new(Packed::new(window))),
+            Box::new(move || Box::new(SwissGenerations::new(2, window))),
+            Box::new(move || Box::new(SwissGenerations::new(3, window))),
             Box::new(move || Box::new(Generations::new(2, window))),
             Box::new(move || Box::new(Generations::new(4, window))),
             Box::new(move || Box::new(Generations::new(8, window))),
@@ -32,6 +35,8 @@ fn main() {
             Box::new(move || Box::new(MapFifo::new(window))),
             Box::new(move || Box::new(StampedPrefetch(Stamped::new(window)))),
             Box::new(move || Box::new(GenerationsPrefetch(Generations::new(2, window)))),
+            Box::new(move || Box::new(GenerationsPrefetch(Generations::new(3, window)))),
+            Box::new(move || Box::new(GenerationsPrefetch(Generations::new(4, window)))),
         ];
         for m in make {
             let mut d = m();

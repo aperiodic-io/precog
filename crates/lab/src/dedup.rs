@@ -33,35 +33,40 @@ struct Table {
 impl Table {
     fn new(cap: usize, start_s: u32) -> Table {
         Table {
-            slots: vec![0; cap.next_power_of_two().max(1024)],
+            slots: vec![0; cap.max(1024)],
             len: 0,
             start_s,
         }
     }
+    /// Any capacity: multiply-shift instead of a power-of-two mask.
+    fn home(&self, h: u64) -> usize {
+        ((h as u128 * self.slots.len() as u128) >> 64) as usize
+    }
+    fn next(&self, i: usize) -> usize {
+        if i + 1 == self.slots.len() { 0 } else { i + 1 }
+    }
     fn contains(&self, h: u64) -> bool {
-        let m = self.slots.len() - 1;
-        let mut i = h as usize & m;
+        let mut i = self.home(h);
         loop {
             match self.slots[i] {
                 0 => return false,
                 x if x == h => return true,
-                _ => i = (i + 1) & m,
+                _ => i = self.next(i),
             }
         }
     }
     fn insert(&mut self, h: u64) {
         if (self.len + 1) * 8 > self.slots.len() * 7 {
-            let cap = self.slots.len() * 2;
+            let cap = self.slots.len() + self.slots.len() / 2;
             let old = std::mem::replace(&mut self.slots, vec![0; cap]);
             self.len = 0;
             for x in old.into_iter().filter(|&x| x != 0) {
                 self.insert(x);
             }
         }
-        let m = self.slots.len() - 1;
-        let mut i = h as usize & m;
+        let mut i = self.home(h);
         while self.slots[i] != 0 {
-            i = (i + 1) & m;
+            i = self.next(i);
         }
         self.slots[i] = h;
         self.len += 1;
@@ -101,7 +106,8 @@ impl Dedup for Generations {
             .is_none_or(|t| now_s >= t.start_s + self.span_s)
         {
             // size the new table like the last full one, so it rarely grows
-            self.sized = self.tables.back().map_or(self.sized, |t| t.len * 8 / 7 + 1);
+            // a new generation sized for the last one's count at 7/8 load, plus 10%
+            self.sized = self.tables.back().map_or(self.sized, |t| t.len * 8 / 7 * 11 / 10 + 1);
             self.tables.push_back(Table::new(self.sized, now_s));
             // by count, and by age after an idle gap
             while self.tables.len() > self.k
@@ -259,9 +265,8 @@ impl Dedup for GenerationsPrefetch {
     }
     fn seen_batch(&mut self, hs: &[u64], now_s: u32, out: &mut Vec<bool>) {
         for t in &self.0.tables {
-            let m = t.slots.len() - 1;
             for &h in hs {
-                prefetch(&t.slots[nz(h) as usize & m]);
+                prefetch(&t.slots[t.home(nz(h))]);
             }
         }
         out.clear();
@@ -389,6 +394,63 @@ impl Dedup for Packed {
     }
 }
 
+/// The digest is already xxh3: hash it no further.
+#[derive(Clone, Copy, Default)]
+pub struct Pass(u64);
+
+impl std::hash::Hasher for Pass {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys")
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+type Set = hashbrown::HashSet<u64, std::hash::BuildHasherDefault<Pass>>;
+
+/// H: generations of SwissTables (hashbrown): 16 tags compared per SIMD probe, so a new id is
+/// rejected fast even at 7/8 load; 9 bytes a slot.
+pub struct SwissGenerations {
+    k: usize,
+    span_s: u32,
+    sets: VecDeque<(u32, Set)>,
+    sized: usize,
+}
+
+impl SwissGenerations {
+    pub fn new(k: usize, window_s: u32) -> SwissGenerations {
+        assert!(k >= 2);
+        SwissGenerations { k, span_s: window_s.div_ceil(k as u32 - 1), sets: VecDeque::new(), sized: 1024 }
+    }
+}
+
+impl Dedup for SwissGenerations {
+    fn name(&self) -> String {
+        format!("H swiss generations k={}", self.k)
+    }
+    fn seen(&mut self, h: u64, now_s: u32) -> bool {
+        if self.sets.back().is_none_or(|(t, _)| now_s >= t + self.span_s) {
+            self.sized = self.sets.back().map_or(self.sized, |(_, s)| s.len() * 11 / 10 + 1);
+            self.sets.push_back((now_s, Set::with_capacity_and_hasher(self.sized, Default::default())));
+            while self.sets.len() > self.k || self.sets.front().is_some_and(|(t, _)| now_s >= t + self.span_s * self.k as u32) {
+                self.sets.pop_front();
+            }
+        }
+        if self.sets.iter().rev().any(|(_, s)| s.contains(&h)) {
+            return true;
+        }
+        self.sets.back_mut().unwrap().1.insert(h);
+        false
+    }
+    fn bytes(&self) -> usize {
+        self.sets.iter().map(|(_, s)| s.allocation_size()).sum()
+    }
+}
+
 /// C: the obvious one, a hash map with a FIFO of insertions for expiry.
 pub struct MapFifo {
     window_s: u32,
@@ -445,6 +507,8 @@ mod tests {
             Box::new(StampedPrefetch(Stamped::new(w))),
             Box::new(GenerationsPrefetch(Generations::new(2, w))),
             Box::new(Packed::new(w)),
+            Box::new(SwissGenerations::new(2, w)),
+            Box::new(SwissGenerations::new(3, w)),
         ]
     }
 
