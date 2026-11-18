@@ -106,3 +106,51 @@ async fn the_index_is_rebuilt_from_the_log_after_a_restart() {
     assert_eq!(payloads(&node), ["a:t1", "a:t2", "b:t9"]);
     assert!(node.status().dedup_dropped >= 1, "{:?}", node.status());
 }
+
+#[test]
+fn an_omitted_dedup_config_takes_live_ingestion_s_five_minutes() {
+    // the raw topics' replicas resend within minutes: a shorter default window would let
+    // a second replica's copies through
+    let c: NodeConfig = serde_json::from_str(
+        r#"{"id":0,"domain":"a","data_dir":"/d","token":"t","listen_tcp":null,"peers":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(c.dedup_window_ms, Some(300_000));
+    assert_eq!(c.dedup_max_entries, 8_000_000);
+    let s = NodeConfig::single(0, "a", "/d".into(), "t".into());
+    assert_eq!(
+        (s.dedup_window_ms, s.dedup_max_entries),
+        (Some(300_000), 8_000_000)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_rebuilds_only_the_last_window_of_the_log() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    c.dedup_window_ms = Some(1_000);
+    {
+        let node = Node::open(c.clone()).await.unwrap();
+        append(&node, &keyed("a", 0, &["t1"])).await;
+    }
+    // appended more than the window ago: the rebuilt index must not hold it, or a restart
+    // would drop events the running node would have kept
+    tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
+    let node = Node::open(c).await.unwrap();
+    append(&node, &keyed("b", 0, &["t1"])).await;
+    assert_eq!(payloads(&node), ["a:t1", "b:t1"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_the_fenced_log_refuses_is_unknown_so_the_client_retries_it() {
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    c.storage_failpoints.fail_data_sync_after = Some(1);
+    let node = Node::open(c).await.unwrap();
+    append(&node, &keyed("a", 0, &["t1"])).await;
+    assert!(!node.append(1, keyed("a", 1, &["t2"])).await.is_success());
+    assert!(node.is_fatal());
+    // not Rejected ("no side effect, drop it"): the client must send it again elsewhere
+    let ack = node.append(1, keyed("b", 0, &["t3"])).await;
+    assert_eq!(ack.status, AckStatus::Unknown, "{ack:?}");
+}
