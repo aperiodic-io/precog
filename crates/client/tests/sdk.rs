@@ -161,6 +161,47 @@ async fn a_committed_position_resumes_on_another_node_losing_and_repeating_nothi
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_commits_the_cursor_it_kept_not_how_far_its_reader_got() {
+    // The archiver reads ahead of its uploads: it may commit only what is durable in the object
+    // store, so it keeps that cursor itself and commits it, while its consumer is further on.
+    let c = cluster(&[0, 1, 2]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    let mut p = client.producer("raw.trades.x", "producer-a");
+    for i in 0..20u64 {
+        p.send(i, format!("id{i}").as_bytes(), format!("t{i}").as_bytes());
+    }
+    p.sync().await.unwrap();
+    let mut r = client
+        .consumer("raw.trades.x", "archiver", Start::Beginning)
+        .await
+        .unwrap();
+    let read = r.poll(1 << 20).await.unwrap();
+    assert_eq!(read.len(), 20);
+    let mut uploaded = precog_client::Cursor::new();
+    let log = r.cursor().keys().next().unwrap().clone();
+    uploaded.insert(log.clone(), 10); // t0..t9 are durable; t10.. only read
+    client
+        .commit("archiver", "raw.trades.x", &uploaded)
+        .await
+        .unwrap();
+    let mut resumed = client
+        .consumer(
+            "raw.trades.x",
+            "archiver",
+            Start::Committed {
+                or: Box::new(Start::End),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.cursor().get(&log), Some(&10));
+    assert_eq!(
+        names(&resumed.poll(1 << 20).await.unwrap()),
+        (10..20).map(|i| format!("t{i}")).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_group_can_start_at_a_time_and_compacted_state_is_served() {
     let c = cluster(&[0, 1, 2]).await;
     let client = Client::connect(&c.addrs, "tok").unwrap();
