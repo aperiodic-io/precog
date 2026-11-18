@@ -650,17 +650,20 @@ impl Log {
         let mut counter = 0u64;
         for e in std::fs::read_dir(&dir)?.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
+            // a closing log's paced preallocator may still rename or remove its own spare while
+            // this lists them (a quick restart in one process)
             if name.starts_with("spare-tmp-") {
-                std::fs::remove_file(e.path())?;
+                let _ = std::fs::remove_file(e.path()); // best effort: gone is as good
             } else if let Some(n) = name
                 .strip_prefix("spare-")
                 .and_then(|s| s.strip_suffix(".log"))
             {
                 counter = counter.max(n.trim_start_matches('r').parse::<u64>().unwrap_or(0) + 1);
-                if e.metadata()?.len() == cfg.segment_size {
-                    pool.push(e.path());
-                } else {
-                    std::fs::remove_file(e.path())?;
+                match std::fs::metadata(e.path()) {
+                    Ok(m) if m.len() == cfg.segment_size => pool.push(e.path()),
+                    Ok(_) => std::fs::remove_file(e.path())?,
+                    Err(x) if x.kind() == std::io::ErrorKind::NotFound => {} // gone since listed
+                    Err(x) => return Err(x.into()),
                 }
             }
         }

@@ -1443,3 +1443,23 @@ fn spares_are_filled_at_a_paced_rate_in_the_background() {
     }
     assert_eq!(spares(), 1, "ready within a few seconds");
 }
+
+#[test]
+fn a_spare_gone_since_the_directory_was_listed_is_skipped_but_other_errors_stop_the_open() {
+    // A closing log's paced preallocator can rename or remove a spare while the next open lists
+    // the directory (a quick restart in one process). A dangling link stands in for a spare
+    // listed and then gone; a link loop for a spare that cannot be examined at all.
+    let d = tempfile::tempdir().unwrap();
+    drop(Log::open(cfg(d.path(), 1 << 20)).unwrap());
+    let link = d.path().join("spare-00000099.log");
+    std::os::unix::fs::symlink(d.path().join("gone"), &link).unwrap();
+    let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+    log.append(&[(meta(0), &b"x"[..])]).unwrap();
+    drop(log);
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&link, &link).unwrap();
+    assert!(
+        Log::open(cfg(d.path(), 1 << 20)).is_err(),
+        "not a vanished spare"
+    );
+}
