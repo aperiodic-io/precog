@@ -37,10 +37,10 @@ async fn append_n(node: &Arc<Node>, writer: &str, n: u64, size: usize) -> Vec<By
 async fn batches_are_served_from_disk_after_restart() {
     let d = tempfile::tempdir().unwrap();
     let written = {
-        let (node, _) = Node::open(config(d.path())).await.unwrap();
+        let node = Node::open(config(d.path())).await.unwrap();
         append_n(&node, "w", 120, 1500).await
     };
-    let (node, _) = Node::open(config(d.path())).await.unwrap();
+    let node = Node::open(config(d.path())).await.unwrap();
     assert_eq!(node.store.totals().0, 120);
     for (seq, bytes) in written.iter().enumerate() {
         let id = BatchId {
@@ -68,7 +68,7 @@ async fn retention_trims_the_log_and_the_metadata() {
     let d = tempfile::tempdir().unwrap();
     let mut c = config(d.path());
     c.retention_bytes = Some(3 * 64 * 1024);
-    let (node, _) = Node::open(c).await.unwrap();
+    let node = Node::open(c).await.unwrap();
     append_n(&node, "w", 400, 1000).await;
     node.apply_retention().await.unwrap();
     let (batches, _, _) = node.store.totals();
@@ -95,14 +95,14 @@ async fn age_retention_drops_sealed_segments_older_than_the_limit() {
     let d = tempfile::tempdir().unwrap();
     let mut c = config(d.path());
     c.retention_ms = Some(60_000);
-    let (node, _) = Node::open(c.clone()).await.unwrap();
+    let node = Node::open(c.clone()).await.unwrap();
     append_n(&node, "w", 200, 1000).await;
     node.apply_retention().await.unwrap();
     assert_eq!(node.store.totals().0, 200, "nothing is a minute old yet");
     drop(node);
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     c.retention_ms = Some(10);
-    let (node, _) = Node::open(c).await.unwrap();
+    let node = Node::open(c).await.unwrap();
     node.apply_retention().await.unwrap();
     let kept = node.store.totals().0;
     assert!(
@@ -115,7 +115,7 @@ async fn age_retention_drops_sealed_segments_older_than_the_limit() {
 fn omitted_config_fields_take_production_defaults() {
     let c: NodeConfig = serde_json::from_str(
         r#"{"id":0,"domain":"a","data_dir":"/d","token":"t","listen_tcp":null,
-            "listen_iroh":null,"peers":[]}"#,
+            "peers":[]}"#,
     )
     .unwrap();
     assert_eq!(c.segment_size, 1 << 30);
@@ -129,7 +129,7 @@ async fn a_storage_fault_fences_the_node() {
     let d = tempfile::tempdir().unwrap();
     let mut c = config(d.path());
     c.storage_failpoints.fail_data_sync_after = Some(5);
-    let (node, _) = Node::open(c).await.unwrap();
+    let node = Node::open(c).await.unwrap();
     append_n(&node, "w", 5, 100).await;
     assert!(!node.is_fatal());
     let ack = node.append(1, batch("w", 5, 100)).await;
@@ -143,10 +143,10 @@ async fn a_storage_fault_fences_the_node() {
 async fn status_reports_recovery_and_segments() {
     let d = tempfile::tempdir().unwrap();
     {
-        let (node, _) = Node::open(config(d.path())).await.unwrap();
+        let node = Node::open(config(d.path())).await.unwrap();
         append_n(&node, "w", 120, 1500).await;
     }
-    let (node, _) = Node::open(config(d.path())).await.unwrap();
+    let node = Node::open(config(d.path())).await.unwrap();
     let s = node.status();
     assert_eq!(s.batches, 120);
     assert!(s.segments >= 3, "{s:?}");

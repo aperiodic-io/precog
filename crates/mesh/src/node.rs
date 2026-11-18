@@ -10,7 +10,7 @@
 use crate::proto::*;
 use crate::rpc::{BoxRead, BoxWrite, RpcClient, read_frame, write_loop};
 use crate::store::{Reserve, State, Store};
-use crate::transport::{Addr, Dialer, iroh_endpoint, load_or_create_secret};
+use crate::transport::Addr;
 use crate::wal::Wal;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -38,9 +38,6 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     pub token: String,
     pub listen_tcp: Option<SocketAddr>,
-    pub listen_iroh: Option<SocketAddr>,
-    #[serde(default)]
-    pub iroh_relay: bool,
     pub peers: Vec<PeerConfig>,
     /// Copies the node tries to create for every append (including its own).
     #[serde(default = "three")]
@@ -78,8 +75,6 @@ impl NodeConfig {
             data_dir,
             token,
             listen_tcp: None,
-            listen_iroh: None,
-            iroh_relay: false,
             peers: vec![],
             target_copies: three(),
             rpc_timeout_ms: rpc_ms(),
@@ -133,10 +128,7 @@ pub struct Node {
     pub cfg: NodeConfig,
     pub store: Store,
     wal: Wal,
-    dialer: Dialer,
     peers: Vec<Arc<Peer>>,
-    /// Peer ids keyed by pinned Iroh endpoint id.
-    iroh_peers: HashMap<iroh::EndpointId, u32>,
     repair_cursor: parking_lot::Mutex<HashMap<u32, u64>>,
     repair_lock: tokio::sync::Mutex<()>,
     inflight: Semaphore,
@@ -155,7 +147,7 @@ enum Ident {
 }
 
 impl Node {
-    pub async fn open(cfg: NodeConfig) -> Result<(Arc<Node>, Option<iroh::Endpoint>)> {
+    pub async fn open(cfg: NodeConfig) -> Result<Arc<Node>> {
         anyhow::ensure!(cfg.id < 32, "node id must be < 32");
         anyhow::ensure!(cfg.peers.len() <= 31, "too many peers");
         std::fs::create_dir_all(&cfg.data_dir)?;
@@ -163,23 +155,10 @@ impl Node {
         let n = entries.len();
         let store = Store::load(wal.reader.clone(), entries)?;
         tracing::info!(node = cfg.id, batches = n, "recovered log");
-        let endpoint = match cfg.listen_iroh {
-            Some(bind) => {
-                let sk = load_or_create_secret(&cfg.data_dir.join("iroh.secret"))?;
-                let ep = iroh_endpoint(Some(sk), Some(bind), cfg.iroh_relay).await?;
-                tracing::info!(node = cfg.id, iroh_id = %ep.id(), "iroh endpoint bound on {bind}");
-                Some(ep)
-            }
-            None => None,
-        };
         let mut peers = Vec::new();
-        let mut iroh_peers = HashMap::new();
         for p in &cfg.peers {
             anyhow::ensure!(p.id != cfg.id && p.id < 32, "bad peer id {}", p.id);
             let addr: Addr = p.addr.parse()?;
-            if let Addr::Iroh { id, .. } = &addr {
-                iroh_peers.insert(*id, p.id);
-            }
             peers.push(Arc::new(Peer {
                 cfg: p.clone(),
                 addr,
@@ -192,22 +171,18 @@ impl Node {
             cfg,
             store,
             wal,
-            dialer: Dialer {
-                iroh: endpoint.clone(),
-            },
             peers,
-            iroh_peers,
             repair_cursor: Default::default(),
             repair_lock: Default::default(),
             inflight: Semaphore::new(16_384),
         });
-        Ok((node, endpoint))
+        Ok(node)
     }
 
     /// Opens the node and serves until the process is stopped.
     pub async fn run(cfg: NodeConfig) -> Result<()> {
-        let (node, endpoint) = Node::open(cfg).await?;
-        node.spawn_listeners(endpoint).await?;
+        let node = Node::open(cfg).await?;
+        node.spawn_listeners().await?;
         let n = node.clone();
         tokio::spawn(async move {
             let every = Duration::from_millis(n.cfg.repair_interval_ms.max(50));
@@ -275,7 +250,7 @@ impl Node {
         Ok(())
     }
 
-    pub async fn spawn_listeners(self: &Arc<Self>, endpoint: Option<iroh::Endpoint>) -> Result<()> {
+    pub async fn spawn_listeners(self: &Arc<Self>) -> Result<()> {
         if let Some(addr) = self.cfg.listen_tcp {
             let l = tokio::net::TcpListener::bind(addr)
                 .await
@@ -290,43 +265,14 @@ impl Node {
                     let _ = s.set_nodelay(true);
                     let (r, w) = s.into_split();
                     let node = node.clone();
-                    tokio::spawn(
-                        async move { node.serve_conn(Box::new(r), Box::new(w), None).await },
-                    );
-                }
-            });
-        }
-        if let Some(ep) = endpoint {
-            let node = self.clone();
-            tokio::spawn(async move {
-                while let Some(incoming) = ep.accept().await {
-                    let node = node.clone();
-                    tokio::spawn(async move {
-                        let conn = match incoming.await {
-                            Ok(c) => c,
-                            Err(e) => return tracing::debug!("iroh incoming failed: {e}"),
-                        };
-                        let remote = conn.remote_id();
-                        while let Ok((send, recv)) = conn.accept_bi().await {
-                            let node = node.clone();
-                            tokio::spawn(async move {
-                                node.serve_conn(Box::new(recv), Box::new(send), Some(remote))
-                                    .await
-                            });
-                        }
-                    });
+                    tokio::spawn(async move { node.serve_conn(Box::new(r), Box::new(w)).await });
                 }
             });
         }
         Ok(())
     }
 
-    async fn serve_conn(
-        self: Arc<Self>,
-        mut r: BoxRead,
-        w: BoxWrite,
-        iroh_remote: Option<iroh::EndpointId>,
-    ) {
+    async fn serve_conn(self: Arc<Self>, mut r: BoxRead, w: BoxWrite) {
         let mut buf = BytesMut::new();
         let hello = match tokio::time::timeout(Duration::from_secs(5), read_frame(&mut r, &mut buf))
             .await
@@ -334,7 +280,7 @@ impl Node {
             Ok(Ok(Some(f))) if f.kind == Kind::Hello => f,
             _ => return,
         };
-        let ident = match self.authenticate(&hello.body, iroh_remote) {
+        let ident = match self.authenticate(&hello.body) {
             Ok(i) => i,
             Err(e) => {
                 tracing::warn!("rejected connection: {e}");
@@ -424,22 +370,15 @@ impl Node {
         }
     }
 
-    fn authenticate(&self, body: &[u8], iroh_remote: Option<iroh::EndpointId>) -> Result<Ident> {
+    fn authenticate(&self, body: &[u8]) -> Result<Ident> {
         let h: Hello = serde_json::from_slice(body)?;
         if !constant_time_eq(h.token.as_bytes(), self.cfg.token.as_bytes()) {
             bail!("bad token");
         }
-        match (h.node_id, iroh_remote) {
-            (None, _) => Ok(Ident::Client),
-            (Some(id), Some(remote)) => {
-                // Over Iroh the peer identity is proven by its endpoint key.
-                match self.iroh_peers.get(&remote) {
-                    Some(&pid) if pid == id => Ok(Ident::Peer(id)),
-                    _ => bail!("iroh endpoint {remote} is not configured as peer {id}"),
-                }
-            }
-            (Some(id), None) => {
-                // TCP test transport: a token holder may claim any peer id.
+        match h.node_id {
+            None => Ok(Ident::Client),
+            Some(id) => {
+                // A token holder may claim any configured peer id.
                 anyhow::ensure!(
                     self.peers.iter().any(|p| p.cfg.id == id),
                     "unknown peer {id}"
@@ -741,7 +680,7 @@ impl Node {
         }
         let timeout = Duration::from_millis(self.cfg.rpc_timeout_ms);
         let res: Result<Arc<RpcClient>> = async {
-            let c = self.dialer.connect(&p.addr, timeout).await?;
+            let c = crate::transport::connect(&p.addr, timeout).await?;
             let hello = Hello {
                 token: self.cfg.token.clone(),
                 node_id: Some(self.cfg.id),

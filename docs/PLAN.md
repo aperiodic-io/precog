@@ -23,7 +23,7 @@ This document is the plan of record. Evidence behind each decision:
 | | |
 |---|---|
 | Users | Producers we control (market data, telemetry, audit logs), many writers each with an independent sequence. Consumers that need per-source order, and optionally a global order. |
-| Interfaces | Rust client (`Writer`, `Subscription`) over TCP or Iroh QUIC. Other languages and a Kafka-compatible gateway come later and are optional. |
+| Interfaces | Rust client (`Writer`, `Subscription`) over TCP (QUIC/Iroh was removed: TCP measured 1.4–1.6x faster). Other languages and a Kafka-compatible gateway come later and are optional. |
 | Deployment | 3+ commodity nodes in distinct failure domains, local disks, no object store required. |
 
 ### Guarantees (contract)
@@ -59,7 +59,7 @@ This document is the plan of record. Evidence behind each decision:
 | Crate | Role |
 |---|---|
 | `precog-storage` | Node-local segment log: group commit, recycled preallocated segments, CRC-32C framing with generations, per-segment index files, manifest, recovery, retention, tail cache. No network, no async. |
-| `precog-mesh` | Node, replication, repair, RPC, TCP and Iroh transports, client (`Writer`, `Subscription`), CLI. |
+| `precog-mesh` | Node, replication, repair, RPC, TCP transport, client (`Writer`, `Subscription`), CLI. |
 | `precog-bench` | Same-harness benchmarks against Apache Iggy. |
 | `storage-bench` | 13-backend storage comparison (evidence for the storage design). |
 
@@ -70,13 +70,13 @@ milestone's acceptance scenarios plus its performance gates.
 
 | # | Milestone | Scope | Exit criteria | Status |
 |---|---|---|---|---|
-| M0 | Proof of concept | Mesh, WAL, replication, repair, subscriptions, Iroh; benchmarks against Iggy 0.10 | Durable-2 throughput ≥ 2× Iggy; failover stalls in ms instead of seconds; results reproducible | **done** |
+| M0 | Proof of concept | Mesh, WAL, replication, repair, subscriptions, Iroh (since removed); benchmarks against Iggy 0.10 | Durable-2 throughput ≥ 2× Iggy; failover stalls in ms instead of seconds; results reproducible | **done** |
 | M1 | Engineering foundation | AGENTS.md, CI on `ubuntu-latest`: fmt, clippy, tests + coverage gate, acceptance suite, mutation testing, instruction-count bench gate, wall-clock perf gate, nightly | CI required on `main`; gates fail on a deliberate regression | in progress |
 | M2 | Storage phases 0 + 1 | `precog-storage` replaces the in-memory WAL and store data (details in §5) | Acked data survives SIGKILL at any point; restart replays only the active segment; storage line coverage ≥ 90%; no throughput regression vs M0 | in progress |
 | M3 | Consumers | Resumable subscriptions keyed by per-writer frontiers, subscription failover between nodes, stored consumer positions, consumer groups that assign writer logs or keys | A subscriber killed or moved mid-stream loses and repeats nothing; group rebalance acceptance scenarios | planned |
 | M4 | Control plane | 3-node Raft (openraft) for membership, streams and topics, placement beyond 3 nodes, users and tokens; per-writer authorization | Add or remove a node without downtime; placement survives the loss of a control-plane node | planned |
 | M5 | Global order (optional) | Origin-node cuts (3 integers every T ms) committed through the control plane; lazy binding; ordered subscriptions with global offsets; optional ordered-ack | All readers see the same order; leader kill pauses ordered reads only; ordered e2e p99 ≤ 10 ms at T = 1–2 ms | planned |
-| M6 | Client and throughput | Several batches in flight per writer, client linger batching, vectored writes, Iroh multi-stream, sending to `copies-1` peers first | Per-producer throughput ≥ 3× M2 at the same durability | planned |
+| M6 | Client and throughput | Several batches in flight per writer, client linger batching, vectored writes, sending to `copies-1` peers first | Per-producer throughput ≥ 3× M2 at the same durability | planned |
 | M7 | Operations and hardening | Metrics, TLS, CLI, config, containers, versioned wire format, fault-injection and Jepsen-style checks, 72 h soak | Production readiness review | planned |
 | M8 | Storage phase 2 and cold tier | Optional O_DIRECT writer with its own cache, io_uring with a blocking fallback, erasure-coded (3+2) sealed history, compression per writer batch | ≥ 40% less disk for history at equal fault tolerance | planned |
 
@@ -131,7 +131,6 @@ O_APPEND by 1.08–1.33×; embedded databases reach 0.31–0.71× of that at 27 
 | Per-batch metadata in RAM grows with history | Bounded by retention; move the per-log index to disk (redb or index files) if it exceeds budget |
 | Shared WAL with mixed retention per stream | One retention policy per node in M2; per-stream segment groups if needed |
 | CI runner disk and CPU noise | Perf gate compares base and head on the same runner, alternating runs, best of 5, 15% band |
-| Iroh 30–40% slower than TCP | M6 multi-stream; TCP stays for trusted networks |
 
 ## 7. Replacing `redpanda-raw-internal` (live-ingestion)
 

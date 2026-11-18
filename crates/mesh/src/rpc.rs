@@ -1,5 +1,5 @@
-//! Multiplexed request/response over one ordered byte stream (a TCP socket or
-//! one Iroh QUIC bidirectional stream). Many requests can be in flight;
+//! Multiplexed request/response over one ordered byte stream (a TCP socket).
+//! Many requests can be in flight;
 //! responses are matched by `req_id`. The writer task coalesces queued frames
 //! into one write, so pipelined small requests cost few syscalls.
 
@@ -86,16 +86,10 @@ pub struct RpcClient {
     subs: Subs,
     next_id: AtomicU64,
     closed: Arc<AtomicBool>,
-    /// Keeps the underlying transport (e.g. an Iroh connection) alive.
-    _keep: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl RpcClient {
-    pub fn start(
-        r: BoxRead,
-        w: BoxWrite,
-        keep: Option<Box<dyn std::any::Any + Send + Sync>>,
-    ) -> RpcClient {
+    pub fn start(r: BoxRead, w: BoxWrite) -> RpcClient {
         let (tx, rx) = mpsc::channel::<Frame>(4096);
         let pending: Pending = Default::default();
         let subs: Subs = Default::default();
@@ -123,7 +117,7 @@ impl RpcClient {
                             let tx = subs.lock().get(&id).cloned();
                             if let Some(tx) = tx {
                                 // Backpressure: a slow subscriber stalls this
-                                // connection's reader, and TCP/QUIC flow
+                                // connection's reader, and TCP flow
                                 // control then stalls the server's push.
                                 if tx.send(f).await.is_err() {
                                     subs.lock().remove(&id);
@@ -153,7 +147,6 @@ impl RpcClient {
             subs,
             next_id: AtomicU64::new(1),
             closed,
-            _keep: keep,
         }
     }
 

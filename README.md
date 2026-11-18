@@ -7,7 +7,7 @@ same benchmark harness.
 
 * `crates/mesh`: the mesh node, client and CLI. It has a group-commit WAL, direct
   peer replication with durable-N acks, anti-entropy repair, event-time reads, and
-  TCP or **Iroh 1.4.1** QUIC transport. Design and guarantees are in
+  TCP transport (QUIC/Iroh was removed: TCP measured 1.4–1.6x faster). Design and guarantees are in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 * `crates/bench`: one closed-loop producer benchmark with two backends, Iggy
   through `iggy::IggyClient::send_messages` and the mesh through `Writer::append`.
@@ -27,7 +27,7 @@ Everything runs on one machine over loopback: nodes, client, all of it. Median o
 per producer. Each Iggy producer owns a partition; each mesh producer owns a writer log.
 Iggy nodes run 1 shard each and mesh nodes 1 Tokio worker each.
 
-| Durable acknowledgement (fsync) | Iggy 0.10 | Mesh (TCP) | Mesh (Iroh) |
+| Durable acknowledgement (fsync) | Iggy 0.10 | Mesh (TCP) | Mesh (Iroh, since removed) |
 |---|---:|---:|---:|
 | 1 node, 16 producers | 344k msg/s, p50 4.5 ms | **907k msg/s, p50 1.7 ms (2.6×)** | — |
 | 3 nodes, 2-of-3 durable, 6 producers | 129k msg/s, p50 4.5 ms | **366k, p50 1.5 ms (2.8×)** | 259k, p50 2.1 ms (2.0×) |
@@ -104,8 +104,7 @@ What this shows:
 | 5 | **Fan-out to `copies-1` peers first**, the rest later (hedged after a delay) | Today every append goes to 2 peers. For durable-2 one peer is enough on the hot path. | ~⅓ less network and replica CPU per message. |
 | 6 | **Vectored writes / zero-copy framing** | `write_loop` copies every batch into a frame buffer, once per connection. That hurts most with many subscribers. | Lower CPU per delivered message. |
 | 7 | **Thread-per-core runtime** (like Iggy's compio) and shard the store lock per log | Removes cross-thread hops (Tokio ↔ WAL thread) and one global mutex. | Matters past ~8 cores. |
-| 8 | **Iroh: several QUIC streams per peer, larger flow-control windows** | One stream means head-of-line blocking between requests. | Iroh is 30–40% behind TCP today. |
-| 9 | **Coalesce subscriber wakeups** | Every durable batch wakes every subscription. | CPU at high subscriber counts. |
+| 8 | **Coalesce subscriber wakeups** | Every durable batch wakes every subscription. | CPU at high subscriber counts. |
 
 ## Why the mesh is faster here, and what it costs
 
@@ -158,10 +157,7 @@ fair claim is therefore narrower:
 > seconds** on commodity hardware. The gap narrows to ~1.3–1.7× when Iggy's
 > workload is shaped to amortize its fsyncs (big batches, few hot partitions).
 
-**4. Iroh costs about 30–40 % against raw TCP** on loopback (encryption, QUIC
-congestion and ack processing, and one stream per peer). It still beats Iggy's
-TCP path by 1.3–2.1× while giving authenticated, encrypted, NAT-traversing
-connectivity. Pooling several streams per peer is the obvious next optimization.
+**4. QUIC/Iroh was removed: TCP measured 1.4–1.6x faster** at every load (`mesh-c2-tcp` vs `mesh-c2-iroh` in `results/RESULTS.md`).
 
 ## Caveats (read before quoting numbers)
 
@@ -183,7 +179,7 @@ connectivity. Pooling several streams per peer is the obvious next optimization.
 ## Reproduce
 
 ```bash
-cargo test                       # 11 unit + 7 multi-node tests (TCP and Iroh, live feed)
+cargo test                       # 11 unit + 7 multi-node tests (TCP, live feed)
 cargo build --release
 ```
 
@@ -212,7 +208,7 @@ python3 scripts/summarize.py > results/RESULTS.md
 Try the mesh by hand:
 
 ```bash
-target/release/precog-node init --nodes 3 --dir run/demo --transport iroh
+target/release/precog-node init --nodes 3 --dir run/demo
 ```
 
 ```bash
@@ -235,5 +231,3 @@ target/release/precog-node read --cluster run/demo/cluster.json --node 2   # eve
    Iggy polls.
 3. Add event-time watermarks and completeness signals for readers, plus a minimal
    control plane for consumer offsets.
-4. Iroh: multiple streams per peer, a test of relay mode, descriptor exchange
-   for multi-host setups.

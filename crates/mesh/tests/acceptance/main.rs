@@ -218,28 +218,20 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 
 // ---------------------------------------------------------------------------
 
-#[given(
-    regex = r"^a (\d+)-node cluster( over iroh)? with (\d+) MiB segments(?: and (\d+) MiB retention)?$"
-)]
-async fn cluster(w: &mut Mesh, n: usize, iroh: String, seg_mb: u64, retention_mb: String) {
+#[given(regex = r"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?$")]
+async fn cluster(w: &mut Mesh, n: usize, seg_mb: u64, retention_mb: String) {
     let dir = tempfile::tempdir().unwrap();
     let base = NEXT_PORT.fetch_add(10, Ordering::Relaxed);
     let mut cmd = Command::new(BIN);
-    cmd.args([
-        "init",
-        "--nodes",
-        &n.to_string(),
-        "--transport",
-        if iroh.is_empty() { "tcp" } else { "iroh" },
-    ])
-    .args([
-        "--base-port",
-        &base.to_string(),
-        "--segment-mb",
-        &seg_mb.to_string(),
-    ])
-    .arg("--dir")
-    .arg(dir.path());
+    cmd.args(["init", "--nodes", &n.to_string()])
+        .args([
+            "--base-port",
+            &base.to_string(),
+            "--segment-mb",
+            &seg_mb.to_string(),
+        ])
+        .arg("--dir")
+        .arg(dir.path());
     if !retention_mb.is_empty() {
         cmd.args(["--retention-mb", &retention_mb]);
     }
@@ -264,12 +256,9 @@ async fn cluster(w: &mut Mesh, n: usize, iroh: String, seg_mb: u64, retention_mb
         .iter()
         .map(|a| a.as_str().unwrap().parse().unwrap())
         .collect();
-    let mut mc = Arc::into_inner(
-        MeshClient::new(addrs, cf["token"].as_str().unwrap().into())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let mut mc =
+        Arc::into_inner(MeshClient::new(addrs, cf["token"].as_str().unwrap().into()).unwrap())
+            .unwrap();
     mc.rpc_timeout = Duration::from_millis(1500);
     mc.append_deadline = Duration::from_secs(60);
     w.client = Some(Arc::new(mc));

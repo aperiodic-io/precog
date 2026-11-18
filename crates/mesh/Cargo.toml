@@ -1,6 +1,6 @@
 [package]
 name = "precog-mesh"
-description = "Leaderless writer-log broker mesh POC (Iggy-inspired, Iroh transport)"
+description = "Leaderless writer-log broker mesh POC (Iggy-inspired, TCP transport)"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -11,7 +11,6 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 crc32c = "0.6"
 futures = "0.3"
-iroh = "=1.4.1"
 parking_lot = "0.12"
 precog-storage = { path = "../storage" }
 rand = "0.9"

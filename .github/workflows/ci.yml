@@ -36,7 +36,7 @@ jobs:
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with: { tool: "cargo-nextest,cargo-llvm-cov" }
-      # unit, property and integration tests (TCP and Iroh clusters on loopback) with coverage;
+      # unit, property and integration tests (TCP clusters on loopback) with coverage;
       # the acceptance suite runs in its own job
       - run: cargo llvm-cov nextest $WS --exclude precog-bench --lcov --output-path lcov.info
       - run: scripts/coverage-gate.sh lcov.info
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}" }
-      # real precog-node processes: SIGKILL, damaged files, retention, 3-node mesh, Iroh.
+      # real precog-node processes: SIGKILL, damaged files, retention, 3-node mesh.
       # @stress and @nightly scenarios run in nightly.yml.
       - run: cargo test -p precog-mesh --test acceptance -- --tags 'not @nightly and not @stress'
 

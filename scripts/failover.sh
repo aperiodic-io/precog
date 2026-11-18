@@ -15,7 +15,7 @@ if [ "$SYS" = iggy ]; then
   scripts/iggy.sh cluster 1 >/dev/null; sleep 8; PIDF=run/iggy/n$NODE.pid
   args=(iggy --iggy "$I3" --replication 3 --durability persisted)
 else
-  scripts/mesh.sh up 3 tcp 1 >/dev/null; PIDF=run/mesh/n$NODE.pid
+  scripts/mesh.sh up 3 1 >/dev/null; PIDF=run/mesh/n$NODE.pid
   args=(mesh --copies 2 --rpc-timeout-ms ${MESH_RPC_MS:-1000})
 fi
 target/release/precog-bench "${args[@]}" --label "failover/$SYS-$MODE-n$NODE" --producers $P \

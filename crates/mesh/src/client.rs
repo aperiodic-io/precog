@@ -5,7 +5,7 @@
 
 use crate::proto::*;
 use crate::rpc::RpcClient;
-use crate::transport::{Addr, Dialer, iroh_endpoint};
+use crate::transport::Addr;
 use anyhow::{Result, bail};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 pub struct MeshClient {
     nodes: Vec<Addr>,
     links: Vec<tokio::sync::Mutex<Option<Arc<RpcClient>>>>,
-    dialer: Dialer,
     token: String,
     pub rpc_timeout: Duration,
     /// Total time an append keeps retrying across nodes.
@@ -29,22 +28,11 @@ pub struct Receipt {
 }
 
 impl MeshClient {
-    pub async fn new(nodes: Vec<Addr>, token: String) -> Result<Arc<MeshClient>> {
-        let needs_iroh = nodes.iter().any(|a| matches!(a, Addr::Iroh { .. }));
-        let iroh = if needs_iroh {
-            Some(iroh_endpoint(None, Some("127.0.0.1:0".parse()?), false).await?)
-        } else {
-            None
-        };
-        Self::with_dialer(nodes, token, Dialer { iroh })
-    }
-
-    pub fn with_dialer(nodes: Vec<Addr>, token: String, dialer: Dialer) -> Result<Arc<MeshClient>> {
+    pub fn new(nodes: Vec<Addr>, token: String) -> Result<Arc<MeshClient>> {
         anyhow::ensure!(!nodes.is_empty(), "no nodes");
         Ok(Arc::new(MeshClient {
             links: nodes.iter().map(|_| Default::default()).collect(),
             nodes,
-            dialer,
             token,
             rpc_timeout: Duration::from_millis(1500),
             append_deadline: Duration::from_secs(30),
@@ -62,10 +50,7 @@ impl MeshClient {
         {
             return Ok(c.clone());
         }
-        let c = self
-            .dialer
-            .connect(&self.nodes[i], self.rpc_timeout)
-            .await?;
+        let c = crate::transport::connect(&self.nodes[i], self.rpc_timeout).await?;
         let hello = Hello {
             token: self.token.clone(),
             node_id: None,

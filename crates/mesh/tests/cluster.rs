@@ -1,10 +1,10 @@
-//! In-process multi-node tests over real loopback sockets (TCP and Iroh).
+//! In-process multi-node tests over real loopback TCP sockets.
 
 use bytes::Bytes;
 use precog_mesh::client::{MeshClient, Writer};
 use precog_mesh::node::{Node, NodeConfig, PeerConfig};
 use precog_mesh::proto::*;
-use precog_mesh::transport::{Addr, load_or_create_secret};
+use precog_mesh::transport::Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,31 +22,14 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-fn cluster(n: u32, iroh: bool, domains: &[&str]) -> Cluster {
+fn cluster(n: u32, domains: &[&str]) -> Cluster {
     let dir = tempfile::tempdir().unwrap();
     let mut addrs = Vec::new();
     let mut socks = Vec::new();
-    for i in 0..n {
-        let data = dir.path().join(format!("n{i}"));
-        std::fs::create_dir_all(&data).unwrap();
-        if iroh {
-            let port = free_udp_port();
-            let sk = load_or_create_secret(&data.join("iroh.secret")).unwrap();
-            socks.push(format!("127.0.0.1:{port}").parse().unwrap());
-            addrs.push(format!("iroh://{}@127.0.0.1:{port}", sk.public()));
-        } else {
-            let port = free_port();
-            socks.push(format!("127.0.0.1:{port}").parse().unwrap());
-            addrs.push(format!("tcp://127.0.0.1:{port}"));
-        }
+    for _ in 0..n {
+        let port = free_port();
+        socks.push(format!("127.0.0.1:{port}").parse().unwrap());
+        addrs.push(format!("tcp://127.0.0.1:{port}"));
     }
     let cfgs = (0..n)
         .map(|i| {
@@ -56,8 +39,7 @@ fn cluster(n: u32, iroh: bool, domains: &[&str]) -> Cluster {
                 dir.path().join(format!("n{i}")),
                 "secret-token".into(),
             );
-            c.listen_tcp = (!iroh).then_some(socks[i as usize]);
-            c.listen_iroh = iroh.then_some(socks[i as usize]);
+            c.listen_tcp = Some(socks[i as usize]);
             c.peers = (0..n)
                 .filter(|&j| j != i)
                 .map(|j| PeerConfig {
@@ -80,15 +62,13 @@ fn cluster(n: u32, iroh: bool, domains: &[&str]) -> Cluster {
 }
 
 async fn start(c: &Cluster, i: usize) -> Arc<Node> {
-    let (node, ep) = Node::open(c.cfgs[i].clone()).await.unwrap();
-    node.spawn_listeners(ep).await.unwrap();
+    let node = Node::open(c.cfgs[i].clone()).await.unwrap();
+    node.spawn_listeners().await.unwrap();
     node
 }
 
 async fn client(c: &Cluster) -> Arc<MeshClient> {
-    let mc = MeshClient::new(c.addrs.clone(), "secret-token".into())
-        .await
-        .unwrap();
+    let mc = MeshClient::new(c.addrs.clone(), "secret-token".into()).unwrap();
     // keep failing tests fast
     let mc = Arc::into_inner(mc).unwrap();
     let mut mc = mc;
@@ -104,8 +84,9 @@ async fn status(mc: &MeshClient, node: usize) -> Status {
     }
 }
 
-async fn replication_scenario(iroh: bool) {
-    let c = cluster(3, iroh, &["a", "b", "c"]);
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_replication_degraded_and_repair() {
+    let c = cluster(3, &["a", "b", "c"]);
     let _n0 = start(&c, 0).await;
     let _n1 = start(&c, 1).await;
     let mc = client(&c).await;
@@ -172,18 +153,8 @@ async fn replication_scenario(iroh: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tcp_replication_degraded_and_repair() {
-    replication_scenario(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn iroh_replication_degraded_and_repair() {
-    replication_scenario(true).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_fails_over_to_the_next_node_when_its_preferred_one_is_down() {
-    let c = cluster(3, false, &["a", "b", "c"]);
+    let c = cluster(3, &["a", "b", "c"]);
     // node 2 is down: a client preferring it wraps around to node 0
     for i in 0..2 {
         start(&c, i).await;
@@ -201,7 +172,7 @@ async fn the_client_fails_over_to_the_next_node_when_its_preferred_one_is_down()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idempotent_retry_and_conflict() {
-    let c = cluster(3, false, &["a", "b", "c"]);
+    let c = cluster(3, &["a", "b", "c"]);
     for i in 0..3 {
         start(&c, i).await;
     }
@@ -236,7 +207,7 @@ async fn idempotent_retry_and_conflict() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn duplicate_domain_labels_do_not_count_as_copies() {
     // Nodes 0 and 1 share domain "a": only two independent domains exist.
-    let c = cluster(3, false, &["a", "a", "b"]);
+    let c = cluster(3, &["a", "a", "b"]);
     for i in 0..3 {
         start(&c, i).await;
     }
@@ -261,7 +232,7 @@ async fn duplicate_domain_labels_do_not_count_as_copies() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clients_cannot_replicate_and_bad_tokens_are_refused() {
-    let c = cluster(1, false, &["a"]);
+    let c = cluster(1, &["a"]);
     start(&c, 0).await;
     let mc = client(&c).await;
     let log = LogId {
@@ -276,18 +247,16 @@ async fn clients_cannot_replicate_and_bad_tokens_are_refused() {
         .unwrap_err()
         .to_string();
     assert!(e.contains("non-peer"), "{e}");
-    let bad = MeshClient::new(c.addrs.clone(), "wrong".into())
-        .await
-        .unwrap();
+    let bad = MeshClient::new(c.addrs.clone(), "wrong".into()).unwrap();
     assert!(bad.control(0, &Control::Status).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_recovers_from_wal() {
-    let c = cluster(1, false, &["a"]);
+    let c = cluster(1, &["a"]);
     let cfg = c.cfgs[0].clone();
     {
-        let (node, _) = Node::open(cfg.clone()).await.unwrap();
+        let node = Node::open(cfg.clone()).await.unwrap();
         for i in 0..5u64 {
             let log = LogId {
                 stream: "s".into(),
@@ -302,14 +271,14 @@ async fn restart_recovers_from_wal() {
         drop(node);
     }
     tokio::time::sleep(Duration::from_millis(100)).await; // WAL thread releases lock
-    let (node, _) = Node::open(cfg).await.unwrap();
+    let node = Node::open(cfg).await.unwrap();
     assert_eq!(node.store.totals().1, 5);
     assert_eq!(node.store.frontiers(None)[0].contiguous, 5);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_subscribers_receive_everything_in_writer_order() {
-    let c = cluster(3, false, &["a", "b", "c"]);
+    let c = cluster(3, &["a", "b", "c"]);
     for i in 0..3 {
         start(&c, i).await;
     }
