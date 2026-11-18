@@ -1071,4 +1071,56 @@ mod tests {
             "the end cursor sees what comes next"
         );
     }
+
+    #[test]
+    fn a_cursor_read_stops_at_about_max_bytes() {
+        // a subscriber's response is bounded: a long backlog comes in steps, not one frame
+        let mut t = store();
+        for i in 0..6 {
+            let x = on("s", "w", i);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        let one = on("s", "w", 0).bytes.len();
+        let (bs, c) = t.s.read_cursor("s", &Cursor::new(), 3 * one);
+        assert_eq!(bs.len(), 3);
+        assert_eq!(c.values().copied().collect::<Vec<_>>(), [3]);
+    }
+
+    #[test]
+    fn a_cursor_inside_a_batch_still_gets_that_batch() {
+        // nothing after the cursor is skipped, even where it falls inside a batch
+        let mut t = store();
+        let xs = [
+            b("w", 1, 0, &[(1, b"a"), (2, b"b"), (3, b"c")]),
+            b("w", 1, 3, &[(4, b"d"), (5, b"e"), (6, b"f")]),
+        ];
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        let c = Cursor::from([(xs[0].id.log.clone(), 1)]);
+        let (got, c) = drain(&t.s, "s", c, 1 << 20);
+        assert_eq!(got.iter().map(|i| i.first_seq).collect::<Vec<_>>(), [0, 3]);
+        assert_eq!(c.values().copied().collect::<Vec<_>>(), [6]);
+    }
+
+    #[test]
+    fn a_writer_idle_at_its_cursor_does_not_stall_the_others() {
+        // the scan starts at the earliest unread batch. Starting at w1's last read batch
+        // instead would meet w2's early seq 2 first, block w2, and return nothing, forever
+        let mut t = store();
+        let (w1, w2) = (|i| on("s", "w1", i), |i| on("s", "w2", i));
+        for x in [w1(0), w2(0), w2(2), w2(1)] {
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        let c = Cursor::from([(w1(0).id.log, 1), (w2(0).id.log, 1)]);
+        let (got, _) = drain(&t.s, "s", c, 1 << 20);
+        let got: Vec<_> = got
+            .iter()
+            .map(|i| (i.log.writer.as_str(), i.first_seq))
+            .collect();
+        assert_eq!(got, [("w2", 1), ("w2", 2)]);
+    }
 }
