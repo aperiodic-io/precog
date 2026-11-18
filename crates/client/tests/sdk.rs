@@ -350,7 +350,7 @@ async fn the_end_of_a_stream_is_every_acked_event_even_when_one_node_is_behind()
     // a stream whose clients ask node 0 first: the node that will be behind
     let stream = (0..)
         .map(|i| format!("raw.trades.{i}"))
-        .find(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()) % 3 == 0)
+        .find(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()).is_multiple_of(3))
         .unwrap();
     let mut p = client.producer(&stream, "w");
     for i in 0..40u64 {
