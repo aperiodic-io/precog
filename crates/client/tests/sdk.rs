@@ -11,21 +11,29 @@ use std::sync::Arc;
 struct Cluster {
     addrs: Vec<String>,
     _nodes: Vec<Arc<Node>>,
+    /// the ports of nodes not started, held so they stay dead
+    _reserved: Vec<tokio::net::TcpSocket>,
     _dir: tempfile::TempDir,
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A free port, held (bound with SO_REUSEADDR, as the node binds, but not listening, so a node
+/// not started refuses connections) while the socket lives, so no test running in parallel
+/// takes it before its node binds it.
+fn reserve() -> tokio::net::TcpSocket {
+    let s = tokio::net::TcpSocket::new_v4().unwrap();
+    s.set_reuseaddr(true).unwrap();
+    s.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    s
 }
 
 /// Nodes `up` of three are started; the others' addresses stay dead.
 async fn cluster(up: &[u32]) -> Cluster {
     let dir = tempfile::tempdir().unwrap();
-    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let mut reserved: Vec<Option<_>> = (0..3).map(|_| Some(reserve())).collect();
+    let ports: Vec<u16> = reserved
+        .iter()
+        .map(|s| s.as_ref().unwrap().local_addr().unwrap().port())
+        .collect();
     let addrs: Vec<String> = ports
         .iter()
         .map(|p| format!("tcp://127.0.0.1:{p}"))
@@ -58,11 +66,13 @@ async fn cluster(up: &[u32]) -> Cluster {
         );
         let n = Node::open(c).await.unwrap();
         n.spawn_listeners().await.unwrap();
+        reserved[i as usize] = None; // the node holds the port now
         nodes.push(n);
     }
     Cluster {
         addrs,
         _nodes: nodes,
+        _reserved: reserved.into_iter().flatten().collect(),
         _dir: dir,
     }
 }
