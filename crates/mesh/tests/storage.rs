@@ -156,3 +156,44 @@ async fn status_reports_recovery_and_segments() {
     );
     assert!(s.fsyncs == 0, "fsyncs count this process's group commits");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_declared_stream_keeps_its_own_retention() {
+    // As topicsync declares retention.bytes / retention.ms per topic: one stream trims to its
+    // budget, another to its age, an undeclared one keeps everything (node budget only).
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    let one = batch("w", 0, 1000).len() as u64;
+    c.streams.insert(
+        "small".into(),
+        precog_mesh::node::StreamConfig {
+            retention_bytes: Some(5 * one),
+            retention_ms: None,
+        },
+    );
+    c.streams.insert(
+        "young".into(),
+        precog_mesh::node::StreamConfig {
+            retention_bytes: None,
+            retention_ms: Some(0),
+        },
+    );
+    let node = Node::open(c).await.unwrap();
+    for stream in ["small", "young", "other"] {
+        let log = LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        for seq in 0..20u64 {
+            let b = Batch::encode(&log, seq, &[(seq, &[1u8; 1000 - 40][..])]).unwrap();
+            assert!(node.append(1, b).await.is_success());
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    node.apply_retention().await.unwrap();
+    let count = |s: &str| node.store.read(s, 0, 1000).0.len();
+    assert!((4..=5).contains(&count("small")), "{}", count("small"));
+    assert_eq!(count("young"), 0);
+    assert_eq!(count("other"), 20);
+}

@@ -70,6 +70,10 @@ pub struct NodeConfig {
     /// At most this many dedup ids (~15 bytes each); past it the window shortens.
     #[serde(default = "dedup_max_entries")]
     pub dedup_max_entries: usize,
+    /// Streams with a retention of their own (topicsync's `retention.bytes` / `retention.ms`);
+    /// others keep what the node-level budget leaves.
+    #[serde(default)]
+    pub streams: HashMap<String, StreamConfig>,
     /// Fault injection for tests.
     #[serde(skip)]
     pub storage_failpoints: precog_storage::Failpoints,
@@ -93,6 +97,7 @@ impl NodeConfig {
             retention_ms: None,
             retention_interval_ms: retention_interval_ms(),
             dedup_window_ms: dedup_window_ms(),
+            streams: HashMap::new(),
             dedup_max_entries: dedup_max_entries(),
             tail_cache_bytes: tail_cache_bytes(),
             storage_failpoints: Default::default(),
@@ -111,6 +116,16 @@ impl NodeConfig {
 fn segment_size() -> u64 {
     1 << 30
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StreamConfig {
+    /// Keep at most this many bytes of the stream (its oldest batches go first).
+    #[serde(default)]
+    pub retention_bytes: Option<u64>,
+    /// Drop the stream's batches older than this.
+    #[serde(default)]
+    pub retention_ms: Option<u64>,
+}
+
 fn dedup_window_ms() -> Option<u64> {
     Some(300_000)
 }
@@ -317,6 +332,11 @@ impl Node {
 
     /// Applies the configured retention to the log and forgets trimmed batches.
     pub async fn apply_retention(&self) -> Result<()> {
+        let now = crate::store::now_ms();
+        for (name, s) in &self.cfg.streams {
+            self.store
+                .trim_stream(name, s.retention_bytes, s.retention_ms, now);
+        }
         if self.cfg.retention_bytes.is_none() && self.cfg.retention_ms.is_none() {
             return Ok(());
         }

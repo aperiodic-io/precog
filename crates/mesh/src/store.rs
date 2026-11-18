@@ -76,6 +76,55 @@ struct Inner {
     contiguous: Lsn,
     events: u64,
     bytes: u64,
+    /// Per stream, its durable batches by LSN, for its own retention.
+    by_stream: HashMap<String, StreamLog>,
+}
+
+#[derive(Default)]
+struct StreamLog {
+    /// (first seq's log, append time ms, bytes) by LSN
+    order: BTreeMap<Lsn, (LogId, u64, u32)>,
+    bytes: u64,
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+impl Inner {
+    fn index(&mut self, lsn: Lsn, id: &BatchId, count: u32, crc: u32, len: u32, time_ms: u64) {
+        self.order.insert(lsn, (id.clone(), count, crc, len));
+        self.events += count as u64;
+        self.bytes += len as u64;
+        let s = self.by_stream.entry(id.log.stream.clone()).or_default();
+        s.order.insert(lsn, (id.log.clone(), time_ms, len));
+        s.bytes += len as u64;
+    }
+
+    /// Forgets the durable batch at `lsn` (retention): later copies of it are `Expired`.
+    fn forget(&mut self, lsn: Lsn) {
+        let Some((id, count, _, len)) = self.order.remove(&lsn) else {
+            return;
+        };
+        self.events -= count as u64;
+        self.bytes -= len as u64;
+        if let Some(s) = self.by_stream.get_mut(&id.log.stream)
+            && s.order.remove(&lsn).is_some()
+        {
+            s.bytes -= len as u64;
+        }
+        if let Some(map) = self.logs.get_mut(&id.log)
+            && let Some(e) = map.remove(&id.first_seq)
+        {
+            let t = self.trimmed.entry(id.log.clone()).or_default();
+            *t = (*t).max(e.shape.end);
+            if map.is_empty() {
+                self.logs.remove(&id.log);
+            }
+        }
+    }
 }
 
 pub struct Store {
@@ -141,9 +190,7 @@ impl Store {
                     .entry(log.stream.clone())
                     .or_default()
                     .insert(log);
-                inner.order.insert(e.lsn, (id, shape.count, shape.crc, len));
-                inner.events += shape.count as u64;
-                inner.bytes += len as u64;
+                inner.index(e.lsn, &id, shape.count, shape.crc, len, e.meta.time_ms);
             }
         }
         Ok(s)
@@ -215,11 +262,7 @@ impl Store {
         e.lsn = Some(lsn);
         e.state.send_replace(State::Durable);
         let sh = e.shape;
-        inner
-            .order
-            .insert(lsn, (id.clone(), sh.count, sh.crc, sh.len));
-        inner.events += sh.count as u64;
-        inner.bytes += sh.len as u64;
+        inner.index(lsn, id, sh.count, sh.crc, sh.len, now_ms());
         while inner.order.contains_key(&inner.contiguous) {
             inner.contiguous += 1;
         }
@@ -241,21 +284,33 @@ impl Store {
         let mut g = self.inner.lock();
         let inner = &mut *g;
         inner.contiguous = inner.contiguous.max(floor);
-        let keep = inner.order.split_off(&floor);
-        let gone = std::mem::replace(&mut inner.order, keep);
-        for (_, (id, count, _, len)) in gone {
-            inner.events -= count as u64;
-            inner.bytes -= len as u64;
-            if let Some(map) = inner.logs.get_mut(&id.log)
-                && let Some(e) = map.remove(&id.first_seq)
-            {
-                let t = inner.trimmed.entry(id.log.clone()).or_default();
-                *t = (*t).max(e.shape.end);
-                if map.is_empty() {
-                    inner.logs.remove(&id.log);
-                }
-            }
+        let gone: Vec<Lsn> = inner.order.range(..floor).map(|(&l, _)| l).collect();
+        for lsn in gone {
+            inner.forget(lsn);
         }
+    }
+
+    /// One stream's own retention: drops its oldest batches while it holds more than
+    /// `max_bytes`, or while they are older than `max_age_ms` at `now_ms`. Returns how many.
+    pub fn trim_stream(
+        &self,
+        stream: &str,
+        max_bytes: Option<u64>,
+        max_age_ms: Option<u64>,
+        now_ms: u64,
+    ) -> usize {
+        let mut g = self.inner.lock();
+        let inner = &mut *g;
+        let mut n = 0;
+        while let Some(s) = inner.by_stream.get(stream)
+            && let Some((&lsn, &(_, time, _))) = s.order.first_key_value()
+            && (max_bytes.is_some_and(|m| s.bytes > m)
+                || max_age_ms.is_some_and(|a| now_ms.saturating_sub(time) > a))
+        {
+            inner.forget(lsn);
+            n += 1;
+        }
+        n
     }
 
     /// Durable copy with this exact checksum present (or aged out by retention)?
@@ -735,5 +790,59 @@ mod tests {
         assert_eq!((got.len(), next), (3, 3));
         assert_eq!(t.s.frontiers(Some("s")).len(), 1);
         assert!(t.s.frontiers(Some("other")).is_empty());
+    }
+
+    fn on(stream: &str, writer: &str, seq: u64) -> Batch {
+        let log = LogId {
+            stream: stream.into(),
+            writer: writer.into(),
+            epoch: 1,
+        };
+        Batch::parse(Batch::encode(&log, seq, &[(seq, &[9u8; 100][..])]).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_stream_trims_to_its_own_byte_budget_and_leaves_others_alone() {
+        let mut t = store();
+        let a: Vec<Batch> = (0..10).map(|i| on("a", "w", i)).collect();
+        let b: Vec<Batch> = (0..10).map(|i| on("b", "w", i)).collect();
+        for i in 0..10 {
+            for x in [&a[i], &b[i]] {
+                t.s.reserve(x);
+                t.durable(x);
+            }
+        }
+        let one = a[0].bytes.len() as u64;
+        assert_eq!(t.s.trim_stream("a", Some(3 * one), None, 0), 7);
+        assert!(t.s.get(&a[6].id).is_none() && t.s.get(&a[7].id).is_some());
+        assert!(t.s.get(&b[0].id).is_some(), "stream b keeps everything");
+        assert_eq!(t.s.totals().0, 13);
+        assert_eq!(t.s.totals().2, 13 * one);
+        assert!(
+            matches!(t.s.reserve(&a[2]), Reserve::Expired),
+            "a trimmed batch is not re-ingested"
+        );
+        let f = t.s.frontiers(Some("a"));
+        assert_eq!((f[0].contiguous, f[0].high), (10, 10));
+        // already within budget: nothing more goes
+        assert_eq!(t.s.trim_stream("a", Some(3 * one), None, 0), 0);
+    }
+
+    #[test]
+    fn a_stream_trims_batches_older_than_its_age_limit() {
+        let mut t = store();
+        let a: Vec<Batch> = (0..4).map(|i| on("a", "w", i)).collect();
+        for x in &a {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        let now = now_ms();
+        assert_eq!(
+            t.s.trim_stream("a", None, Some(60_000), now),
+            0,
+            "all are seconds old"
+        );
+        assert_eq!(t.s.trim_stream("a", None, Some(60_000), now + 61_000), 4);
+        assert_eq!(t.s.totals().0, 0);
     }
 }
