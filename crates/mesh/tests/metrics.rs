@@ -122,3 +122,32 @@ async fn a_request_split_across_tcp_writes_is_read_whole() {
     s.read_to_string(&mut out).await.unwrap();
     assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_groups_commit_age_is_in_seconds() {
+    // the alert on a stuck consumer compares this gauge with a threshold in seconds
+    let d = tempfile::tempdir().unwrap();
+    let mut c = NodeConfig::single(0, "a", d.path().to_path_buf(), "tok".into());
+    c.segment_size = 1 << 20;
+    let node = Node::open(c).await.unwrap();
+    let log = LogId {
+        stream: "s".into(),
+        writer: "p".into(),
+        epoch: 1,
+    };
+    for seq in 0..2 {
+        let b = Batch::encode(&log, seq, &[(1, b"a")]).unwrap();
+        assert!(node.append(1, b).await.is_success());
+    }
+    let pos: precog_mesh::store::Cursor = [(log, 1)].into_iter().collect();
+    node.commit_position("g", "s", &pos).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    let m = node.metrics();
+    let age: u64 = m
+        .lines()
+        .find_map(|l| l.strip_prefix(r#"precog_group_commit_age_seconds{group="g",stream="s"} "#))
+        .unwrap_or_else(|| panic!("no commit age in\n{m}"))
+        .parse()
+        .unwrap();
+    assert!((1..=3).contains(&age), "{age} s after a commit 1.2 s ago");
+}
