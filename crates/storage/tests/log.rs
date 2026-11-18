@@ -1410,3 +1410,36 @@ fn a_damaged_final_record_is_dropped_and_zeroed() {
         "its header was zeroed"
     );
 }
+
+#[test]
+fn spares_are_filled_at_a_paced_rate_in_the_background() {
+    // A spare zero-filled at full speed saturates the disk and the log's own fsyncs queue
+    // behind it (p99 acks of 400 ms in bench/compare at each roll); the preallocator paces itself.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 4 << 20);
+    c.prealloc_bytes_per_s = 4 << 20;
+    let _log = Log::open(c).unwrap();
+    let spares = || {
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("spare-0")
+            })
+            .count()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        spares(),
+        0,
+        "a 4 MiB spare at 4 MiB/s is not ready after 300 ms"
+    );
+    let t = std::time::Instant::now();
+    while spares() == 0 && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(spares(), 1, "ready within a few seconds");
+}
