@@ -32,7 +32,7 @@ import json, sys
 peers = [{"id": i, "domain": f"d{i}", "addr": f"tcp://172.31.78.{10+i}:7000"} for i in range(3)]
 json.dump({"id": 0, "domain": "", "data_dir": "/var/lib/precog", "token": "in-cluster",
            "listen_tcp": "0.0.0.0:7000", "peers": peers, "target_copies": 3,
-           "segment_size": 268435456, "dedup_window_ms": 300000,
+           "segment_size": 268435456, "dedup_window_ms": (None if __import__("os").environ.get("NODEDUP") else 300000),
            "retention_bytes": int(__import__("os").environ.get("RETENTION", "1252698794")), "retention_interval_ms": 1000,
            "repair_interval_ms": int(__import__("os").environ.get("REPAIR_MS", "1000"))}, open(sys.argv[1], "w"))
 PY
@@ -57,7 +57,7 @@ else
   RPK="docker exec cmp-0 /opt/redpanda/bin/rpk"
   for _ in $(seq 1 90); do $RPK cluster health 2>/dev/null | grep -q "Healthy:.*true" && break; sleep 2; done
   $RPK cluster config set auto_create_topics_enabled false >/dev/null
-  $RPK cluster config set write_caching_default true >/dev/null  # as live-ingestion runs it: acks before fsync
+  $RPK cluster config set write_caching_default "${RP_WRITE_CACHING:-true}" >/dev/null  # true as live-ingestion runs it: acks before fsync
   $RPK topic create raw.bench.trades -p 3 -r 3 -c retention.bytes=1252698794 -c cleanup.policy=delete \
     -c redpanda.dedup.window.ms=300000 -c redpanda.dedup.key.header=dedup-id >/dev/null
   cp "${FRANZ_LOADGEN:?}" "$work/loadgen"
