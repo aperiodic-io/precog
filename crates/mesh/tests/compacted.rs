@@ -125,3 +125,32 @@ async fn a_damaged_snapshot_is_refused_loudly() {
     assert!(format!("{e:#}").contains("snapshot"), "{e:#}");
     let _: Option<Bytes> = None;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_of_an_unknown_version_is_refused_even_with_a_valid_checksum() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let node = Node::open(config(d.path())).await.unwrap();
+        put(&node, "state", 0, &[("k1", "v1")]).await;
+        node.apply_retention().await.unwrap();
+    }
+    let snap = std::fs::read_dir(d.path().join("compact"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // a future format: other magic, consistent checksum. Reading it as this one would
+    // serve made-up keys, so it must be refused, not trusted for its CRC
+    let mut b = std::fs::read(&snap).unwrap();
+    let n = b.len() - 4;
+    b[3] = b'9';
+    let c = crc32c::crc32c(&b[..n]);
+    b[n..].copy_from_slice(&c.to_le_bytes());
+    std::fs::write(&snap, &b).unwrap();
+    let e = Node::open(config(d.path()))
+        .await
+        .err()
+        .expect("must not start on a snapshot of another version");
+    assert!(format!("{e:#}").contains("unknown version"), "{e:#}");
+}
