@@ -1123,4 +1123,27 @@ mod tests {
             .collect();
         assert_eq!(got, [("w2", 1), ("w2", 2)]);
     }
+
+    #[test]
+    fn a_batch_exactly_its_streams_age_limit_old_is_kept() {
+        // retention.ms keeps data for at least that long (as in Kafka): only older goes
+        let mut t = store();
+        let a = on("a", "w", 0);
+        let m = Meta {
+            key: encode_log_key(&a.id.log),
+            first_seq: 0,
+            count: a.count,
+            tag: batch_crc(&a.bytes),
+            time_ms: 1_000,
+        };
+        t.log.append(&[(m, &a.bytes[..])]).unwrap();
+        let r = t.log.reader();
+        let s = Store::load(r.clone(), r.entries(0, 10)).unwrap();
+        assert_eq!(
+            s.trim_stream("a", None, Some(500), 1_500),
+            0,
+            "exactly 500 ms old"
+        );
+        assert_eq!(s.trim_stream("a", None, Some(500), 1_501), 1, "older");
+    }
 }
