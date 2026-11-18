@@ -104,6 +104,11 @@ jobs:
   bench-gate:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # One codegen unit for both builds: with several, a function's instructions move by a few
+    # percent when unrelated code changes which unit it lands in (#6: +3.2% on an unchanged
+    # Batch::parse), past the 2% limit. Bench builds only; release keeps its own setting.
+    env:
+      CARGO_PROFILE_BENCH_CODEGEN_UNITS: "1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { fetch-depth: 0 }
