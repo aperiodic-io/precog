@@ -203,6 +203,17 @@ impl Inner {
         self.ix.get(log).map(|&i| (i, &self.logs[i as usize]))
     }
 
+    /// Whether `seq` of the log is below its trimmed floor: raised by `trim`, or by a segment
+    /// the log already dropped (retention runs before `trim` hears of it).
+    fn trimmed(&self, r: &Reader, log: &LogId, seq: u64) -> bool {
+        let Some((_, l)) = self.log(log) else {
+            return false;
+        };
+        let first = r.first_lsn();
+        let gone = l.cold.iter().take_while(|c| c.base < first);
+        seq < gone.fold(l.trimmed, |t, c| t.max(c.hi))
+    }
+
     fn stream_of(&self, ix: u32) -> &StreamLog {
         &self.streams[&self.logs[ix as usize].id.stream]
     }
@@ -596,7 +607,7 @@ impl Store {
         let inner = &mut *g;
         let first = b.id.first_seq;
         let end = b.end_seq();
-        if inner.log(&b.id.log).is_some_and(|l| first < l.1.trimmed) {
+        if inner.trimmed(&self.reader, &b.id.log, first) {
             return Reserve::Expired;
         }
         let ix = inner.intern(&b.id.log);
@@ -785,7 +796,7 @@ impl Store {
     /// Durable copy with this exact checksum present (or aged out by retention)?
     pub fn has(&self, id: &BatchId, crc: u32) -> bool {
         let g = self.inner.lock();
-        g.log(&id.log).is_some_and(|l| id.first_seq < l.1.trimmed)
+        g.trimmed(&self.reader, &id.log, id.first_seq)
             || self
                 .durable_at(&g, &id.log, id.first_seq)
                 .is_some_and(|e| e.crc == crc)
@@ -2163,6 +2174,34 @@ mod tests {
             "the oldest segment, nothing past the gap"
         );
         assert_eq!(t.s.frontiers(Some("g"))[0].contiguous, 5);
+    }
+
+    #[test]
+    fn a_segment_retention_dropped_is_trimmed_before_the_store_hears_of_it() {
+        // Why: the node drops segments from the log, then tells the store (`trim`). In between,
+        // a retry of a batch in a dropped segment must not be taken as new (appended again),
+        // and repair must not think the batch missing
+        let mut t = store_with(TINY);
+        let xs: Vec<Batch> = (0..8).map(|i| on("s", "w", i)).collect();
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        t.s.absorb();
+        let floor = t.log.retain(Some(3 * TINY), None).unwrap();
+        let sealed = t.log.reader().sealed();
+        assert!(
+            floor > 1 && sealed[0].0 == floor,
+            "segments dropped, a sealed one kept"
+        );
+        let kinds = |t: &T| -> Vec<&str> { xs.iter().map(|x| kind(t.s.reserve(x))).collect() };
+        let want: Vec<&str> = (0..8)
+            .map(|lsn| if lsn < floor { "expired" } else { "duplicate" })
+            .collect();
+        assert_eq!(kinds(&t), want);
+        assert!(t.s.has(&xs[0].id, batch_crc(&xs[0].bytes)));
+        t.s.trim(floor);
+        assert_eq!(kinds(&t), want);
     }
 
     #[test]
