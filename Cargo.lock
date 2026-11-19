@@ -3025,6 +3025,8 @@ dependencies = [
  "libc",
  "lz4_flex",
  "precog-mesh",
+ "tempfile",
+ "tokio",
  "xxhash-rust",
 ]
 
