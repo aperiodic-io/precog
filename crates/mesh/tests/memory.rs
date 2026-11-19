@@ -36,8 +36,8 @@ fn live() -> isize {
 
 const BATCHES: usize = 200_000;
 /// Bytes of heap per retained batch, the store's index and the segment log's together (requested
-/// sizes: malloc's own rounding and headers come on top). Today: 1092 B.
-const BUDGET: f64 = 1200.0;
+/// sizes: malloc's own rounding and headers come on top). Today: 338 B (store 147 B).
+const BUDGET: f64 = 400.0;
 
 #[test]
 fn ram_per_retained_batch_stays_within_budget() {

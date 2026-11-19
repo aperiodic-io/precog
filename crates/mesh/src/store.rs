@@ -6,8 +6,8 @@
 //! log has made it durable. Only metadata lives in RAM (range, checksum, length, LSN); payloads
 //! are read back through the log's index and tail cache.
 //!
-//! ponytail: ~150 bytes of RAM per retained batch; move the per-log index to disk (redb or the
-//! segment index files) if retention keeps more than ~10M batches per node.
+//! ponytail: ~150 bytes of RAM per retained batch (tests/memory.rs), on top of the segment log's
+//! own index; move the per-log index to disk if retention keeps more than ~10M batches per node.
 
 use crate::proto::{Batch, BatchId, Event, Frontier, LogId, decode_log_key};
 use parking_lot::Mutex;
@@ -22,30 +22,45 @@ pub enum State {
     Failed,
 }
 
-/// What identifies a batch's content for duplicate detection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Shape {
-    end: u64,
+/// An entry's LSN until the segment log has made it durable.
+const PENDING: Lsn = Lsn::MAX;
+
+/// A batch, keyed by its writer log and first sequence. Its length, count and checksum decide
+/// duplicates; its LSN is where its payload is.
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    lsn: Lsn,
     count: u32,
     crc: u32,
     len: u32,
 }
 
-impl Shape {
-    fn of(b: &Batch) -> Shape {
-        Shape {
-            end: b.end_seq(),
-            count: b.count,
-            crc: b.ident,
-            len: b.bytes.len() as u32,
-        }
+impl Entry {
+    fn durable(&self) -> bool {
+        self.lsn != PENDING
     }
 }
 
-struct Entry {
-    shape: Shape,
-    lsn: Option<Lsn>,
-    state: watch::Sender<State>,
+/// One writer log. Kept for good once seen: its frontier outlives its batches.
+struct Log {
+    id: LogId,
+    batches: BTreeMap<u64, Entry>,
+    /// Sequences below this were trimmed by retention.
+    trimmed: u64,
+    /// Every sequence below this is durable here or trimmed (kept as batches arrive, so
+    /// frontiers, and with them repair, cost O(logs) instead of O(batches)).
+    contig: u64,
+}
+
+impl Log {
+    /// The end of its last durable batch.
+    fn high(&self) -> Option<u64> {
+        self.batches
+            .iter()
+            .rev()
+            .find(|(_, e)| e.durable())
+            .map(|(&s, e)| s + e.count as u64)
+    }
 }
 
 pub enum Reserve {
@@ -60,30 +75,31 @@ pub enum Reserve {
     Expired,
 }
 
+/// Writer logs are interned: a batch refers to its log by index, so no map holds a copy of its
+/// stream and writer names per batch.
 #[derive(Default)]
 struct Inner {
-    logs: HashMap<LogId, BTreeMap<u64, Entry>>,
-    streams: HashMap<String, BTreeSet<LogId>>,
-    /// Durable batches by LSN: (id, count, crc, len).
-    order: BTreeMap<Lsn, (BatchId, u32, u32, u32)>,
-    /// Per writer log: sequences below this were trimmed by retention.
-    trimmed: HashMap<LogId, u64>,
+    logs: Vec<Log>,
+    ix: HashMap<LogId, u32>,
+    streams: HashMap<String, StreamLog>,
+    /// Durable batches by LSN: (log, len, first seq).
+    order: BTreeMap<Lsn, (u32, u32, u64)>,
+    /// What waits on a batch not yet durable (a concurrent duplicate); dropped once it is
+    /// durable or failed, as a later duplicate needs no wait.
+    pending: HashMap<(u32, u64), watch::Sender<State>>,
     /// Every LSN below this is in `order` (or trimmed). Subscriptions read only below it:
     /// batches are marked durable in any order, but a reader must never skip one.
     contiguous: Lsn,
     events: u64,
     bytes: u64,
-    /// Per stream, its durable batches by LSN, for its own retention.
-    by_stream: HashMap<String, StreamLog>,
-    /// Per writer log: every sequence below this is durable here or trimmed (kept as batches
-    /// arrive, so frontiers, and with them repair, cost O(logs) instead of O(batches)).
-    contig: HashMap<LogId, u64>,
 }
 
 #[derive(Default)]
 struct StreamLog {
-    /// (first seq's log, append time ms, bytes) by LSN
-    order: BTreeMap<Lsn, (LogId, u64, u32)>,
+    /// The stream's writer logs.
+    logs: BTreeSet<u32>,
+    /// Its durable batches by LSN: append time ms, for its own retention.
+    order: BTreeMap<Lsn, u64>,
     bytes: u64,
 }
 
@@ -120,50 +136,81 @@ pub fn now_ms() -> u64 {
 }
 
 impl Inner {
-    fn index(&mut self, lsn: Lsn, id: &BatchId, count: u32, crc: u32, len: u32, time_ms: u64) {
-        self.order.insert(lsn, (id.clone(), count, crc, len));
-        self.events += count as u64;
-        self.bytes += len as u64;
-        let s = self.by_stream.entry(id.log.stream.clone()).or_default();
-        s.order.insert(lsn, (id.log.clone(), time_ms, len));
-        s.bytes += len as u64;
-        self.advance(&id.log);
+    fn intern(&mut self, log: &LogId) -> u32 {
+        if let Some(&i) = self.ix.get(log) {
+            return i;
+        }
+        let i = self.logs.len() as u32;
+        self.logs.push(Log {
+            id: log.clone(),
+            batches: BTreeMap::new(),
+            trimmed: 0,
+            contig: 0,
+        });
+        self.ix.insert(log.clone(), i);
+        i
+    }
+
+    fn log(&self, log: &LogId) -> Option<&Log> {
+        self.ix.get(log).map(|&i| &self.logs[i as usize])
+    }
+
+    /// Adds the log to its stream's.
+    fn join(&mut self, ix: u32) {
+        let stream = &self.logs[ix as usize].id.stream;
+        match self.streams.get_mut(stream) {
+            Some(s) => {
+                s.logs.insert(ix);
+            }
+            None => {
+                let s = StreamLog {
+                    logs: BTreeSet::from([ix]),
+                    ..Default::default()
+                };
+                self.streams.insert(stream.clone(), s);
+            }
+        }
+    }
+
+    fn index(&mut self, lsn: Lsn, ix: u32, first: u64, e: Entry, time_ms: u64) {
+        self.order.insert(lsn, (ix, e.len, first));
+        self.events += e.count as u64;
+        self.bytes += e.len as u64;
+        let s = self
+            .streams
+            .get_mut(&self.logs[ix as usize].id.stream)
+            .expect("a log joins its stream when reserved");
+        s.order.insert(lsn, time_ms);
+        s.bytes += e.len as u64;
+        self.advance(ix);
     }
 
     /// Moves the log's contiguous end past every durable batch that now follows it.
-    fn advance(&mut self, log: &LogId) {
-        let floor = self.trimmed.get(log).copied().unwrap_or(0);
-        let mut c = self.contig.get(log).copied().unwrap_or(0).max(floor);
-        if let Some(map) = self.logs.get(log) {
-            while let Some(e) = map.get(&c).filter(|e| e.lsn.is_some()) {
-                c = e.shape.end;
-            }
+    fn advance(&mut self, ix: u32) {
+        let l = &mut self.logs[ix as usize];
+        let mut c = l.contig.max(l.trimmed);
+        while let Some(e) = l.batches.get(&c).filter(|e| e.durable()) {
+            c += e.count as u64;
         }
-        self.contig.insert(log.clone(), c);
+        l.contig = c;
     }
 
     /// Forgets the durable batch at `lsn` (retention): later copies of it are `Expired`.
     fn forget(&mut self, lsn: Lsn) {
-        let Some((id, count, _, len)) = self.order.remove(&lsn) else {
+        let Some((ix, len, first)) = self.order.remove(&lsn) else {
             return;
         };
+        let l = &mut self.logs[ix as usize];
+        let count = l.batches.remove(&first).map_or(0, |e| e.count);
+        l.trimmed = l.trimmed.max(first + count as u64);
         self.events -= count as u64;
         self.bytes -= len as u64;
-        if let Some(s) = self.by_stream.get_mut(&id.log.stream)
+        if let Some(s) = self.streams.get_mut(&l.id.stream)
             && s.order.remove(&lsn).is_some()
         {
             s.bytes -= len as u64;
         }
-        if let Some(map) = self.logs.get_mut(&id.log)
-            && let Some(e) = map.remove(&id.first_seq)
-        {
-            let t = self.trimmed.entry(id.log.clone()).or_default();
-            *t = (*t).max(e.shape.end);
-            if map.is_empty() {
-                self.logs.remove(&id.log);
-            }
-            self.advance(&id.log);
-        }
+        self.advance(ix);
     }
 }
 
@@ -188,49 +235,31 @@ impl Store {
             inner.contiguous = s.reader.next_lsn(); // everything recovered is durable
             for e in entries {
                 let log = decode_log_key(&e.meta.key)?;
-                let id = BatchId {
-                    log: log.clone(),
-                    first_seq: e.meta.first_seq,
-                };
-                let shape = Shape {
-                    end: e.meta.first_seq + e.meta.count as u64,
+                let ix = inner.intern(&log);
+                let first = e.meta.first_seq;
+                let new = Entry {
+                    lsn: e.lsn,
                     count: e.meta.count,
                     crc: e.meta.tag,
                     len: e.payload_len,
                 };
-                let map = inner.logs.entry(log.clone()).or_default();
-                if let Some((&s0, x)) = map.range(..=id.first_seq).next_back()
-                    && x.shape.end > id.first_seq
+                let map = &mut inner.logs[ix as usize].batches;
+                if let Some((&s0, x)) = map.range(..=first).next_back()
+                    && s0 + x.count as u64 > first
                 {
-                    if s0 == id.first_seq
-                        && x.shape.crc == shape.crc
-                        && x.shape.count == shape.count
-                    {
+                    if s0 == first && x.crc == new.crc && x.count == new.count {
                         continue; // logged twice (a repair raced a replicate): keep the first
                     }
                     anyhow::bail!(
                         "conflicting batches in the log at lsn {}: {:?} seq {}",
                         e.lsn,
                         log,
-                        id.first_seq
+                        first
                     );
                 }
-                let len = shape.len;
-                let (tx, _) = watch::channel(State::Durable);
-                map.insert(
-                    id.first_seq,
-                    Entry {
-                        shape,
-                        lsn: Some(e.lsn),
-                        state: tx,
-                    },
-                );
-                inner
-                    .streams
-                    .entry(log.stream.clone())
-                    .or_default()
-                    .insert(log);
-                inner.index(e.lsn, &id, shape.count, shape.crc, len, e.meta.time_ms);
+                map.insert(first, new);
+                inner.join(ix);
+                inner.index(e.lsn, ix, first, new, e.meta.time_ms);
             }
         }
         Ok(s)
@@ -241,24 +270,24 @@ impl Store {
         let inner = &mut *g;
         let first = b.id.first_seq;
         let end = b.end_seq();
-        if inner.trimmed.get(&b.id.log).is_some_and(|&t| first < t) {
+        if inner.log(&b.id.log).is_some_and(|l| first < l.trimmed) {
             return Reserve::Expired;
         }
-        let log = inner.logs.entry(b.id.log.clone()).or_default();
+        let ix = inner.intern(&b.id.log);
+        let log = &mut inner.logs[ix as usize].batches;
         if let Some((&s, e)) = log.range(..=first).next_back()
-            && e.shape.end > first
+            && s + e.count as u64 > first
         {
-            let new = Shape::of(b);
-            if s == first
-                && e.shape.crc == new.crc
-                && e.shape.count == new.count
-                && e.shape.end == new.end
-            {
-                return Reserve::Duplicate(e.state.subscribe());
+            if s == first && e.crc == b.ident && e.count == b.count {
+                return Reserve::Duplicate(match inner.pending.get(&(ix, first)) {
+                    Some(tx) => tx.subscribe(),
+                    None => watch::channel(State::Durable).1,
+                });
             }
             return Reserve::Conflict(format!(
                 "{:?} seq {first}..{end} overlaps stored {s}..{}",
-                b.id.log, e.shape.end
+                b.id.log,
+                s + e.count as u64
             ));
         }
         if let Some((&s, _)) = log.range(first + 1..).next()
@@ -269,40 +298,41 @@ impl Store {
                 b.id.log
             ));
         }
-        let (tx, _) = watch::channel(State::Pending);
         log.insert(
             first,
             Entry {
-                shape: Shape::of(b),
-                lsn: None,
-                state: tx,
+                lsn: PENDING,
+                count: b.count,
+                crc: b.ident,
+                len: b.bytes.len() as u32,
             },
         );
         inner
-            .streams
-            .entry(b.id.log.stream.clone())
-            .or_default()
-            .insert(b.id.log.clone());
+            .pending
+            .insert((ix, first), watch::channel(State::Pending).0);
+        inner.join(ix);
         Reserve::New
     }
 
     pub fn mark_durable(&self, id: &BatchId, lsn: Lsn) {
         let mut g = self.inner.lock();
         let inner = &mut *g;
-        let Some(e) = inner
-            .logs
-            .get_mut(&id.log)
-            .and_then(|l| l.get_mut(&id.first_seq))
-        else {
+        let Some(&ix) = inner.ix.get(&id.log) else {
             return;
         };
-        if *e.state.borrow() == State::Durable {
+        let first = id.first_seq;
+        let Some(e) = inner.logs[ix as usize].batches.get_mut(&first) else {
+            return;
+        };
+        if e.durable() {
             return;
         }
-        e.lsn = Some(lsn);
-        e.state.send_replace(State::Durable);
-        let sh = e.shape;
-        inner.index(lsn, id, sh.count, sh.crc, sh.len, now_ms());
+        e.lsn = lsn;
+        let e = *e;
+        if let Some(tx) = inner.pending.remove(&(ix, first)) {
+            tx.send_replace(State::Durable);
+        }
+        inner.index(lsn, ix, first, e, now_ms());
         while inner.order.contains_key(&inner.contiguous) {
             inner.contiguous += 1;
         }
@@ -312,10 +342,12 @@ impl Store {
 
     pub fn mark_failed(&self, id: &BatchId) {
         let mut g = self.inner.lock();
-        if let Some(log) = g.logs.get_mut(&id.log)
-            && let Some(e) = log.remove(&id.first_seq)
+        let inner = &mut *g;
+        if let Some(&ix) = inner.ix.get(&id.log)
+            && let Some(tx) = inner.pending.remove(&(ix, id.first_seq))
         {
-            e.state.send_replace(State::Failed);
+            inner.logs[ix as usize].batches.remove(&id.first_seq);
+            tx.send_replace(State::Failed);
         }
     }
 
@@ -342,8 +374,8 @@ impl Store {
         let mut g = self.inner.lock();
         let inner = &mut *g;
         let mut n = 0;
-        while let Some(s) = inner.by_stream.get(stream)
-            && let Some((&lsn, &(_, time, _))) = s.order.first_key_value()
+        while let Some(s) = inner.streams.get(stream)
+            && let Some((&lsn, &time)) = s.order.first_key_value()
             && (max_bytes.is_some_and(|m| s.bytes > m)
                 || max_age_ms.is_some_and(|a| now_ms.saturating_sub(time) > a))
         {
@@ -356,22 +388,19 @@ impl Store {
     /// Durable copy with this exact checksum present (or aged out by retention)?
     pub fn has(&self, id: &BatchId, crc: u32) -> bool {
         let g = self.inner.lock();
-        if g.trimmed.get(&id.log).is_some_and(|&t| id.first_seq < t) {
-            return true;
-        }
-        g.logs
-            .get(&id.log)
-            .and_then(|l| l.get(&id.first_seq))
-            .is_some_and(|e| *e.state.borrow() == State::Durable && e.shape.crc == crc)
+        let Some(l) = g.log(&id.log) else {
+            return false;
+        };
+        id.first_seq < l.trimmed
+            || l.batches
+                .get(&id.first_seq)
+                .is_some_and(|e| e.durable() && e.crc == crc)
     }
 
     fn lsn_of(&self, id: &BatchId) -> Option<Lsn> {
         let g = self.inner.lock();
-        g.logs
-            .get(&id.log)?
-            .get(&id.first_seq)
-            .filter(|e| *e.state.borrow() == State::Durable)?
-            .lsn
+        let e = g.log(&id.log)?.batches.get(&id.first_seq)?;
+        e.durable().then_some(e.lsn)
     }
 
     fn read_batch(&self, lsn: Lsn) -> Option<Batch> {
@@ -396,13 +425,13 @@ impl Store {
             let g = self.inner.lock();
             let mut size = 0usize;
             let mut v = vec![];
-            for (&lsn, (id, _, _, len)) in g.order.range(from..g.contiguous.max(from)) {
+            for (&lsn, &(ix, len, _)) in g.order.range(from..g.contiguous.max(from)) {
                 if size >= max_bytes {
                     break;
                 }
-                let want = stream.is_none_or(|s| id.log.stream == s);
+                let want = stream.is_none_or(|s| g.logs[ix as usize].id.stream == s);
                 if want {
-                    size += *len as usize;
+                    size += len as usize;
                 }
                 v.push((lsn, want));
             }
@@ -429,48 +458,47 @@ impl Store {
         let mut next = cursor.clone();
         let lsns: Vec<Lsn> = {
             let g = self.inner.lock();
-            let (Some(sl), Some(logs)) = (g.by_stream.get(stream), g.streams.get(stream)) else {
+            let Some(sl) = g.streams.get(stream) else {
                 return (vec![], next);
             };
-            let from = |log: &LogId| {
-                cursor
-                    .get(log)
-                    .copied()
-                    .unwrap_or_else(|| g.trimmed.get(log).copied().unwrap_or(0))
-            };
+            let from = |l: &Log| cursor.get(&l.id).copied().unwrap_or(l.trimmed);
             // start at the earliest LSN of an unread batch of any of the stream's logs
-            let start = logs
+            let start = sl
+                .logs
                 .iter()
-                .filter_map(|log| {
-                    let (map, c) = (g.logs.get(log)?, from(log));
-                    let e = map
+                .filter_map(|&ix| {
+                    let l = &g.logs[ix as usize];
+                    let c = from(l);
+                    let (_, e) = l
+                        .batches
                         .range(..=c)
                         .next_back()
-                        .filter(|(_, e)| e.shape.end > c)
-                        .or_else(|| map.range(c..).next());
-                    e?.1.lsn
+                        .filter(|(s, e)| **s + e.count as u64 > c)
+                        .or_else(|| l.batches.range(c..).next())?;
+                    e.durable().then_some(e.lsn)
                 })
                 .min();
             let Some(start) = start else {
                 return (vec![], next);
             };
             let (mut size, mut out, mut blocked) = (0usize, vec![], BTreeSet::new());
-            for (&lsn, (log, _, len)) in sl.order.range(start..g.contiguous.max(start)) {
+            for &lsn in sl.order.range(start..g.contiguous.max(start)).map(|x| x.0) {
                 if size >= max_bytes {
                     break;
                 }
-                let id = &g.order[&lsn].0;
-                let c = next.get(log).copied().unwrap_or_else(|| from(log));
-                let end = g.logs[log][&id.first_seq].shape.end;
-                if blocked.contains(log) || end <= c {
+                let (ix, len, first) = g.order[&lsn];
+                let l = &g.logs[ix as usize];
+                let c = next.get(&l.id).copied().unwrap_or_else(|| from(l));
+                let end = first + l.batches[&first].count as u64;
+                if blocked.contains(&ix) || end <= c {
                     continue;
                 }
-                if id.first_seq > c {
-                    blocked.insert(log.clone()); // its predecessor is not here yet
+                if first > c {
+                    blocked.insert(ix); // its predecessor is not here yet
                     continue;
                 }
-                next.insert(log.clone(), end);
-                size += *len as usize;
+                next.insert(l.id.clone(), end);
+                size += len as usize;
                 out.push(lsn);
             }
             out
@@ -486,27 +514,25 @@ impl Store {
     pub fn cursor_at(&self, stream: &str, time_ms: u64) -> Cursor {
         let g = self.inner.lock();
         let mut c = Cursor::new();
+        let Some(sl) = g.streams.get(stream) else {
+            return c;
+        };
         // the end (u64::MAX) is polled often: no batch is at or after it, so skip the scan
-        if let Some(sl) = g.by_stream.get(stream).filter(|_| time_ms != u64::MAX) {
-            for (lsn, (log, t, _)) in &sl.order {
+        if time_ms != u64::MAX {
+            for (lsn, t) in &sl.order {
+                let (ix, _, first) = g.order[lsn];
+                let log = &g.logs[ix as usize].id;
                 if *t >= time_ms && !c.contains_key(log) {
-                    c.insert(log.clone(), g.order[lsn].0.first_seq);
+                    c.insert(log.clone(), first);
                 }
             }
         }
-        for log in g.streams.get(stream).into_iter().flatten() {
-            if !c.contains_key(log) {
+        for &ix in &sl.logs {
+            let l = &g.logs[ix as usize];
+            if !c.contains_key(&l.id) {
                 // a log's batches are keyed by first seq and do not overlap: its last durable
                 // one ends furthest
-                let end = g
-                    .logs
-                    .get(log)
-                    .and_then(|m| m.values().rev().find_map(|e| e.lsn.map(|_| e.shape.end)));
-                c.insert(
-                    log.clone(),
-                    end.unwrap_or(0)
-                        .max(g.trimmed.get(log).copied().unwrap_or(0)),
-                );
+                c.insert(l.id.clone(), l.high().unwrap_or(0).max(l.trimmed));
             }
         }
         c
@@ -518,20 +544,19 @@ impl Store {
     pub fn live_start(&self, stream: Option<&str>) -> (Lsn, HashMap<LogId, u64>) {
         let g = self.inner.lock();
         let pos = g.contiguous;
-        let mut keys: BTreeSet<&LogId> = g.logs.keys().collect();
-        keys.extend(g.trimmed.keys());
-        let next = keys
-            .into_iter()
-            .filter(|l| stream.is_none_or(|s| l.stream == s))
+        let next = g
+            .logs
+            .iter()
+            .filter(|l| stream.is_none_or(|s| l.id.stream == s))
             .map(|l| {
-                let mut c = g.trimmed.get(l).copied().unwrap_or(0);
-                for (&s, e) in g.logs.get(l).into_iter().flatten() {
+                let mut c = l.trimmed;
+                for (&s, e) in &l.batches {
                     // durable out of LSN order at or past `pos`: the tail still returns it
-                    if s == c && e.lsn.is_some_and(|x| (..pos).contains(&x)) {
-                        c = e.shape.end;
+                    if s == c && e.durable() && e.lsn < pos {
+                        c = s + e.count as u64;
                     }
                 }
-                (l.clone(), c)
+                (l.id.clone(), c)
             })
             .collect();
         (pos, next)
@@ -541,9 +566,9 @@ impl Store {
     /// from `pos` does not return it).
     pub fn durable_below(&self, log: &LogId, seq: u64, pos: Lsn) -> Option<u64> {
         let g = self.inner.lock();
-        let e = g.logs.get(log)?.get(&seq)?;
+        let e = g.log(log)?.batches.get(&seq)?;
         // an LSN is set once durable
-        e.lsn.filter(|x| (..pos).contains(x)).map(|_| e.shape.end)
+        (e.durable() && e.lsn < pos).then_some(seq + e.count as u64)
     }
 
     /// The LSN a subscription "from now" starts at.
@@ -556,24 +581,12 @@ impl Store {
         (g.order.len() as u64, g.events, g.bytes)
     }
 
-    fn frontier_of(g: &Inner, log: &LogId) -> Frontier {
-        let trimmed = g.trimmed.get(log).copied().unwrap_or(0);
-        let contiguous = g.contig.get(log).copied().unwrap_or(0).max(trimmed);
-        let high = g
-            .logs
-            .get(log)
-            .and_then(|m| {
-                m.values()
-                    .rev()
-                    .find(|e| e.lsn.is_some())
-                    .map(|e| e.shape.end)
-            })
-            .unwrap_or(0)
-            .max(contiguous);
+    fn frontier_of(l: &Log) -> Frontier {
+        let contiguous = l.contig.max(l.trimmed);
         Frontier {
-            log: log.clone(),
+            log: l.id.clone(),
             contiguous,
-            high,
+            high: l.high().unwrap_or(0).max(contiguous),
         }
     }
 
@@ -582,23 +595,24 @@ impl Store {
     pub fn log_batches(&self, log: &LogId, from: u64, max_bytes: usize) -> Vec<bytes::Bytes> {
         let lsns: Vec<Lsn> = {
             let g = self.inner.lock();
-            let Some(map) = g.logs.get(log) else {
+            let Some(l) = g.log(log) else {
                 return vec![];
             };
-            let first = map
+            let first = l
+                .batches
                 .range(..=from)
                 .next_back()
-                .filter(|(_, e)| e.shape.end > from)
+                .filter(|(s, e)| **s + e.count as u64 > from)
                 .map_or(from, |(&s, _)| s);
             let mut size = 0usize;
             let mut out = vec![];
-            for e in map.range(first..).map(|(_, e)| e) {
+            for e in l.batches.range(first..).map(|(_, e)| e) {
                 if size >= max_bytes {
                     break;
                 }
-                if let Some(lsn) = e.lsn {
-                    size += e.shape.len as usize;
-                    out.push(lsn);
+                if e.durable() {
+                    size += e.len as usize;
+                    out.push(e.lsn);
                 }
             }
             out
@@ -610,12 +624,11 @@ impl Store {
 
     pub fn frontiers(&self, stream: Option<&str>) -> Vec<Frontier> {
         let g = self.inner.lock();
-        let mut keys: BTreeSet<&LogId> = g.logs.keys().collect();
-        keys.extend(g.trimmed.keys());
-        let mut v: Vec<_> = keys
-            .into_iter()
-            .filter(|l| stream.is_none_or(|s| l.stream == s))
-            .map(|l| Self::frontier_of(&g, l))
+        let mut v: Vec<_> = g
+            .logs
+            .iter()
+            .filter(|l| stream.is_none_or(|s| l.id.stream == s))
+            .map(Self::frontier_of)
             .filter(|f| f.high > 0)
             .collect();
         v.sort_by(|a, b| a.log.cmp(&b.log));
@@ -633,16 +646,12 @@ impl Store {
             let g = self.inner.lock();
             let mut lsns = vec![];
             let mut cov = vec![];
-            if let Some(logs) = g.streams.get(stream) {
-                for l in logs {
-                    cov.push(Self::frontier_of(&g, l));
-                    for e in g.logs.get(l).into_iter().flat_map(|m| m.values()) {
-                        if let (State::Durable, Some(lsn)) = (*e.state.borrow(), e.lsn) {
-                            lsns.push(lsn);
-                        }
-                    }
-                }
+            for &ix in g.streams.get(stream).into_iter().flat_map(|s| &s.logs) {
+                let l = &g.logs[ix as usize];
+                cov.push(Self::frontier_of(l));
+                lsns.extend(l.batches.values().filter(|e| e.durable()).map(|e| e.lsn));
             }
+            cov.sort_by(|a, b| a.log.cmp(&b.log));
             (lsns, cov)
         };
         let mut out: Vec<Event> = lsns
@@ -748,6 +757,37 @@ mod tests {
             t.s.reserve(&b("w", 2, 0, &[(1, b"zz")])),
             Reserve::New
         ));
+    }
+
+    #[test]
+    fn a_duplicate_of_a_pending_batch_learns_how_it_ends() {
+        // a retry arriving while the first copy is still being written waits for that write:
+        // it must hear the outcome, durable or failed, not hang or assume
+        let mut t = store();
+        let a = b("w", 1, 0, &[(1, b"a")]);
+        let c = b("w", 1, 1, &[(1, b"c")]);
+        for x in [&a, &c] {
+            assert!(matches!(t.s.reserve(x), Reserve::New));
+        }
+        let (Reserve::Duplicate(mut ra), Reserve::Duplicate(mut rc)) =
+            (t.s.reserve(&a), t.s.reserve(&c))
+        else {
+            panic!("expected duplicates");
+        };
+        assert_eq!(*ra.borrow_and_update(), State::Pending);
+        t.durable(&a);
+        assert_eq!(*ra.borrow(), State::Durable);
+        t.s.mark_failed(&c.id);
+        assert_eq!(*rc.borrow_and_update(), State::Failed);
+        assert!(
+            matches!(t.s.reserve(&c), Reserve::New),
+            "a failed write is retried"
+        );
+        t.s.mark_failed(&a.id);
+        assert!(
+            t.s.has(&a.id, batch_crc(&a.bytes)),
+            "a durable batch never fails"
+        );
     }
 
     #[test]
