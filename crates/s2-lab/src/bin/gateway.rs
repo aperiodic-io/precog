@@ -214,8 +214,9 @@ impl App {
             seq_num: t,
             timestamp: ts,
         });
-        let (tx, rx) = mpsc::channel(1024);
-        let (live, _) = broadcast::channel(1024);
+        let (tx, rx) = mpsc::channel(64);
+        // small: a lagging follower falls back to reading the mesh
+        let (live, _) = broadcast::channel(16);
         let s = Arc::new(Stream {
             tx,
             tail,

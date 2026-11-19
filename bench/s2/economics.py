@@ -35,8 +35,8 @@ HZ_OBJECT_EUR_TB = 6.35   # Hetzner Object Storage beyond the base (single site,
 EUR_PER_EXTRA_NVME_TB = 170 / 7.68  # 7.68 TB NVMe DC add-on, EUR 170/month
 
 # Capacity, measured here (results/compare.md, results/s2.md) on 2.1 GHz Xeon vCPUs
-CPU_US_REC_NATIVE = 1.38  # broker CPU per acked record, 3 nodes, 3 copies, ~230 B, native protocol
-CPU_US_REC_GATEWAY = 2.0  # S2 REST/JSON gateway per record at 256 B (results/s2.md: gw-none)
+CPU_US_REC_NATIVE = 5.17  # 3 nodes, 3 copies, acked at 2, 256 B uncompressed (results/s2.md: precog3 6.92 - gw-none 1.75)
+CPU_US_REC_GATEWAY = 1.75  # S2 REST/JSON gateway per record at 256 B, 100 per append (results/s2.md: gw-none)
 CPU_US_PER_KIB = 1.0      # model: copies, CRCs and JSON per KiB beyond the measured size
 LINK_GBPS = 10            # with the 10G uplink add-on
 DISK_FILL = 0.8           # usable share of disks
