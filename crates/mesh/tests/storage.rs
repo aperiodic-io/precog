@@ -130,6 +130,8 @@ fn omitted_config_fields_take_production_defaults() {
     assert_eq!(c.tail_cache_bytes, 64 << 20);
     assert_eq!(c.retention_interval_ms, 10_000);
     assert_eq!((c.retention_bytes, c.retention_ms), (None, None));
+    // write caching is opt-in; once on, it flushes at Redpanda's 256 KiB of unsynced data
+    assert_eq!((c.flush_delay_ms, c.flush_bytes), (0, 256 << 10));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
