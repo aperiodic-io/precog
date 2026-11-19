@@ -64,13 +64,11 @@ fn now_ms() -> u64 {
 }
 
 impl Wal {
-    /// Opens (and recovers) the segment log and starts the writer thread. Returns the index
-    /// entries of every retained record, for rebuilding the node's metadata.
-    pub fn open(cfg: Config) -> Result<(Wal, Vec<precog_storage::Entry>)> {
+    /// Opens (and recovers) the segment log and starts the writer thread.
+    pub fn open(cfg: Config) -> Result<Wal> {
         let caching = cfg.flush_delay_ms > 0;
         let log = precog_storage::Log::open(cfg)?;
         let reader = log.reader();
-        let entries = reader.entries(reader.first_lsn(), usize::MAX);
         let (tx, rx) = std::sync::mpsc::channel::<Req>();
         let stats = Arc::new(WalStats::default());
         let s = log.stats();
@@ -88,17 +86,14 @@ impl Wal {
                 .name("precog-wal".into())
                 .spawn(move || writer(log, rx, stats, fatal))?;
         }
-        Ok((
-            Wal {
-                tx,
-                log,
-                caching,
-                stats,
-                fatal,
-                reader,
-            },
-            entries,
-        ))
+        Ok(Wal {
+            tx,
+            log,
+            caching,
+            stats,
+            fatal,
+            reader,
+        })
     }
 
     /// Resolves with the batch's LSN once it is on stable storage.
@@ -345,7 +340,7 @@ mod tests {
         let mut c = Config::new(dir.path());
         c.segment_size = 1 << 20;
         c.flush_delay_ms = flush_delay_ms;
-        let (wal, _) = Wal::open(c).unwrap();
+        let wal = Wal::open(c).unwrap();
         let log = LogId {
             stream: "s".into(),
             writer: "w".into(),
@@ -357,6 +352,7 @@ mod tests {
         let flags: Vec<bool> = wal
             .reader
             .entries(0, 10)
+            .unwrap()
             .iter()
             .map(|e| decode_record_key(&e.meta.key).unwrap().1)
             .collect();

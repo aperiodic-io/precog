@@ -377,26 +377,15 @@ impl Node {
         anyhow::ensure!(cfg.id < 32, "node id must be < 32");
         anyhow::ensure!(cfg.peers.len() <= 31, "too many peers");
         std::fs::create_dir_all(&cfg.data_dir)?;
-        let (wal, entries) = Wal::open(cfg.storage())?;
-        let n = entries.len();
+        let wal = Wal::open(cfg.storage())?;
         let mut dedup = cfg
             .dedup_window_ms
             .map(|w| Streams::new(w.div_ceil(1000).max(1), 3, cfg.dedup_max_entries));
-        // the last window of the log rebuilds the index (bounded: the window, not the log)
-        let recent: Vec<_> = match cfg.dedup_window_ms {
-            Some(w) => {
-                let since = (now_s() * 1000).saturating_sub(w);
-                entries
-                    .iter()
-                    .filter(|e| e.meta.time_ms >= since)
-                    .map(|e| e.lsn)
-                    .collect()
-            }
-            None => vec![],
-        };
+        let since = cfg
+            .dedup_window_ms
+            .map(|w| (now_s() * 1000).saturating_sub(w));
         // compacted streams: their snapshots, then whatever the log holds that is newer
         let mut compact: HashMap<String, Compacted> = HashMap::new();
-        let mut replay = vec![];
         let compacted = cfg
             .streams
             .iter()
@@ -411,12 +400,18 @@ impl Node {
             };
             compact.insert(name.to_string(), m);
         }
-        for e in &entries {
+        // the store's one pass over the log's index: the dedup window's batches rebuild its
+        // index, the compacted streams' replay (bounded: those, not the log)
+        let (mut recent, mut replay) = (vec![], vec![]);
+        let store = Store::load_with(wal.reader.clone(), |e| {
+            if since.is_some_and(|s| e.meta.time_ms >= s) {
+                recent.push(e.lsn);
+            }
             if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
                 replay.push(e.lsn);
             }
-        }
-        let store = Store::load(wal.reader.clone(), entries)?;
+        })?;
+        let n = store.totals().0;
         for lsn in replay {
             if let Some(r) = wal.reader.read(lsn)? {
                 let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
@@ -638,6 +633,8 @@ impl Node {
     }
 
     pub async fn apply_retention(&self) -> Result<()> {
+        // sealed segments' batches leave RAM (their index is on disk)
+        self.store.absorb();
         self.write_snapshots()?;
         let now = crate::store::now_ms();
         for (name, s) in &self.cfg.streams {
@@ -717,13 +714,11 @@ impl Node {
                 .sum();
             let labels = format!("group=\"{group}\",stream=\"{stream}\"");
             out.push_str(&format!("precog_group_lag_events{{{labels}}} {lag}\n"));
-            if let Some(e) = self
-                .wal
-                .reader
-                .entries(lsn, 1)
-                .first()
-                .filter(|e| e.lsn == lsn)
-            {
+            let at = self.wal.reader.entries(lsn, 1).unwrap_or_else(|e| {
+                tracing::error!("reading the log's index at lsn {lsn}: {e}");
+                vec![]
+            });
+            if let Some(e) = at.first().filter(|e| e.lsn == lsn) {
                 let age = now.saturating_sub(e.meta.time_ms) / 1000;
                 out.push_str(&format!(
                     "precog_group_commit_age_seconds{{{labels}}} {age}\n"
@@ -1165,7 +1160,7 @@ impl Node {
         match Wal::durable(rx).await {
             Ok(lsn) => {
                 self.compacted_durable(batch, lsn);
-                self.store.mark_durable(&batch.id, lsn);
+                self.store.mark_durable(batch, lsn);
                 Ok(Local::Stored)
             }
             Err(e) => {
@@ -1186,7 +1181,7 @@ impl Node {
                     return match self.wal.append(batch.clone()).await {
                         Ok(lsn) => {
                             self.compacted_durable(batch, lsn);
-                            self.store.mark_durable(&batch.id, lsn);
+                            self.store.mark_durable(batch, lsn);
                             Ok(Local::Stored)
                         }
                         Err(e) => {
@@ -1208,6 +1203,7 @@ impl Node {
                     }
                 },
                 Reserve::Conflict(e) => return Ok(Local::Conflict(e)),
+                Reserve::Error(e) => bail!(e),
                 Reserve::Expired => {
                     return Ok(Local::Conflict(format!(
                         "{:?} seq {} is below the retention floor",
