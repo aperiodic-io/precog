@@ -10,6 +10,7 @@ the `formal` job on each pull request, bigger bounds in `nightly.yml`.
 | Decoders of records, manifest slots and index files | Kani | Bounded proofs over every byte pattern, at the code itself | `#[cfg(kani)] mod proofs` in `crates/storage/src/{record,log}.rs` |
 | Leaderless appends at k of n, failure domains, retries, conflicts, repair, dedup, write caching, `Client::end` | TLA+ / TLC | The protocol's failure modes are interleavings of messages, power losses and disk losses across nodes | `spec/mesh/Replication.tla` |
 | Reader-group positions and compacted streams across nodes; cursor reads with failover | TLA+ / TLC | Commits and batches reach nodes in any order | `spec/consumers/Positions.tla` |
+| Live subscriptions: the start point, per-log order, held batches | TLA+ / TLC | Batches become durable out of order around the moment a feed starts | `spec/livefeed/LiveFeed.tla` |
 | Wire codecs: batches (every format), acks, append and replicate bodies, log keys, compacted-stream snapshots | proptest | The bytes come from the network or the disk; Kani does not finish them (below) | `mod props` in `crates/mesh/src/{proto,node}.rs` |
 
 Run them:
@@ -250,6 +251,38 @@ values older than any event. Test: `a_node_that_gets_two_commits_newest_first_se
 Known ceiling: two commits through two nodes closer together than the nodes' clock skew may
 keep the earlier one (an order from the reader would remove it).
 
+## Live subscriptions: `spec/livefeed/LiveFeed.tla`
+
+**Models.** A live (not from-the-start) subscription to one node, for one writer log whose
+batches become durable there in any order: `Store::live_start` (the start position, and the end
+of the log's run below it), the empty push that confirms the start before `subscribe` returns,
+`push_loop` reading the durable order from the start, `in_log_order` holding a batch until its
+predecessor came, and the client's `Subscription::accept` joining the log at the first batch it
+sees and holding batches out of order.
+
+**Abstracts away.** Several logs and streams (each log is handled on its own), retention during
+a feed, `max_bytes` paging of `tail`, the wake-up (`Notify`) between appends and the feed (the
+feed re-reads from its position on every wake-up, so a late wake-up only delays it).
+
+**Properties.** `InOrder` (the client delivers consecutive sequences) and `NothingStuck` (once
+every batch arrived and the feed caught up, nothing is held on either side and every batch made
+durable after `subscribe` returned was delivered: the start point is confirmed).
+
+| Config | Bounds | Distinct states |
+|---|---|---|
+| `MC_livefeed` | 5 batches, any durable order, subscribe at any point | 10,461 |
+| `Nightly_livefeed` | 7 batches | 906,177 |
+| `MC_livefeed_skip` (expect) | the feed before the fix: `NothingStuck` fails | |
+
+**Found and fixed.** The feed skipped batches made durable before it started, including ones
+behind a gap in their log. When the gap filled, it pushed the gap's batch, skipped the next
+(durable before the start), and pushed the one after; the client, which takes a log in
+sequence from the first batch it sees, held that one and every later batch of the log for good.
+A node makes a log durable out of order whenever a producer has several batches in flight
+(the SDK keeps 8) or repair fills a hole. Now a batch durable before the start that follows the
+gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_everything_after_it`
+(failed first: the feed stalled after batch 2).
+
 ## Not verified, and why
 
 - **Loom for the storage write path.** One OS thread owns the `Log`; other threads only read
@@ -257,6 +290,10 @@ keep the earlier one (an order from the reader would remove it).
   There is no lock-free protocol for Loom to explore, and the publication order (`next_lsn`
   stored after the entries) is a single release store, covered by
   `readers_see_appends_concurrently_and_hit_the_tail_cache`.
+- **Loom for the live feed.** The feed waits on a `tokio::sync::Notify` (registered before it
+  checks the store, the documented no-lost-wakeup pattern) and re-reads the store from its
+  position on every wake-up; Loom does not model tokio's primitives, and the model above covers
+  what the feed computes from the store, at every interleaving of appends with it.
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.

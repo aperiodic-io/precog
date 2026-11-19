@@ -670,6 +670,40 @@ fn an_address_prints_as_configured() {
     assert_eq!(a.to_string(), "tcp://127.0.0.1:7001");
 }
 
+/// A live feed that joins a log behind a gap (a node made its batches durable out of order, as
+/// pipelined appends and repair do) must carry the batches past the gap once it fills: the
+/// client joins the log at the first batch it sees and waits for each next one in sequence.
+/// The feed used to skip batches durable before it started, so the client held everything
+/// after them for good. Found by spec/livefeed (MC_livefeed_skip).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_feed_that_joins_behind_a_gap_delivers_everything_after_it() {
+    let c = cluster(1, &["a"]);
+    let node = start(&c, 0).await;
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let b = |seq: u64| Batch::encode(&log, seq, &[(seq, b"x")]).unwrap();
+    for seq in [0, 1, 3] {
+        assert!(node.append(1, b(seq)).await.is_success());
+    }
+    let mut sub = mc.subscribe(0, Some("s"), false).await.unwrap();
+    for seq in [2, 4] {
+        assert!(node.append(1, b(seq)).await.is_success());
+    }
+    let mut got = vec![];
+    while got.len() < 3 {
+        let next = tokio::time::timeout(Duration::from_secs(2), sub.next()).await;
+        let Ok(Some(Ok(batch))) = next else {
+            panic!("the feed stalled after {got:?}");
+        };
+        got.push(batch.id.first_seq);
+    }
+    assert_eq!(got, vec![2, 3, 4]);
+}
+
 /// The bytes node `n` holds at batch identity `id`, if any.
 async fn held(mc: &MeshClient, n: usize, id: &BatchId) -> Option<Bytes> {
     let c = Control::Fetch {

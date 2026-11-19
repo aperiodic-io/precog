@@ -919,8 +919,9 @@ impl Node {
         }
     }
 
-    /// A live feed's batches in log order: `b` and whatever it releases, or nothing while its
-    /// predecessor is missing. A batch already below the feed's start was never due.
+    /// A live feed's batches in log order: `b` and whatever it releases (held batches, and ones
+    /// durable before the feed began that follow it), or nothing while its predecessor is
+    /// missing. A batch below where the feed joined its log was never due.
     fn in_log_order(
         &self,
         start: precog_storage::Lsn,
@@ -943,6 +944,14 @@ impl Node {
         let h = held.entry(log.clone()).or_default();
         loop {
             if let Some(end) = self.store.durable_below(&log, *n, start) {
+                // durable before the feed began, but past the gap the feed joined the log at:
+                // the client takes the log in sequence from the first batch it saw, so it is
+                // due (skipping it stalled the log on the client for good: spec/livefeed)
+                let id = BatchId {
+                    log: log.clone(),
+                    first_seq: *n,
+                };
+                out.extend(self.store.get(&id));
                 *n = end;
             } else if let Some(b) = h.remove(n) {
                 *n = b.end_seq();
