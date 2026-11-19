@@ -775,8 +775,7 @@ impl Log {
             inflight: 0,
         };
 
-        let unsynced = (log.cfg.flush_delay_ms > 0)
-            .then(|| log.cfg.flush_bytes.saturating_add(MAX_GROUP as u64));
+        let unsynced = (log.cfg.flush_delay_ms > 0).then(|| Log::unsynced_bound(&log.cfg));
         // Sealed segments: drop ones missing at the head (retention whose manifest write was lost),
         // load their indexes (or rebuild them).
         let mut segs: Vec<Arc<Seg>> = vec![];
@@ -1418,7 +1417,7 @@ fn write_index(dir: &Path, seg: &Seg) -> Result<()> {
 /// record and decides between a torn tail (truncate) and interior damage (error).
 ///
 /// `unsynced`: with write caching, at most this many bytes at the end can have been unsynced at
-/// a crash (`flush_bytes` + one group), and the kernel writes them back in any order. Damage
+/// a crash (`Log::unsynced_bound`), and the kernel writes them back in any order. Damage
 /// followed only by records within that bound is that tail, partly lost: it is dropped as a
 /// whole (none of it was acknowledged on this node's fsync). Found by spec/storage.
 fn scan(
