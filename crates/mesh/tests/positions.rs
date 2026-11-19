@@ -103,12 +103,23 @@ async fn a_node_that_gets_two_commits_newest_first_serves_the_newest() {
         node.position("archiver", "raw.trades.x"),
         Some(cursor(&[("a", 12)]))
     );
+    // a commit through this node, a second after another node's, wins (times are in us)
+    let now_us = precog_mesh::store::now_ms() * 1000;
+    let before = commit_batch(9, 0, now_us - 1_000_000, &[("a", 20)]);
+    assert!(node.append(1, before).await.is_success());
+    node.commit_position("archiver", "raw.trades.x", &cursor(&[("a", 30)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        node.position("archiver", "raw.trades.x"),
+        Some(cursor(&[("a", 30)]))
+    );
     node.apply_retention().await.unwrap(); // writes the snapshots
     drop(node);
     // and the same after a restart, from the snapshot and the log
     let node = Node::open(config(d.path())).await.unwrap();
     assert_eq!(
         node.position("archiver", "raw.trades.x"),
-        Some(cursor(&[("a", 12)]))
+        Some(cursor(&[("a", 30)]))
     );
 }

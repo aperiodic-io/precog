@@ -222,7 +222,7 @@ pub struct Node {
     /// This node's writer log for consumer-position commits (a new epoch per boot).
     pos_log: LogId,
     pos_seq: AtomicU64,
-    /// The event time (us) of this node's last position commit: commits get increasing times.
+    /// The event time (us) of this node's last position commit: it never goes back.
     pos_time: AtomicU64,
 }
 
@@ -552,19 +552,15 @@ impl Node {
         let payload = serde_json::to_vec(&entries)?;
         let seq = self.pos_seq.fetch_add(1, Ordering::Relaxed);
         // the commit time orders commits across nodes (the newest wins everywhere); on this node
-        // it only increases. ponytail: commits through two nodes closer together than their
-        // clock skew may keep the earlier one; an order from the reader if that matters.
+        // it never goes back (equal times fall to the sequence). ponytail: commits through two
+        // nodes closer together than their clock skew may keep the earlier one; an order from
+        // the reader if that matters.
         let now = crate::store::now_ms() * 1000;
-        let prev = self
-            .pos_time
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
-                Some(now.max(t + 1))
-            })
-            .unwrap();
+        let time = self.pos_time.fetch_max(now, Ordering::Relaxed).max(now);
         let b = Batch::encode_keyed(
             &self.pos_log,
             seq,
-            &[(now.max(prev + 1), &position_key(group, stream), &payload)],
+            &[(time, &position_key(group, stream), &payload)],
         )?;
         let copies = (1 + self.targets().len()).min(2) as u8;
         let ack = self.append(copies, b).await;
