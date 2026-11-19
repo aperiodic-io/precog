@@ -6,7 +6,7 @@
 //! (`precog_storage::Error::Fatal`) sets `fatal`: every later append fails, and the node
 //! must restart and recover.
 
-use crate::proto::{Batch, batch_crc, encode_log_key};
+use crate::proto::{Batch, encode_log_key};
 use anyhow::{Result, bail};
 use precog_storage::record::Meta;
 use precog_storage::{Config, Lsn, Reader};
@@ -87,6 +87,11 @@ impl Wal {
 
     /// Resolves with the batch's LSN once it is on stable storage.
     pub async fn append(&self, batch: Batch) -> Result<Lsn> {
+        Self::durable(self.submit(batch)?).await
+    }
+
+    /// Queues the batch: batches reach the log in the order they are submitted.
+    pub fn submit(&self, batch: Batch) -> Result<oneshot::Receiver<Result<Lsn, String>>> {
         if self.fatal.load(Ordering::Acquire) {
             bail!("storage is fenced after a fatal error");
         }
@@ -94,6 +99,11 @@ impl Wal {
         self.tx
             .send(Req::Append { batch, done })
             .map_err(|_| anyhow::anyhow!("wal writer stopped"))?;
+        Ok(rx)
+    }
+
+    /// Waits for a submitted batch's LSN.
+    pub async fn durable(rx: oneshot::Receiver<Result<Lsn, String>>) -> Result<Lsn> {
         match rx.await {
             Ok(Ok(lsn)) => Ok(lsn),
             Ok(Err(e)) => bail!("storage: {e}"),
@@ -174,7 +184,7 @@ fn writer(
                     key: encode_log_key(&b.id.log),
                     first_seq: b.id.first_seq,
                     count: b.count,
-                    tag: batch_crc(&b.bytes),
+                    tag: b.ident,
                     time_ms: t,
                 };
                 (meta, &b.bytes[..])

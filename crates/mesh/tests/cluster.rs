@@ -381,6 +381,33 @@ async fn live_subscribers_receive_everything_in_writer_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replicas_dedup_index_is_warm_so_a_failover_still_drops_duplicates() {
+    // Producer replica a's events land on node 0 and are replicated; replica b's copies then
+    // reach node 1 (as after node 0 fails): node 1 drops them, having recorded a's ids.
+    let c = cluster(3, &["a", "b", "c"]);
+    let nodes: Vec<_> = futures::future::join_all((0..3).map(|i| start(&c, i))).await;
+    let mc = client(&c).await;
+    let log = |w: &str| LogId {
+        stream: "raw.trades.x".into(),
+        writer: w.into(),
+        epoch: 1,
+    };
+    let a = Batch::encode_keyed(&log("a"), 0, &[(1, b"t1", b"x"), (2, b"t2", b"y")]).unwrap();
+    mc.append(0, &a, 3).await.unwrap();
+    let b = Batch::encode_keyed(&log("b"), 0, &[(1, b"t2", b"y"), (3, b"t3", b"z")]).unwrap();
+    let r = mc.append(1, &b, 3).await.unwrap();
+    assert_eq!(r.node, 1);
+    let (evs, _) = nodes[1].store.read("raw.trades.x", 0, 100);
+    let mut got: Vec<_> = evs
+        .iter()
+        .map(|e| (e.writer.clone(), e.payload.clone()))
+        .collect();
+    got.sort();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert!(nodes[1].status().dedup_dropped >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_subscriber_gets_a_logs_batches_that_land_out_of_order() {
     // A replica can store a log's seq 1 before seq 0 (its replicate requests run
     // concurrently). A subscriber that was already listening must still get seq 0: the feed
