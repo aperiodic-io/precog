@@ -476,4 +476,21 @@ async fn a_cursor_read_over_rpc_answers_in_frames_that_fit() {
         "{}",
         f.body.len()
     );
+    // a reader's cursor is honoured: from seq 19 only the last batch comes back
+    let read = Control::ReadCursor {
+        stream: "s".into(),
+        cursor: vec![("w".to_string(), 1, 19)],
+        max_bytes: u32::MAX,
+    };
+    let f = mc
+        .call(
+            0,
+            Kind::Control,
+            Bytes::from(serde_json::to_vec(&read).unwrap()),
+        )
+        .await
+        .unwrap();
+    let len = u32::from_le_bytes(f.body[..4].try_into().unwrap()) as usize;
+    assert_eq!(f.body.len(), 4 + len, "one batch");
+    assert_eq!(Batch::parse(f.body.slice(4..)).unwrap().id.first_seq, 19);
 }
