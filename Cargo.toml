@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/storage", "crates/mesh", "crates/bench", "crates/storage-bench", "crates/lab", "crates/client", "crates/harness"]
+exclude = ["crates/s2-lab"]
 
 [workspace.package]
 edition = "2024"

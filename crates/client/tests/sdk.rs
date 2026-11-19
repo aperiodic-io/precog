@@ -147,6 +147,31 @@ async fn replicas_publish_the_same_events_and_a_reader_sees_each_once_in_writer_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poll_is_empty_only_when_caught_up_even_past_a_batch_dedup_emptied() {
+    // replica b's copy of a's event is a batch with every event dropped by dedup; a reader in
+    // small steps reaches it, and an empty poll there would read as "caught up" before b's next
+    let c = cluster(&[0, 1, 2]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    let (mut a, mut b) = (client.producer("s", "a"), client.producer("s", "b"));
+    a.send(1, b"id0", b"t0");
+    a.sync().await.unwrap();
+    b.send(2, b"id0", b"t0");
+    b.sync().await.unwrap();
+    b.send(3, b"id1", b"t1");
+    b.sync().await.unwrap();
+    let mut r = client.consumer("s", "g", Start::Beginning).await.unwrap();
+    let mut got = vec![];
+    loop {
+        let evs = r.poll(1).await.unwrap();
+        if evs.is_empty() {
+            break;
+        }
+        got.extend(evs);
+    }
+    assert_eq!(names(&got), ["t0", "t1"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_committed_position_resumes_on_another_node_losing_and_repeating_nothing() {
     let c = cluster(&[1, 2]).await; // node 0 is down: every client fails over
     let client = Client::connect(&c.addrs, "tok").unwrap();

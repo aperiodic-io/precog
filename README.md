@@ -6,8 +6,8 @@ any append, and an append is acknowledged once 2 of 3 nodes hold it. No consensu
 and no partition has a leader to fail over.
 
 On the same machine, the same workload and the same durability, Precog beats the Redpanda build
-live-ingestion runs by **4.4–4.8x on throughput** and **3.9–7.4x on ack latency**, using **2.3–3.0x
-less broker CPU per record** ([results](#results-against-redpanda)).
+live-ingestion runs by **3.1–4.8x on throughput** and **2.8–4.2x on median ack latency** (3–7.4x at p99), using
+**2.3–3.0x less broker CPU per record** ([results](#results-against-redpanda)).
 
 Design and guarantees: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Plan of record:
 [docs/PLAN.md](docs/PLAN.md).
@@ -69,15 +69,19 @@ At these caps the load generator saturates before the brokers, which run at 25�
 The write-caching row predates appends on the worker thread (#16): in an A/B on a smaller-segment setup, that change cut
 broker CPU per record by 6.9% under write caching and left fsync-per-ack unchanged (`results/compare.md`).
 
+Re-measured on main after #16 and #25, on the same VM when it ran slower, the ratios were 3.2x throughput, 2.8x p50, 4.7x
+p99 and 2.7x CPU per record with write caching, and 3.1x, 2.8x, 3.0x and 2.4x with an fsync before every ack
+(`results/compare.md`, "Re-measured on main after #16 and #25").
+
 With every broker capped at 0.5 CPU, so the brokers are the bottleneck:
 - Precog does 3.1x the throughput and 8x lower p99.
 - It uses 2.4–2.6x less CPU per record.
 
 Dedup drops exactly the resent share on both systems (Redpanda 19.99%).
 
-Where Precog's CPU goes and what was tried to lower it is also in `results/compare.md`. CPU per record is the one ratio not clearly above 3x:
-- it is 3.0x with write caching, with no margin;
-- it is 2.3x with an fsync before every ack.
+Where Precog's CPU goes and what was tried to lower it is also in `results/compare.md`. CPU per record is the one ratio below 3x:
+- it is 2.7–3.0x with write caching;
+- it is 2.3–2.4x with an fsync before every ack.
 
 ## The wire protocol
 

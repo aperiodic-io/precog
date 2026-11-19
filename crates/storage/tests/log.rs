@@ -431,7 +431,7 @@ fn readers_see_appends_concurrently_and_hit_the_tail_cache() {
     assert!(log.stats().cache_hits > 0, "{:?}", log.stats());
 }
 
-mod property {
+mod props {
     use super::*;
     use proptest::prelude::*;
 
@@ -520,7 +520,7 @@ fn segments_missing_at_the_head_count_as_retained() {
     ));
 }
 
-mod flips {
+mod props_flips {
     use super::*;
     use proptest::prelude::*;
 
@@ -2144,4 +2144,208 @@ fn a_record_s_append_time_is_read_from_its_index() {
     assert_eq!(r.time_ms(300).unwrap(), None, "not written");
     log.retain(Some(3 * 64 * KB), None).unwrap();
     assert_eq!(r.time_ms(0).unwrap(), None, "dropped");
+}
+
+/// Model-based test: random appends, flushes, retention by size and age, cache drops, lost
+/// index files and reopens against a list of records. After every step every read API
+/// (`read`, `entries`, `sealed`, `by_key`) agrees with the model.
+mod model {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// records of (key 0..3, payload bytes), time step
+        Append(Vec<(u8, usize)>, u64),
+        Flush,
+        RetainBytes(u64),
+        RetainAge(u64),
+        ClearCache,
+        /// drop one sealed segment's index file, then reopen
+        LoseIndex(prop::sample::Index),
+        Reopen,
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        let rec = (0u8..3, 0usize..1500);
+        prop::collection::vec(
+            prop_oneof![
+                8 => (prop::collection::vec(rec, 1..4), 0u64..50).prop_map(|(r, t)| Op::Append(r, t)),
+                1 => Just(Op::Flush),
+                1 => (8u64..64).prop_map(|k| Op::RetainBytes(k * KB)),
+                1 => (0u64..2000).prop_map(Op::RetainAge),
+                1 => Just(Op::ClearCache),
+                1 => any::<prop::sample::Index>().prop_map(Op::LoseIndex),
+                1 => Just(Op::Reopen),
+            ],
+            1..40,
+        )
+    }
+
+    struct Model {
+        recs: Vec<(Meta, Vec<u8>)>,
+        first: u64,
+        time: u64,
+    }
+
+    fn check(log: &Log, m: &Model) -> Result<(), TestCaseError> {
+        let r = log.reader();
+        prop_assert_eq!(log.next_lsn(), m.recs.len() as u64);
+        prop_assert_eq!(log.first_lsn(), m.first);
+        for (l, (meta, p)) in m.recs.iter().enumerate() {
+            let got = r.read(l as u64).unwrap();
+            if (l as u64) < m.first {
+                prop_assert!(got.is_none(), "lsn {} below the floor", l);
+                continue;
+            }
+            let got = got.unwrap();
+            prop_assert_eq!(&got.meta, meta);
+            prop_assert_eq!(&got.payload[..], &p[..]);
+        }
+        let all = r.entries(0, usize::MAX).unwrap();
+        let want: Vec<u64> = (m.first..m.recs.len() as u64).collect();
+        prop_assert_eq!(all.iter().map(|e| e.lsn).collect::<Vec<_>>(), want);
+        for e in &all {
+            prop_assert_eq!(&e.meta, &m.recs[e.lsn as usize].0);
+        }
+        // the sealed segments tile the log from its floor, and each one's by-key lookup holds
+        // exactly its records of that key, by first_seq
+        let mut at = m.first;
+        for (base, end) in r.sealed() {
+            prop_assert_eq!(base, at);
+            prop_assert!(end > base && end <= m.recs.len() as u64);
+            for k in 0u8..4 {
+                let key = format!("k{k}").into_bytes();
+                let got: Vec<u64> = r
+                    .by_key(base, &key)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.lsn)
+                    .collect();
+                let mut want: Vec<u64> = (base..end)
+                    .filter(|&l| m.recs[l as usize].0.key == key)
+                    .collect();
+                want.sort_by_key(|&l| (m.recs[l as usize].0.first_seq, l));
+                prop_assert_eq!(got, want, "segment {} key {}", base, k);
+            }
+            at = end;
+        }
+        prop_assert!(
+            r.by_key(at, b"k0").unwrap().is_empty(),
+            "the active segment has no index"
+        );
+        Ok(())
+    }
+
+    fn run(caching: bool, ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = cfg(d.path(), 16 * KB);
+        c.tail_cache_bytes = 8 * KB as usize;
+        if caching {
+            c.flush_delay_ms = 1_000;
+            c.flush_bytes = 4 * KB;
+        }
+        let mut log = Log::open(c.clone()).unwrap();
+        let mut m = Model {
+            recs: vec![],
+            first: 0,
+            time: 1_000,
+        };
+        for op in ops {
+            match op {
+                Op::Append(rs, dt) => {
+                    m.time += dt;
+                    let items: Vec<(Meta, Vec<u8>)> = rs
+                        .iter()
+                        .map(|&(k, n)| {
+                            let i = m.recs.len() as u64;
+                            // first_seq descends within a key so by_key's order is not LSN order
+                            let meta = Meta {
+                                key: format!("k{k}").into_bytes(),
+                                first_seq: u64::MAX - i,
+                                count: 1,
+                                tag: i as u32,
+                                time_ms: m.time,
+                            };
+                            (meta, payload(i, n))
+                        })
+                        .collect();
+                    let refs: Vec<(Meta, &[u8])> =
+                        items.iter().map(|(a, p)| (a.clone(), &p[..])).collect();
+                    let first = log.append(&refs).unwrap();
+                    prop_assert_eq!(first, m.recs.len() as u64);
+                    m.recs.extend(items);
+                }
+                Op::Flush => log.flush().unwrap(),
+                Op::RetainBytes(max) => {
+                    let sealed = log.reader().sealed();
+                    let floor = log.retain(Some(max), None).unwrap();
+                    prop_assert!(floor >= m.first);
+                    prop_assert!(
+                        floor == m.first || sealed.iter().any(|s| s.1 == floor),
+                        "the floor moves to a segment boundary"
+                    );
+                    let left = log.reader().sealed();
+                    prop_assert!(
+                        left.is_empty() || log.stats().log_bytes <= max,
+                        "sealed segments remain past the budget: {:?}",
+                        log.stats()
+                    );
+                    m.first = floor;
+                }
+                Op::RetainAge(age) => {
+                    let t = m.time.saturating_sub(age);
+                    let sealed = log.reader().sealed();
+                    let floor = log.retain(None, Some(t)).unwrap();
+                    // exactly the leading run of sealed segments whose records are all older
+                    let old = |s: &(u64, u64)| (s.0..s.1).all(|l| m.recs[l as usize].0.time_ms < t);
+                    let want = sealed
+                        .iter()
+                        .take_while(|s| old(s))
+                        .last()
+                        .map_or(m.first, |s| s.1);
+                    prop_assert_eq!(floor, want.max(m.first));
+                    m.first = floor;
+                }
+                Op::ClearCache => log.reader().clear_cache(),
+                Op::LoseIndex(i) => {
+                    let sealed = log.reader().sealed();
+                    drop(log);
+                    let idx: Vec<_> = segment_files(d.path())
+                        .into_iter()
+                        .map(|p| p.with_extension("idx"))
+                        .filter(|p| p.exists())
+                        .collect();
+                    let lost = !idx.is_empty();
+                    if lost {
+                        std::fs::remove_file(&idx[i.index(idx.len())]).unwrap();
+                    }
+                    log = Log::open(c.clone()).unwrap();
+                    prop_assert_eq!(log.stats().index_rebuilds, u64::from(lost));
+                    prop_assert_eq!(log.reader().sealed(), sealed);
+                }
+                Op::Reopen => {
+                    // a clean close: with write caching the owner flushes first (`Wal` does)
+                    log.flush().unwrap();
+                    drop(log);
+                    log = Log::open(c.clone()).unwrap();
+                }
+            }
+            check(&log, &m)?;
+        }
+        Ok(())
+    }
+
+    proptest! {
+
+        #[test]
+        fn the_log_agrees_with_a_list_of_records(ops in ops()) {
+            run(false, ops)?;
+        }
+
+        #[test]
+        fn under_write_caching_the_log_agrees_with_a_list_of_records(ops in ops()) {
+            run(true, ops)?;
+        }
+    }
 }

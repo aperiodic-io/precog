@@ -1,7 +1,7 @@
 # Agent instructions
 
-Coding agents working in this repository develop test first (below), respect the storage and
-protocol invariants, keep every CI gate green, and follow the Ponytail skill at the default
+Coding agents working in this repository develop test first (below), verify every new feature
+formally (below), respect the storage and protocol invariants, keep every CI gate green, and follow the Ponytail skill at the default
 **full** intensity. Ponytail source:
 [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail/SKILL.md) (MIT),
 as adopted in aperiodic-io/brrrrr.
@@ -23,6 +23,28 @@ Say in the commit or pull request which test failed first. Where a test cannot f
 refactor, a performance change), say so and say what covers it. Performance changes are covered by
 the bench and perf gates.
 
+## Formal verification
+
+Every new feature, and every change to a protocol, a file or wire format, or an invariant below,
+comes with formal verification, in the same pull request. `spec/README.md` is the record: what
+is checked, with which tool, to what bound, what is not and why.
+
+1. **A property or model test reaches the new code** (`proptest`, in a module named `props` or
+   `model`): a codec round-trips and refuses damage, a state machine agrees with a reference
+   model after every step. CI's `formal-coverage` job fails if a line the pull request adds or
+   changes in `crates/{storage,mesh,client}/src` is not run by one (`scripts/formal-gate.py`).
+2. **A TLA+ model covers a protocol** (messages, crashes, retries, concurrent steps across
+   threads or nodes, anything whose bugs are interleavings): extend the spec in `spec/` with the
+   new action or fault, add the invariant it must keep, and run `spec/check.sh`. Bounds the PR
+   job finishes in minutes go in `MC_*.cfg`, bigger ones in `Nightly_*.cfg`.
+3. **A Kani proof covers a decoder of bytes from disk or the network** where Kani finishes
+   (`#[cfg(kani)] mod proofs`): it never panics and accepts only what it should.
+4. **A bug a model finds keeps its counterexample**: a config whose first line is
+   `\* expect: <Invariant>` with the old behaviour, plus the failing test first (above).
+
+Where a part cannot be verified this way, say so in `spec/README.md` (Not verified, and why) and
+in the pull request.
+
 ## Commands
 
 | What | Command |
@@ -35,6 +57,9 @@ the bench and perf gates.
 | Wall-clock perf gate | `python3 bench/perf-gate/gate.py --base <dir> --head <dir>` (see `.github/workflows/ci.yml`) |
 | Broker harness (Docker, root; optional CI job `harness`) | `sudo target/release/precog-harness run [--system redpanda] [--only a,b]` (see `crates/harness/README.md`) |
 | Mutants of a diff | `git diff origin/main... -- '*.rs' > pr.diff && cargo mutants --in-diff pr.diff` |
+| TLA+ models (Java 11+) | `spec/check.sh` (`spec/check.sh nightly` for the bigger bounds) |
+| Kani proofs | `env -u RUSTFLAGS cargo kani -p precog-storage -Z stubbing` (kani-verifier 0.68.0) |
+| Formal-coverage gate | `cargo llvm-cov nextest --workspace --exclude storage-bench --exclude precog-bench -E 'test(/(^\|::)(props\|model)(_[a-z_]+)?::/)' --lcov --output-path formal.lcov && scripts/formal-gate.py formal.lcov origin/main` |
 
 The mesh crate needs `LIBCLANG_PATH` only for `storage-bench` (RocksDB bindings). Nothing else
 needs system libraries.
@@ -83,7 +108,8 @@ Each invariant has tests that fail if it breaks. Keep them failing for the right
   `build`, `ci`, `chore`; scope the area (`storage`, `mesh`, `client`, `spec`, ...); summary in
   the imperative, lower case, no final period. Example: `fix(storage): recover a write-caching
   log whose unsynced tail reached disk out of order`.
-- CI must be green: lint, test, coverage, acceptance, mutants, bench gate, perf gate.
+- CI must be green: lint, test, coverage, formal coverage, TLA+, Kani, acceptance, mutants,
+  bench gate, perf gate.
 - A deliberate performance regression needs a line in the PR saying why, plus the gate's numbers.
 
 ## Ponytail

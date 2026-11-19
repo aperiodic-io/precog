@@ -1747,7 +1747,17 @@ impl Node {
                     body = &body[4 + n..];
                     end = end.max(b.end_seq());
                     match self.store_local(&b).await? {
-                        Local::Stored => fetched += 1,
+                        Local::Stored => {
+                            fetched += 1;
+                            // as a replica records the ids the origin kept: a node that got the
+                            // batch only by repair dedups its events too. ponytail: its ids count
+                            // from the repair, so an old batch's are kept up to a window too long
+                            if let Some(d) = self.dedup.lock().as_mut() {
+                                let ds: Vec<u64> =
+                                    digests(&b).into_iter().map(|(_, h)| h).collect();
+                                d.record(&b.id.log.stream, &ds, now_s());
+                            }
+                        }
                         Local::Duplicate => {}
                         Local::Conflict(e) => {
                             tracing::error!("repair conflict from peer {}: {e}", p.cfg.id)

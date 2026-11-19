@@ -2994,6 +2994,7 @@ dependencies = [
  "bytes",
  "parking_lot",
  "precog-mesh",
+ "proptest",
  "serde_json",
  "tempfile",
  "tokio",
@@ -3025,6 +3026,8 @@ dependencies = [
  "libc",
  "lz4_flex",
  "precog-mesh",
+ "tempfile",
+ "tokio",
  "xxhash-rust",
 ]
 
