@@ -39,7 +39,8 @@ PY
 precog_image() {
   cp "$root/target/release/precog-node" "$lab/gateway" "$work/"
   printf 'FROM debian:trixie-slim\nCOPY precog-node gateway /usr/local/bin/\n' > "$work/Dockerfile"
-  docker build -q -t precog-s2 "$work" >/dev/null
+  # built once (REBUILD=1 forces it): Docker Hub rate-limits the base image lookup per build
+  { [ -z "${REBUILD:-}" ] && docker image inspect precog-s2 >/dev/null 2>&1; } || docker build -q -t precog-s2 "$work" >/dev/null
 }
 start_nodes() { # <n>
   local n=$1; python3 - "$work/cluster.json" "$n" <<'PY'
