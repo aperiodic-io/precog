@@ -351,10 +351,14 @@ impl Reader {
                 None => return Ok(None),
             }
         };
-        Ok(seg
-            .index(lsn - seg.base_lsn, 1)?
-            .first()
-            .map(|e| e.meta.time_ms))
+        let rel = lsn - seg.base_lsn;
+        // the active segment's (every append asks): its entry in RAM, without a copy of its key
+        if seg.disk.get().is_none()
+            && let Some(e) = seg.entries.read().unwrap().get(rel as usize)
+        {
+            return Ok(Some(e.meta.time_ms));
+        }
+        Ok(seg.index(rel, 1)?.first().map(|e| e.meta.time_ms))
     }
 
     /// Below the retention floor.
