@@ -2358,3 +2358,23 @@ mod model {
         }
     }
 }
+
+#[test]
+fn rolls_says_beforehand_whether_an_append_rolls() {
+    // Why: under write caching the caller appends on a network worker and hands a group that
+    // rolls (seal, syncs, maybe a zero-fill) to the WAL thread instead; it decides by `rolls`,
+    // so `rolls` must agree with what `append` does.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(deferred(d.path(), 64 * KB, 1 << 30)).unwrap();
+    let mut rolled = 0;
+    for i in 0..200 {
+        let p = payload(i, 1000);
+        let group = [(meta(i), &p[..])];
+        let segments = log.stats().segments;
+        let rolls = log.rolls(&group);
+        log.append(&group).unwrap();
+        assert_eq!(rolls, log.stats().segments > segments, "group {i}");
+        rolled += usize::from(rolls);
+    }
+    assert!(rolled >= 2, "rolled {rolled} times");
+}
