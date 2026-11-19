@@ -361,7 +361,8 @@ impl Manifest {
             return None;
         }
         let body = b.get(24..24usize.checked_add(u32_at(h, 16) as usize)?)?;
-        if crc32c::crc32c_append(crc32c::crc32c(&b[..20]), body) != u32_at(b, 20) {
+        if body.len() < 28 || crc32c::crc32c_append(crc32c::crc32c(&b[..20]), body) != u32_at(b, 20)
+        {
             return None;
         }
         let mut m = Manifest {
@@ -1593,6 +1594,27 @@ mod tests {
             v[20..24].copy_from_slice(&c.to_le_bytes());
             assert!(Manifest::decode(&v).is_none(), "field at {at}");
         }
+    }
+
+    #[test]
+    fn a_manifest_body_too_short_for_its_fields_is_refused_not_a_panic() {
+        // Why: a slot is refused unless it decodes; a body shorter than its fixed fields under a
+        // valid checksum (a torn or foreign write that happens to check) must read as invalid,
+        // so the other slot is used. Found by the Kani proof `manifest_decode_never_panics`.
+        for n in 0..28usize {
+            let mut b = Vec::new();
+            b.extend_from_slice(&MF_MAGIC.to_le_bytes());
+            b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&(n as u32).to_le_bytes());
+            let body = vec![0u8; n];
+            let c = crc32c::crc32c_append(crc32c::crc32c(&b), &body);
+            b.extend_from_slice(&c.to_le_bytes());
+            b.extend_from_slice(&body);
+            assert!(Manifest::decode(&b).is_none(), "body of {n} bytes");
+        }
+        // exactly the fixed fields: a manifest of no segments (a fresh log's first slots)
+        assert_eq!(Manifest::decode(&mf(0).encode().unwrap()), Some(mf(0)));
     }
 
     fn header_with(magic: u32, version: u32, id: u64, generation: u64, base: Lsn) -> Vec<u8> {
