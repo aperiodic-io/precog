@@ -15,3 +15,5 @@ lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 precog-mesh = { path = "../mesh" }
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
