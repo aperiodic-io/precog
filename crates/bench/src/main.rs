@@ -333,8 +333,7 @@ async fn main() -> Result<()> {
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_micros() as u64;
-            // One iroh endpoint for all producers of this process (if needed).
-            let probe = MeshClient::new(addrs.clone(), token.clone()).await?;
+            let probe = MeshClient::new(addrs.clone(), token.clone())?;
             let mut before = 0;
             for n in 0..addrs.len() {
                 if let Ok(ControlResp::Status(s)) = probe.control(n, &Control::Status).await {
@@ -342,7 +341,7 @@ async fn main() -> Result<()> {
                 }
             }
             for s in 0..args.subscribers {
-                let mc = MeshClient::new(addrs.clone(), token.clone()).await?;
+                let mc = MeshClient::new(addrs.clone(), token.clone())?;
                 let sub = mc.subscribe(s % addrs.len(), Some("bench"), false).await?;
                 sub_handles.push(tokio::spawn(mesh_subscriber(
                     sub,
@@ -356,7 +355,7 @@ async fn main() -> Result<()> {
             }
             for p in 0..args.producers {
                 let mut mc =
-                    Arc::into_inner(MeshClient::new(addrs.clone(), token.clone()).await?).unwrap();
+                    Arc::into_inner(MeshClient::new(addrs.clone(), token.clone())?).unwrap();
                 mc.rpc_timeout = Duration::from_millis(args.rpc_timeout_ms);
                 let mc = Arc::new(mc);
                 let w = Writer::new(

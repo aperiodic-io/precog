@@ -1,0 +1,10 @@
+[package]
+name = "precog-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Proofs of concept compared before a design is settled (evidence; not part of the product)"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+hashbrown = "0.15"

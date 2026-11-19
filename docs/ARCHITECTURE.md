@@ -44,11 +44,11 @@ on arrival play no part in read order.
 | `store.rs` | In-memory index: per-log `BTreeMap<first_seq, batch>`, reservation of pending ranges (concurrent duplicates coalesce), durable-only visibility, frontiers (`contiguous` prefix + `high`), event-time snapshot read |
 | `node.rs` | Append = local WAL ‖ replicate to one peer per other domain. **Early completion** at `copies`. Replicate is accepted only from authenticated peers and does not fan out further. Anti-entropy repair pulls each peer's durable inventory incrementally (cursor over the peer's WAL order). |
 | `rpc.rs` | Multiplexed request/response over one byte stream. The writer task coalesces frames. |
-| `transport.rs` | TCP, or **Iroh 1.4.1 QUIC**: identities pinned by endpoint id. Direct mode (no relay or discovery) by default; `iroh_relay: true` selects n0's relays. |
+| `transport.rs` | TCP. QUIC/Iroh was removed: TCP measured 1.4–1.6x faster. |
 | `client.rs` | `Writer` owns the sequence numbers. On a timeout, a transport error or an `Unknown` ack it retries the **same bytes** on the next node until a deadline. Failover sticks to the node that answered. |
 
 Tests are in `crates/mesh/src/*` (unit) and `crates/mesh/tests/cluster.rs`
-(multi-node over real sockets, TCP and Iroh). Run them with `cargo test`.
+(multi-node over real TCP sockets). Run them with `cargo test`.
 
 ## Guarantees (and what is traded away)
 
@@ -86,10 +86,7 @@ What Iggy's VSR provides and the mesh deliberately does not:
 * Placement is static: every node targets 3 copies, chosen as the first peer per
   distinct domain. There is no controller, membership changes, rebalancing or
   rack/zone awareness beyond labels.
-* Security: one shared token. Over TCP a token holder can claim any peer id.
-  Over Iroh, peer identity is proven by key, but there is no per-writer
-  authorization.
+* Security: one shared token. A token holder can claim any peer id, and there
+  is no per-writer authorization.
 * Live subscriptions (`Kind::Subscribe` / `Push`, `client::Subscription`) push each batch once it is durable on the serving node, in local durable order. The client restores per-log order. There is no resume or failover to another node yet. Repair pulls the full inventory after a restart
   (cursor 0), not Merkle ranges.
-* Iroh: one connection with one bidirectional stream per peer (head-of-line
-  blocking between requests). Relay mode exists but was not exercised.

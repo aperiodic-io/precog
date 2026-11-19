@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use precog_mesh::client::{MeshClient, Writer};
 use precog_mesh::node::{Node, NodeConfig, PeerConfig};
 use precog_mesh::proto::Control;
-use precog_mesh::transport::{Addr, load_or_create_secret};
+use precog_mesh::transport::Addr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -29,8 +29,6 @@ enum Cmd {
         nodes: u32,
         #[arg(long)]
         dir: PathBuf,
-        #[arg(long, default_value = "tcp")]
-        transport: String,
         #[arg(long, default_value_t = 7000)]
         base_port: u16,
         /// Segment file size in MiB.
@@ -91,14 +89,14 @@ pub struct ClusterFile {
     pub nodes: Vec<String>,
 }
 
-pub async fn client_from(path: &PathBuf) -> Result<std::sync::Arc<MeshClient>> {
+pub fn client_from(path: &PathBuf) -> Result<std::sync::Arc<MeshClient>> {
     let c: ClusterFile = serde_json::from_slice(&std::fs::read(path)?)?;
     let addrs = c
         .nodes
         .iter()
         .map(|s| s.parse())
         .collect::<Result<Vec<Addr>>>()?;
-    MeshClient::new(addrs, c.token).await
+    MeshClient::new(addrs, c.token)
 }
 
 fn main() -> Result<()> {
@@ -129,7 +127,6 @@ async fn run(cmd: Cmd) -> Result<()> {
         Cmd::Init {
             nodes,
             dir,
-            transport,
             base_port,
             segment_mb,
             retention_mb,
@@ -137,21 +134,9 @@ async fn run(cmd: Cmd) -> Result<()> {
         } => {
             std::fs::create_dir_all(&dir)?;
             let token = precog_mesh::proto::hex_encode(&rand::random::<[u8; 16]>());
-            let mut addrs = Vec::new();
-            for i in 0..nodes {
-                let data = dir.join(format!("n{i}"));
-                std::fs::create_dir_all(&data)?;
-                let port = base_port + i as u16;
-                let addr = match transport.as_str() {
-                    "tcp" => format!("tcp://127.0.0.1:{port}"),
-                    "iroh" => {
-                        let sk = load_or_create_secret(&data.join("iroh.secret"))?;
-                        format!("iroh://{}@127.0.0.1:{port}", sk.public())
-                    }
-                    t => anyhow::bail!("unknown transport {t}"),
-                };
-                addrs.push(addr);
-            }
+            let addrs: Vec<String> = (0..nodes)
+                .map(|i| format!("tcp://127.0.0.1:{}", base_port + i as u16))
+                .collect();
             for i in 0..nodes {
                 let port = base_port + i as u16;
                 let sock = format!("127.0.0.1:{port}").parse()?;
@@ -161,8 +146,7 @@ async fn run(cmd: Cmd) -> Result<()> {
                     std::path::absolute(dir.join(format!("n{i}")))?,
                     token.clone(),
                 );
-                cfg.listen_tcp = (transport == "tcp").then_some(sock);
-                cfg.listen_iroh = (transport == "iroh").then_some(sock);
+                cfg.listen_tcp = Some(sock);
                 cfg.peers = (0..nodes)
                     .filter(|&j| j != i)
                     .map(|j| PeerConfig {
@@ -195,7 +179,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Status { cluster, node } => {
-            let c = client_from(&cluster).await?;
+            let c = client_from(&cluster)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&c.control(node, &Control::Status).await?)?
@@ -203,7 +187,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             Ok(())
         }
         Cmd::Repair { cluster, node } => {
-            let c = client_from(&cluster).await?;
+            let c = client_from(&cluster)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&c.control(node, &Control::Repair).await?)?
@@ -216,7 +200,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             node,
             limit,
         } => {
-            let c = client_from(&cluster).await?;
+            let c = client_from(&cluster)?;
             let r = c
                 .control(
                     node,
@@ -238,7 +222,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             writer,
             node,
         } => {
-            let c = client_from(&cluster).await?;
+            let c = client_from(&cluster)?;
             let epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs();

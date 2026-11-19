@@ -1,4 +1,4 @@
-//! Precog mesh POC: leaderless, per-writer-log replication over TCP or Iroh.
+//! Precog mesh POC: leaderless, per-writer-log replication over TCP.
 //!
 //! See `docs/ARCHITECTURE.md` at the repository root.
 

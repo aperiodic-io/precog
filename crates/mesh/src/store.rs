@@ -311,12 +311,7 @@ impl Store {
 
     /// Durable batches at LSNs `from..`, optionally only one stream, up to about `max_bytes`.
     /// Returns the batches and the next LSN to ask for.
-    pub fn tail(
-        &self,
-        from: u64,
-        stream: Option<&str>,
-        max_bytes: usize,
-    ) -> (Vec<bytes::Bytes>, u64) {
+    pub fn tail(&self, from: u64, stream: Option<&str>, max_bytes: usize) -> (Vec<Batch>, u64) {
         let picks: Vec<(Lsn, bool)> = {
             let g = self.inner.lock();
             let mut size = 0usize;
@@ -337,9 +332,43 @@ impl Store {
         let out = picks
             .into_iter()
             .filter(|x| x.1)
-            .filter_map(|(lsn, _)| self.read_batch(lsn).map(|b| b.bytes))
+            .filter_map(|(lsn, _)| self.read_batch(lsn))
             .collect();
         (out, next)
+    }
+
+    /// Where a live feed starting now joins: the LSN its tail starts at and, per log of the
+    /// stream, the sequence it is next due (the end of the log's contiguous run below that
+    /// LSN). Read under one lock, so no batch falls between the two.
+    pub fn live_start(&self, stream: Option<&str>) -> (Lsn, HashMap<LogId, u64>) {
+        let g = self.inner.lock();
+        let pos = g.contiguous;
+        let mut keys: BTreeSet<&LogId> = g.logs.keys().collect();
+        keys.extend(g.trimmed.keys());
+        let next = keys
+            .into_iter()
+            .filter(|l| stream.is_none_or(|s| l.stream == s))
+            .map(|l| {
+                let mut c = g.trimmed.get(l).copied().unwrap_or(0);
+                for (&s, e) in g.logs.get(l).into_iter().flatten() {
+                    // durable out of LSN order at or past `pos`: the tail still returns it
+                    if s == c && e.lsn.is_some_and(|x| (..pos).contains(&x)) {
+                        c = e.shape.end;
+                    }
+                }
+                (l.clone(), c)
+            })
+            .collect();
+        (pos, next)
+    }
+
+    /// The end of the log's durable batch starting at `seq`, if its LSN is below `pos` (a tail
+    /// from `pos` does not return it).
+    pub fn durable_below(&self, log: &LogId, seq: u64, pos: Lsn) -> Option<u64> {
+        let g = self.inner.lock();
+        let e = g.logs.get(log)?.get(&seq)?;
+        // an LSN is set once durable
+        e.lsn.filter(|x| (..pos).contains(x)).map(|_| e.shape.end)
     }
 
     /// The LSN a subscription "from now" starts at.
@@ -623,6 +652,46 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(next2, 3);
         assert_eq!(t.s.durable_len(), 3);
+    }
+
+    #[test]
+    fn a_live_feed_joins_each_log_after_its_run_below_the_start() {
+        // the feed's start LSN and each log's next sequence are one snapshot: the log's run
+        // stops at its gap (seq 2), even though seq 3 is already durable below the start
+        let mut t = store();
+        let xs: Vec<Batch> = (0..4).map(|i| b("w", 1, i, &[(i, b"x")])).collect();
+        let mut lsns = vec![];
+        for i in [0, 1, 3, 2] {
+            let x = &xs[i];
+            t.s.reserve(x);
+            let m = Meta {
+                key: encode_log_key(&x.id.log),
+                first_seq: x.id.first_seq,
+                count: 1,
+                tag: batch_crc(&x.bytes),
+                time_ms: 0,
+            };
+            lsns.push((i, t.log.append(&[(m, &x.bytes[..])]).unwrap()));
+        }
+        for &(i, lsn) in &lsns[..3] {
+            t.s.mark_durable(&xs[i].id, lsn); // seq 2 (lsn 3) is not durable yet
+        }
+        let (pos, next) = t.s.live_start(Some("s"));
+        assert_eq!(pos, 3);
+        assert_eq!(next, HashMap::from([(xs[0].id.log.clone(), 2)]));
+        assert!(t.s.live_start(Some("other")).1.is_empty());
+        let log = &xs[0].id.log;
+        assert_eq!(
+            t.s.durable_below(log, 3, pos),
+            Some(4),
+            "above the gap, below the start"
+        );
+        assert_eq!(
+            t.s.durable_below(log, 3, 2),
+            None,
+            "the tail from 2 returns it"
+        );
+        assert_eq!(t.s.durable_below(log, 2, pos), None, "not durable");
     }
 
     #[test]

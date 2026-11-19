@@ -21,18 +21,16 @@ cpu_ticks() { # sum utime+stime of the given pid files
   echo $t
 }
 
-# run <label> <system: iggy1|iggy3|mesh1|mesh3> <transport/env> -- bench args...
+# run <label> <system: iggy1|iggy3|mesh1|mesh3> -- bench args...
 run() {
   local label=$1 sys=$2; shift 2
-  local tr=tcp
-  if [ "${1:-}" = iroh ]; then tr=iroh; shift; fi
   [ "${1:-}" = -- ] && shift
   for r in $(seq 1 "$REPS"); do
     case $sys in
       iggy1) scripts/iggy.sh single 1 >/dev/null; pidf=(run/iggy/n0.pid); sleep 3 ;;
       iggy3) scripts/iggy.sh cluster 1 >/dev/null; pidf=(run/iggy/n0.pid run/iggy/n1.pid run/iggy/n2.pid); sleep 8 ;;
-      mesh1) scripts/mesh.sh up 1 "$tr" 1 >/dev/null; pidf=(run/mesh/n0.pid) ;;
-      mesh3) scripts/mesh.sh up 3 "$tr" 1 >/dev/null; pidf=(run/mesh/n0.pid run/mesh/n1.pid run/mesh/n2.pid) ;;
+      mesh1) scripts/mesh.sh up 1 1 >/dev/null; pidf=(run/mesh/n0.pid) ;;
+      mesh3) scripts/mesh.sh up 3 1 >/dev/null; pidf=(run/mesh/n0.pid run/mesh/n1.pid run/mesh/n2.pid) ;;
     esac
     local t0; t0=$(cpu_ticks "${pidf[@]}")
     local target=mesh extra=()
@@ -70,7 +68,6 @@ for s in "${sections[@]}"; do
     for p in 1 6 24; do
       run "cluster/iggy-persisted-rf3/p$p" iggy3 -- --producers $p --durability persisted
       run "cluster/mesh-c2-tcp/p$p" mesh3 -- --producers $p --copies 2
-      run "cluster/mesh-c2-iroh/p$p" mesh3 iroh -- --producers $p --copies 2
     done ;;
   iggyfair) # give Iggy's per-partition group commit something to group
     run "iggyfair/iggy-persisted-rf3-1part/p24" iggy3 -- --producers 24 --partitions 1 --durability persisted
@@ -88,7 +85,6 @@ for s in "${sections[@]}"; do
       run "subs/iggy-persisted-rf3/rate60k-s$n" iggy3 -- --producers 6 --rate 100 --subscribers $n --durability persisted
       run "subs/mesh-c2-tcp/rate60k-s$n" mesh3 -- --producers 6 --rate 100 --subscribers $n --copies 2
     done
-    run "subs/mesh-c2-iroh/rate60k-s16" mesh3 iroh -- --producers 6 --rate 100 --subscribers 16 --copies 2
     # as fast as possible with 16 subscribers
     run "subs/iggy-persisted-rf3/max-s16" iggy3 -- --producers 6 --subscribers 16 --durability persisted
     run "subs/mesh-c2-tcp/max-s16" mesh3 -- --producers 6 --subscribers 16 --copies 2 ;;

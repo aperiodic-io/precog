@@ -18,9 +18,3 @@ Feature: The mesh replicates every acknowledged batch and keeps serving through 
     And a subscriber on node 2
     When 3 writers each append 300 batches of 500 bytes with 2 copies
     Then every subscriber received every acknowledged batch in writer order
-
-  @iroh
-  Scenario: The mesh works over Iroh QUIC
-    Given a 3-node cluster over iroh with 4 MiB segments
-    When a writer appends 500 batches of 1000 bytes with 2 copies
-    Then every acknowledged batch is held by at least 2 nodes

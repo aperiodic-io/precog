@@ -22,7 +22,15 @@ use anyhow::{Context, Result, bail, ensure};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-pub const BATCH_MAGIC: &[u8; 4] = b"PCB1";
+/// Batch format 2: every event has an optional dedup key, and a dropped event is a tombstone.
+pub const BATCH_MAGIC: &[u8; 4] = b"PCB2";
+/// Format 1 (no keys) still parses.
+const BATCH_MAGIC_V1: &[u8; 4] = b"PCB1";
+/// A payload length that marks a dropped event (no key, no payload).
+const TOMBSTONE: u32 = u32::MAX;
+/// `(time, Some((key, payload)))`, or `(time, None)` for a tombstone.
+type RawEvent<'a> = (u64, Option<(&'a [u8], &'a [u8])>);
+pub const MAX_KEY: usize = 1024;
 pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_EVENTS_PER_BATCH: u32 = 65_536;
@@ -71,9 +79,12 @@ pub struct Batch {
     pub bytes: Bytes,
     /// Offset of the first event record inside `bytes`.
     events_off: usize,
+    /// Format 1: events without keys.
+    v1: bool,
 }
 
 impl Batch {
+    /// Events without dedup keys: format 1, which has no key or tombstone fields to write or check.
     pub fn encode(log: &LogId, first_seq: u64, events: &[(u64, &[u8])]) -> Result<Bytes> {
         ensure!(!events.is_empty(), "empty batch");
         ensure!(
@@ -95,7 +106,7 @@ impl Batch {
         let len = 4 + 2 + log.stream.len() + 2 + log.writer.len() + 8 + 8 + 4 + payload + 4;
         ensure!(len <= MAX_BATCH_BYTES, "batch too large ({len} bytes)");
         let mut b = BytesMut::with_capacity(len);
-        b.put_slice(BATCH_MAGIC);
+        b.put_slice(BATCH_MAGIC_V1);
         b.put_u16_le(log.stream.len() as u16);
         b.put_slice(log.stream.as_bytes());
         b.put_u16_le(log.writer.len() as u16);
@@ -114,6 +125,73 @@ impl Batch {
         Ok(b.freeze())
     }
 
+    /// Events of `(time, dedup key, payload)`; an empty key is never deduplicated.
+    pub fn encode_keyed(
+        log: &LogId,
+        first_seq: u64,
+        events: &[(u64, &[u8], &[u8])],
+    ) -> Result<Bytes> {
+        let events: Vec<RawEvent<'_>> = events.iter().map(|&(t, k, p)| (t, Some((k, p)))).collect();
+        Self::encode_events(log, first_seq, &events)
+    }
+
+    /// `None` is a tombstone.
+    fn encode_events(log: &LogId, first_seq: u64, events: &[RawEvent<'_>]) -> Result<Bytes> {
+        ensure!(!events.is_empty(), "empty batch");
+        ensure!(
+            events.len() as u64 <= MAX_EVENTS_PER_BATCH as u64,
+            "too many events"
+        );
+        ensure!(
+            log.stream.len() <= MAX_NAME && log.writer.len() <= MAX_NAME,
+            "name too long"
+        );
+        ensure!(
+            !log.stream.is_empty() && !log.writer.is_empty(),
+            "empty name"
+        );
+        first_seq
+            .checked_add(events.len() as u64)
+            .context("sequence overflow")?;
+        for (_, e) in events {
+            if let Some((k, p)) = e {
+                ensure!(k.len() <= MAX_KEY, "dedup key too long");
+                ensure!(p.len() < TOMBSTONE as usize, "payload too large");
+            }
+        }
+        let payload: usize = events
+            .iter()
+            .map(|(_, e)| 14 + e.map_or(0, |(k, p)| k.len() + p.len()))
+            .sum();
+        let len = 4 + 2 + log.stream.len() + 2 + log.writer.len() + 8 + 8 + 4 + payload + 4;
+        ensure!(len <= MAX_BATCH_BYTES, "batch too large ({len} bytes)");
+        let mut b = BytesMut::with_capacity(len);
+        b.put_slice(BATCH_MAGIC);
+        b.put_u16_le(log.stream.len() as u16);
+        b.put_slice(log.stream.as_bytes());
+        b.put_u16_le(log.writer.len() as u16);
+        b.put_slice(log.writer.as_bytes());
+        b.put_u64_le(log.epoch);
+        b.put_u64_le(first_seq);
+        b.put_u32_le(events.len() as u32);
+        for (t, e) in events {
+            b.put_u64_le(*t);
+            let (k, p) = e.unwrap_or((b"", b""));
+            b.put_u16_le(k.len() as u16);
+            b.put_u32_le(if e.is_some() {
+                p.len() as u32
+            } else {
+                TOMBSTONE
+            });
+            b.put_slice(k);
+            b.put_slice(p);
+        }
+        let crc = crc32c::crc32c(&b);
+        b.put_u32_le(crc);
+        debug_assert_eq!(b.len(), len);
+        Ok(b.freeze())
+    }
+
     /// Parses and fully validates (checksum, structure, bounds) a batch.
     pub fn parse(bytes: Bytes) -> Result<Batch> {
         ensure!(bytes.len() <= MAX_BATCH_BYTES, "batch too large");
@@ -122,7 +200,8 @@ impl Batch {
         let crc = u32::from_le_bytes(crc.try_into().unwrap());
         ensure!(crc32c::crc32c(body) == crc, "batch checksum mismatch");
         let mut c = body;
-        ensure!(&c[..4] == BATCH_MAGIC, "bad batch magic");
+        let v1 = &c[..4] == BATCH_MAGIC_V1;
+        ensure!(v1 || &c[..4] == BATCH_MAGIC, "bad batch magic");
         c.advance(4);
         let stream = take_str(&mut c)?;
         let writer = take_str(&mut c)?;
@@ -139,9 +218,17 @@ impl Batch {
             .context("sequence overflow")?;
         let events_off = body.len() - c.remaining();
         for _ in 0..count {
-            ensure!(c.remaining() >= 12, "truncated event");
-            c.advance(8);
-            let n = c.get_u32_le() as usize;
+            let n = if v1 {
+                // format 1: time and payload length only
+                ensure!(c.remaining() >= 12, "truncated event");
+                c.advance(8);
+                let n = c.get_u32_le();
+                ensure!(n != TOMBSTONE, "bad payload length");
+                n as usize
+            } else {
+                let (k, n) = take_event(&mut c, false)?;
+                k + n.unwrap_or(0)
+            };
             ensure!(c.remaining() >= n, "truncated payload");
             c.advance(n);
         }
@@ -158,30 +245,81 @@ impl Batch {
             count,
             bytes,
             events_off,
+            v1,
         })
+    }
+
+    /// `(time, key, payload)` of every event, `None` for a tombstone.
+    fn raw(&self) -> impl Iterator<Item = RawEvent<'_>> + '_ {
+        let mut c = &self.bytes[self.events_off..self.bytes.len() - 4];
+        (0..self.count).map(move |_| {
+            let t = u64::from_le_bytes(c[..8].try_into().unwrap());
+            let (k, n) = take_event(&mut c, self.v1).expect("validated by parse");
+            let e = n.map(|n| (&c[..k], &c[k..k + n]));
+            c.advance(k + n.unwrap_or(0));
+            (t, e)
+        })
+    }
+
+    /// Each event's dedup key; `None` for no key or a tombstone.
+    pub fn keys(&self) -> impl Iterator<Item = Option<&[u8]>> + '_ {
+        self.raw()
+            .map(|(_, e)| e.map(|(k, _)| k).filter(|k| !k.is_empty()))
+    }
+
+    /// This batch with the flagged events replaced by tombstones (same identity and sequence).
+    pub fn without(&self, drop: &[bool]) -> Result<Bytes> {
+        ensure!(drop.len() == self.count as usize, "one flag per event");
+        if !drop.contains(&true) {
+            return Ok(self.bytes.clone());
+        }
+        let events: Vec<_> = self
+            .raw()
+            .zip(drop)
+            .map(|((t, e), &d)| (t, e.filter(|_| !d)))
+            .collect();
+        Self::encode_events(&self.id.log, self.id.first_seq, &events)
     }
 
     pub fn end_seq(&self) -> u64 {
         self.id.first_seq + self.count as u64
     }
 
+    /// The batch's events, without tombstones.
     pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
-        let mut off = self.events_off;
-        (0..self.count).map(move |i| {
-            let t = u64::from_le_bytes(self.bytes[off..off + 8].try_into().unwrap());
-            let n = u32::from_le_bytes(self.bytes[off + 8..off + 12].try_into().unwrap()) as usize;
-            let payload = self.bytes.slice(off + 12..off + 12 + n);
-            off += 12 + n;
-            Event {
+        self.raw().enumerate().filter_map(move |(i, (t, e))| {
+            let (_, p) = e?;
+            Some(Event {
                 stream: self.id.log.stream.clone(),
                 writer: self.id.log.writer.clone(),
                 epoch: self.id.log.epoch,
                 seq: self.id.first_seq + i as u64,
                 event_time_us: t,
-                payload,
-            }
+                payload: self.bytes.slice_ref(p),
+            })
         })
     }
+}
+
+/// Skips the event time; returns (key length, payload length), `None` for a tombstone.
+fn take_event(c: &mut &[u8], v1: bool) -> Result<(usize, Option<usize>)> {
+    if v1 {
+        ensure!(c.remaining() >= 12, "truncated event");
+        c.advance(8);
+        let n = c.get_u32_le();
+        ensure!(n != TOMBSTONE, "bad payload length");
+        return Ok((0, Some(n as usize)));
+    }
+    ensure!(c.remaining() >= 14, "truncated event");
+    c.advance(8);
+    let k = c.get_u16_le() as usize;
+    let n = c.get_u32_le();
+    ensure!(k <= MAX_KEY, "dedup key too long");
+    if n == TOMBSTONE {
+        ensure!(k == 0, "tombstone with a key");
+        return Ok((0, None));
+    }
+    Ok((k, Some(n as usize)))
 }
 
 fn take_str(c: &mut &[u8]) -> Result<String> {
@@ -471,14 +609,6 @@ pub fn hex_encode(b: &[u8]) -> String {
     s
 }
 
-pub fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    ensure!(s.len().is_multiple_of(2), "odd hex length");
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("bad hex"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +645,93 @@ mod tests {
             );
         }
         assert!(Batch::parse(b.slice(..b.len() - 1)).is_err());
+    }
+
+    #[test]
+    fn keyed_batches_carry_a_dedup_key_per_event() {
+        let b = Batch::encode_keyed(
+            &log(),
+            4,
+            &[(1, b"k1", b"a"), (2, b"", b"bb"), (3, b"k3", b"")],
+        )
+        .unwrap();
+        let p = Batch::parse(b).unwrap();
+        let keys: Vec<Option<&[u8]>> = p.keys().collect();
+        assert_eq!(keys, vec![Some(&b"k1"[..]), None, Some(&b"k3"[..])]);
+        let ev: Vec<_> = p.events().collect();
+        assert_eq!(ev.len(), 3);
+        assert_eq!((&ev[1].payload[..], ev[2].seq), (&b"bb"[..], 6));
+    }
+
+    #[test]
+    fn dropping_events_keeps_their_sequence_numbers_and_shrinks_the_batch() {
+        // Dedup replaces a duplicate with a tombstone: readers skip it, but the writer's sequence
+        // stays contiguous, so a cursor past it is exact on every node.
+        let big = vec![7u8; 1000];
+        let b = Batch::encode_keyed(
+            &log(),
+            10,
+            &[(1, b"a", &big), (2, b"b", b"keep"), (3, b"c", &big)],
+        )
+        .unwrap();
+        let p = Batch::parse(b.clone()).unwrap();
+        let f = Batch::parse(p.without(&[true, false, true]).unwrap()).unwrap();
+        assert_eq!((f.id.clone(), f.count, f.end_seq()), (p.id.clone(), 3, 13));
+        assert!(
+            f.bytes.len() < b.len() - 1900,
+            "tombstones carry no payload"
+        );
+        let ev: Vec<_> = f.events().collect();
+        assert_eq!(ev.len(), 1);
+        assert_eq!((ev[0].seq, &ev[0].payload[..]), (11, &b"keep"[..]));
+        assert_eq!(
+            f.keys().collect::<Vec<_>>(),
+            vec![None, Some(&b"b"[..]), None]
+        );
+        // dropping nothing returns the batch as it was
+        assert_eq!(p.without(&[false, false, false]).unwrap(), b);
+        assert!(p.without(&[true]).is_err(), "one flag per event");
+    }
+
+    #[test]
+    fn version_1_batches_still_read_as_keyless() {
+        // PCB1: magic, names, epoch, first_seq, count, then (time u64, len u32, payload) per event
+        let l = log();
+        let mut v = b"PCB1".to_vec();
+        for n in [&l.stream, &l.writer] {
+            v.extend_from_slice(&(n.len() as u16).to_le_bytes());
+            v.extend_from_slice(n.as_bytes());
+        }
+        v.extend_from_slice(&l.epoch.to_le_bytes());
+        v.extend_from_slice(&3u64.to_le_bytes());
+        v.extend_from_slice(&2u32.to_le_bytes());
+        for (t, p) in [(9u64, &b"x"[..]), (8, b"yz")] {
+            v.extend_from_slice(&t.to_le_bytes());
+            v.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            v.extend_from_slice(p);
+        }
+        let c = crc32c::crc32c(&v);
+        v.extend_from_slice(&c.to_le_bytes());
+        let p = Batch::parse(Bytes::from(v)).unwrap();
+        assert_eq!(p.keys().collect::<Vec<_>>(), vec![None, None]);
+        let ev: Vec<_> = p.events().collect();
+        assert_eq!((ev[1].seq, &ev[1].payload[..]), (4, &b"yz"[..]));
+    }
+
+    #[test]
+    fn keyed_batch_corruption_detected() {
+        let b = Batch::encode_keyed(&log(), 0, &[(1, b"id", b"hello")]).unwrap();
+        let t = Batch::parse(b.clone()).unwrap().without(&[true]).unwrap();
+        for x in [b, t] {
+            for i in 0..x.len() {
+                let mut v = x.to_vec();
+                v[i] ^= 0x40;
+                assert!(
+                    Batch::parse(Bytes::from(v)).is_err(),
+                    "flip at {i} undetected"
+                );
+            }
+        }
     }
 
     #[test]

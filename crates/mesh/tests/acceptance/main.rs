@@ -218,28 +218,20 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 
 // ---------------------------------------------------------------------------
 
-#[given(
-    regex = r"^a (\d+)-node cluster( over iroh)? with (\d+) MiB segments(?: and (\d+) MiB retention)?$"
-)]
-async fn cluster(w: &mut Mesh, n: usize, iroh: String, seg_mb: u64, retention_mb: String) {
+#[given(regex = r"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?$")]
+async fn cluster(w: &mut Mesh, n: usize, seg_mb: u64, retention_mb: String) {
     let dir = tempfile::tempdir().unwrap();
     let base = NEXT_PORT.fetch_add(10, Ordering::Relaxed);
     let mut cmd = Command::new(BIN);
-    cmd.args([
-        "init",
-        "--nodes",
-        &n.to_string(),
-        "--transport",
-        if iroh.is_empty() { "tcp" } else { "iroh" },
-    ])
-    .args([
-        "--base-port",
-        &base.to_string(),
-        "--segment-mb",
-        &seg_mb.to_string(),
-    ])
-    .arg("--dir")
-    .arg(dir.path());
+    cmd.args(["init", "--nodes", &n.to_string()])
+        .args([
+            "--base-port",
+            &base.to_string(),
+            "--segment-mb",
+            &seg_mb.to_string(),
+        ])
+        .arg("--dir")
+        .arg(dir.path());
     if !retention_mb.is_empty() {
         cmd.args(["--retention-mb", &retention_mb]);
     }
@@ -264,12 +256,9 @@ async fn cluster(w: &mut Mesh, n: usize, iroh: String, seg_mb: u64, retention_mb
         .iter()
         .map(|a| a.as_str().unwrap().parse().unwrap())
         .collect();
-    let mut mc = Arc::into_inner(
-        MeshClient::new(addrs, cf["token"].as_str().unwrap().into())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let mut mc =
+        Arc::into_inner(MeshClient::new(addrs, cf["token"].as_str().unwrap().into()).unwrap())
+            .unwrap();
     mc.rpc_timeout = Duration::from_millis(1500);
     mc.append_deadline = Duration::from_secs(60);
     w.client = Some(Arc::new(mc));
@@ -445,12 +434,20 @@ async fn retention_ran(_w: &mut Mesh, _i: usize) {
 
 #[when(regex = r"^repair has run on every node$")]
 async fn repair(w: &mut Mesh) {
+    // A peer that was just restarted stays marked down for its backoff, and a repair meanwhile
+    // reports it: repair has run once it completes without errors, which must happen within the
+    // deadline.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     for i in 0..w.n {
-        match w.client().control(i, &Control::Repair).await.unwrap() {
-            ControlResp::Repair { errors, .. } => {
-                assert!(errors.is_empty(), "node {i}: {errors:?}")
+        loop {
+            match w.client().control(i, &Control::Repair).await.unwrap() {
+                ControlResp::Repair { errors, .. } if errors.is_empty() => break,
+                ControlResp::Repair { errors, .. } => {
+                    assert!(std::time::Instant::now() < deadline, "node {i}: {errors:?}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                r => panic!("{r:?}"),
             }
-            r => panic!("{r:?}"),
         }
     }
 }

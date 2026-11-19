@@ -62,7 +62,7 @@ Each invariant has tests that fail if it breaks. Keep them failing for the right
 | Path | What |
 |---|---|
 | `crates/storage` | `precog-storage`: segment log, group commit, index files, manifest, recovery, retention, tail cache |
-| `crates/mesh` | `precog-mesh`: node, replication, repair, RPC, transports (TCP, Iroh), client, CLI, acceptance tests |
+| `crates/mesh` | `precog-mesh`: node, replication, repair, RPC, TCP transport, client, CLI, acceptance tests |
 | `crates/bench` | Same-harness benchmarks against Apache Iggy |
 | `crates/storage-bench` | Storage-backend comparison (evidence; not part of the product) |
 | `bench/perf-gate` | Wall-clock gate comparing a PR with its merge base |
