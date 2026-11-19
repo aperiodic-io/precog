@@ -414,6 +414,15 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   checks the store, the documented no-lost-wakeup pattern) and re-reads the store from its
   position on every wake-up; Loom does not model tokio's primitives, and the model above covers
   what the feed computes from the store, at every interleaving of appends with it.
+- **The segment cleaner in TLA+** (#28: copy forward, drop, a replacement in between, a crash
+  anywhere). Its steps run on one task and the WAL thread; the only concurrent writer of the
+  batches it moves is a replacement, and the two are serialised by `Node::clean`, with each
+  copy group re-checking what is still retained under it. What it must keep is checked at the
+  code instead: `node::props_cleaner` (writes, slow batches, replacements, passes, restarts,
+  damaged segments), the failpoint test at every step between copy and drop
+  (`a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`) and
+  `props_majority` in `crates/mesh/tests/cluster.rs`. A model of copy, replacement and crash
+  interleavings is the next extension of `SegmentLog.tla`.
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.
