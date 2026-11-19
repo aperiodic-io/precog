@@ -1829,3 +1829,40 @@ fn under_write_caching_damage_before_more_than_the_unsynced_bound_still_fails_cl
         Ok(_) => panic!("opened a log with interior damage"),
     }
 }
+
+#[test]
+fn under_write_caching_the_unsynced_bound_is_exact_to_the_last_record_written() {
+    // Why: the bound decides between dropping an unsynced tail and failing closed on damage; a
+    // record that ends past x + flush_bytes + MAX_GROUP was written after an fsync covered x.
+    // Two later records: the second, found by stepping over the first, decides.
+    for (past, opens) in [(0u64, true), (8, false)] {
+        let d = tempfile::tempdir().unwrap();
+        let c = || deferred(d.path(), 64 << 20, 4096);
+        {
+            let mut log = Log::open(c()).unwrap();
+            fill(&mut log, 0, 2, 1, 100);
+            log.flush().unwrap();
+        }
+        let (active, generation, lsn, x) = active_end(d.path());
+        let mut torn = vec![];
+        record::encode(&mut torn, generation, x, lsn, &meta(lsn), &[1; 100]);
+        torn[80] ^= 0xff;
+        patch(&active, x, &torn);
+        let bound = 4096 + precog_storage::log::MAX_GROUP as u64;
+        let first = x + 1024;
+        let second = x + bound - record::HEADER as u64 + past;
+        for (at, l) in [(first, lsn + 1), (second, lsn + 2)] {
+            let mut r = vec![];
+            record::encode(&mut r, generation, at, l, &meta(l), &[2; 100]);
+            patch(&active, at, &r);
+        }
+        match Log::open(c()) {
+            Ok(log) => {
+                assert!(opens, "{past} bytes past the bound must fail closed");
+                assert_eq!(log.next_lsn(), 2, "the unsynced tail is dropped");
+            }
+            Err(Error::Corrupt(msg)) => assert!(!opens, "within the bound: {msg}"),
+            Err(e) => panic!("wrong error: {e}"),
+        }
+    }
+}
