@@ -527,8 +527,7 @@ impl Inner {
     }
 
     /// Forgets the durable batch at `lsn` in RAM (retention): later copies of it are `Expired`.
-    /// `own`: its stream's own retention forgot it, oldest first (raises the stream's floor).
-    fn forget(&mut self, r: &Reader, lsn: Lsn, own: bool) {
+    fn forget(&mut self, r: &Reader, lsn: Lsn) {
         let Some((ix, len, first)) = self.order.remove(&lsn) else {
             return;
         };
@@ -541,25 +540,19 @@ impl Inner {
         self.events -= count as u64;
         self.bytes -= len as u64;
         if let Some(s) = self.streams.get_mut(&l.id.stream)
-            && let Some(time) = s.order.remove(&lsn)
+            && s.order.remove(&lsn).is_some()
         {
             s.bytes -= len as u64;
-            if own {
-                s.floor = s.floor.max((time, first, lsn + 1));
-            }
         }
         self.trim_log(r, ix, first + count as u64);
     }
 
-    /// Forgets an absorbed batch; `own`: as `forget`.
-    fn forget_cold(&mut self, r: &Reader, x: Rec, own: bool) {
+    /// Forgets an absorbed batch.
+    fn forget_cold(&mut self, r: &Reader, x: Rec) {
         let s = self
             .streams
             .get_mut(&self.logs[x.ix as usize].id.stream)
             .unwrap();
-        if own {
-            s.floor = s.floor.max((x.time, x.first, x.lsn + 1));
-        }
         s.bytes -= x.e.len as u64;
         if let Some((_, cs)) = s.cold.range_mut(..=x.lsn).next_back() {
             cs.batches -= 1;
@@ -752,9 +745,12 @@ impl Inner {
                 if !over(self.streams[stream].bytes, &x) {
                     return n;
                 }
+                // forgotten oldest first: everything older is gone too
+                let s = self.streams.get_mut(stream).unwrap();
+                s.floor = s.floor.max((x.time, x.first, x.lsn + 1));
                 match base {
-                    Some(_) => self.forget_cold(r, x, true),
-                    None => self.forget(r, x.lsn, true),
+                    Some(_) => self.forget_cold(r, x),
+                    None => self.forget(r, x.lsn),
                 }
                 n += 1;
             }
@@ -925,14 +921,13 @@ impl Store {
     /// The append time the log gave the record at `lsn`: what retention by age, a seek by time
     /// and the stream's trim order go by, the same in RAM as once absorbed.
     fn time_of(&self, lsn: Lsn) -> u64 {
-        match self.reader.time_ms(lsn) {
-            Ok(Some(t)) => t,
-            Ok(None) => now_ms(),
-            Err(e) => {
-                tracing::error!("reading the log's index at lsn {lsn}: {e}");
-                now_ms()
-            }
-        }
+        // ponytail: `lsn` was just written (the active segment's index, in RAM); were it not
+        // readable, now stands in, unlogged
+        self.reader
+            .time_ms(lsn)
+            .ok()
+            .flatten()
+            .unwrap_or_else(now_ms)
     }
 
     /// Whether `b` can replace what this node holds under its identity: a durable batch with
@@ -987,7 +982,7 @@ impl Store {
         inner.contiguous = inner.contiguous.max(floor);
         let gone: Vec<Lsn> = inner.order.range(..floor).map(|(&l, _)| l).collect();
         for lsn in gone {
-            inner.forget(r, lsn, false);
+            inner.forget(r, lsn);
         }
         let mut bases: Vec<(Lsn, Lsn)> = inner
             .streams
@@ -1012,7 +1007,7 @@ impl Store {
                 match inner.seg_recs(r, s, base) {
                     Ok(v) => {
                         for x in v.into_iter().filter(|x| x.lsn < floor) {
-                            inner.forget_cold(r, x, false);
+                            inner.forget_cold(r, x);
                         }
                     }
                     Err(e) => tracing::error!("reading the index of segment at {base}: {e}"),

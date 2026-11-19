@@ -1885,6 +1885,8 @@ mod props_cleaner {
         Write(Vec<(usize, usize, usize)>),
         /// a batch logged but not marked durable until the next `Retain`: absorption waits
         Slow,
+        /// a held batch of (stream, writer, which) replaced by other bytes (a majority's)
+        Replace(usize, usize, prop::sample::Index),
         Retain,
         Reopen,
     }
@@ -1895,6 +1897,8 @@ mod props_cleaner {
                 6 => prop::collection::vec((0usize..4, 0usize..2, 200usize..3000), 1..40)
                     .prop_map(Op::Write),
                 1 => Just(Op::Slow),
+                1 => (0usize..4, 0usize..2, any::<prop::sample::Index>())
+                    .prop_map(|(s, w, i)| Op::Replace(s, w, i)),
                 3 => Just(Op::Retain),
                 1 => Just(Op::Reopen),
             ],
@@ -1972,6 +1976,10 @@ mod props_cleaner {
             let mut slow: Option<(Batch, u64)> = None;
             let mut slow_seq = 0;
             let mut cut = std::collections::BTreeSet::new();
+            // logs with a replacement: its record is later than its neighbours' and so is its
+            // append time, so it may outlive them (ponytail: a replacement does not keep the
+            // batch's age); for those, only that what is served is what was written last
+            let mut replaced = std::collections::BTreeSet::new();
             for op in ops {
                 let pass = match op {
                     Op::Write(bs) => {
@@ -2005,6 +2013,31 @@ mod props_cleaner {
                         }
                         false
                     }
+                    Op::Replace(s, w, i) => {
+                        let l = log(s, w);
+                        let of: Vec<usize> = (0..written[s].len())
+                            .filter(|&j| written[s][j].0 == l)
+                            .collect();
+                        if !of.is_empty() {
+                            let j = of[i.index(of.len())];
+                            let (seq, old) = (written[s][j].1, written[s][j].2.len());
+                            // other bytes, as many of them
+                            let size =
+                                old - Batch::encode(&l, seq, &[(seq, &[][..])]).unwrap().len();
+                            let theirs =
+                                Batch::encode(&l, seq, &[(seq, &vec![!(seq as u8); size][..])])
+                                    .unwrap();
+                            if node
+                                .replace_with(&Batch::parse(theirs.clone()).unwrap())
+                                .await
+                                .is_ok()
+                            {
+                                written[s][j].2 = theirs;
+                                replaced.insert(l);
+                            }
+                        }
+                        false
+                    }
                     Op::Retain => true,
                     Op::Reopen => {
                         slow = None; // logged: recovery finds it
@@ -2032,7 +2065,22 @@ mod props_cleaner {
                 for (s, w) in written.iter().enumerate() {
                     let got = cursor(&node, STREAMS[s]);
                     let (mut held, mut held_bytes) = (0, 0u64);
+                    let whole = !replaced.iter().any(|l: &LogId| l.stream == STREAMS[s]);
                     for (l, seqs) in &got {
+                        if replaced.contains(l) {
+                            for &seq in seqs {
+                                let id = BatchId {
+                                    log: l.clone(),
+                                    first_seq: seq,
+                                };
+                                let x = w
+                                    .iter()
+                                    .find(|x| &x.0 == l && x.1 == seq)
+                                    .map(|x| x.2.clone());
+                                prop_assert_eq!(node.store.get(&id).map(|x| x.bytes), x);
+                            }
+                            continue;
+                        }
                         let all = next[l];
                         let first = all - seqs.len() as u64;
                         prop_assert_eq!(
@@ -2054,6 +2102,9 @@ mod props_cleaner {
                             .filter(|x| &x.0 == l && x.1 >= first)
                             .map(|x| x.2.len() as u64)
                             .sum::<u64>();
+                    }
+                    if !whole {
+                        continue;
                     }
                     prop_assert_eq!(
                         node.store.read(STREAMS[s], 0, 1 << 20).0.len(),
@@ -2083,6 +2134,14 @@ mod props_cleaner {
                         }
                     }
                 }
+                for (s, w) in written.iter().enumerate() {
+                    // a live feed from the start: what it is served is what was written
+                    let (bs, _) = node.store.tail(0, Some(STREAMS[s]), 1 << 20);
+                    for b in bs {
+                        let x = w.iter().find(|x| x.0 == b.id.log && x.1 == b.id.first_seq);
+                        prop_assert_eq!(x.map(|x| &x.2), Some(&b.bytes), "{:?}", b.id);
+                    }
+                }
                 let (_, live) = node.store.live_start(None);
                 // (a log reading as a gap at its start after a restart joins at the gap, as above)
                 let whole: Vec<LogId> = node
@@ -2102,12 +2161,141 @@ mod props_cleaner {
         })
     }
 
+    #[derive(Clone, Debug)]
+    enum Hurt {
+        /// batches of 1000 bytes appended to a stream
+        Write(usize, usize),
+        /// a sealed segment's index file cut short, or one byte of its records flipped
+        Damage(bool, prop::sample::Index, prop::sample::Index),
+        Retain,
+    }
+
+    /// Why: the cap protects the disk. Damage to sealed segments (a bad sector, a stray write)
+    /// makes reads of them fail; that must not stop the cap: every pass succeeds, the log stays
+    /// within the cap, and readers get errors or less, never a panic.
+    fn hurt(ops: Vec<Hurt>) -> Result<(), TestCaseError> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 16 << 10;
+        c.tail_cache_bytes = 0; // reads go to the disk
+        let cap = 6 * (16 << 10);
+        c.retention_bytes = Some(cap);
+        for (s, m) in [(0, 20_000u64), (1, 50_000)] {
+            c.streams.insert(
+                STREAMS[s].into(),
+                StreamConfig {
+                    retention_bytes: Some(m),
+                    ..Default::default()
+                },
+            );
+        }
+        rt.block_on(async {
+            let node = Node::open(c.clone()).await.unwrap();
+            let mut next = [0u64; 4];
+            let mut damaged: Vec<PathBuf> = vec![];
+            for op in ops {
+                match op {
+                    Hurt::Write(s, n) => {
+                        for _ in 0..n {
+                            let seq = next[s];
+                            next[s] += 1;
+                            let b =
+                                Batch::encode(&log(s, 0), seq, &[(seq, &[7u8; 1000][..])]).unwrap();
+                            let ack = node.append(1, b).await;
+                            prop_assert!(ack.is_success(), "{:?} fatal {}", ack, node.is_fatal());
+                        }
+                    }
+                    Hurt::Damage(index, file, at) => {
+                        let ext = if index { "idx" } else { "log" };
+                        let mut fs: Vec<_> = std::fs::read_dir(d.path().join("log"))
+                            .unwrap()
+                            .map(|e| e.unwrap().path())
+                            .filter(|p| p.extension().is_some_and(|x| x == ext))
+                            .collect();
+                        fs.sort();
+                        if !index {
+                            fs.pop(); // the active segment's: appends go on there
+                        }
+                        if fs.is_empty() {
+                            continue;
+                        }
+                        let p = &fs[file.index(fs.len())];
+                        damaged.push(p.clone());
+                        let f = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(p)
+                            .unwrap();
+                        let len = f.metadata().unwrap().len();
+                        if len == 0 {
+                            continue;
+                        }
+                        let off = at.index(len as usize) as u64;
+                        if index {
+                            // cut short: its reads fail (ponytail: an index file has no checksum
+                            // of its entries, so a flipped byte there reads as wrong entries)
+                            f.set_len(off).unwrap();
+                        } else {
+                            use std::os::unix::fs::FileExt;
+                            let mut b = [0u8];
+                            f.read_exact_at(&mut b, off).unwrap();
+                            f.write_all_at(&[!b[0]], off).unwrap();
+                        }
+                    }
+                    Hurt::Retain => {
+                        let r = node.apply_retention().await;
+                        prop_assert!(r.is_ok(), "a pass fails: {:?}", r);
+                        // a damaged segment can keep the cap from cutting what it holds until it
+                        // goes itself (the oldest go first): then the next pass is within it
+                        damaged.retain(|p| p.exists());
+                        if damaged.is_empty() {
+                            prop_assert!(node.apply_retention().await.is_ok());
+                            let bytes = node.wal.stats.log_bytes.load(Ordering::Relaxed);
+                            prop_assert!(bytes <= cap, "log {} over the cap {}", bytes, cap);
+                        }
+                    }
+                }
+                for s in STREAMS {
+                    let mut cur = node.store.cursor_at(s, 0);
+                    for _ in 0..64 {
+                        let (bs, n) = node.store.read_cursor(s, &cur, 16 << 10);
+                        if bs.is_empty() {
+                            break;
+                        }
+                        cur = n;
+                    }
+                    node.store.tail(0, Some(s), 1 << 20);
+                    node.store.read(s, 0, 1 << 20);
+                }
+            }
+            Ok(())
+        })
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(24))]
 
         #[test]
         fn the_cleaner_keeps_each_stream_s_retention_within_the_cap(caching: bool, ops in ops()) {
             run(caching, ops)?;
+        }
+
+        #[test]
+        fn the_cap_holds_whatever_damage_sealed_segments_take(ops in prop::collection::vec(
+            prop_oneof![
+                4 => (0usize..3, 1usize..40).prop_map(|(s, n)| Hurt::Write(s, n)),
+                2 => (any::<bool>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
+                    .prop_map(|(i, f, a)| Hurt::Damage(i, f, a)),
+                3 => Just(Hurt::Retain),
+            ],
+            1..24,
+        )) {
+            hurt(ops)?;
         }
     }
 

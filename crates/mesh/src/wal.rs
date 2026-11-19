@@ -42,16 +42,17 @@ enum Req {
         replaces: bool,
         done: Done,
     },
-    /// Records copied forward as they are (one group), synced as appends are.
-    Copy {
-        records: Vec<(Meta, Arc<[u8]>)>,
-        done: Done,
-    },
-    /// Syncs what is unsynced (write caching: the copies), then drops the sealed segments that
-    /// end at or below `end`.
-    Drop { end: Lsn, done: Done },
+    /// The cleaner's steps, on this thread between groups.
+    Retain { job: Job, done: Done },
     /// Write caching: the flush deadline moved (`Log::flush_due`).
     Wake,
+}
+
+enum Job {
+    /// Records copied forward as they are (one group), synced as appends are.
+    Copy(Vec<(Meta, Arc<[u8]>)>),
+    /// `Log::drop_until`: syncs what is unsynced (the copies), then drops.
+    Drop(Lsn),
 }
 
 #[derive(Clone)]
@@ -193,19 +194,19 @@ impl Wal {
 
     /// Logs `records` again, unchanged, as one group; resolves with the first one's new LSN.
     pub async fn copy(&self, records: Vec<(Meta, Arc<[u8]>)>) -> Result<Lsn> {
-        self.request(|done| Req::Copy { records, done }).await
+        self.request(Job::Copy(records)).await
     }
 
     /// Makes everything written durable, then drops the sealed segments that end at or below
     /// `end`; returns the new first LSN.
     pub async fn drop_until(&self, end: Lsn) -> Result<Lsn> {
-        self.request(|done| Req::Drop { end, done }).await
+        self.request(Job::Drop(end)).await
     }
 
-    async fn request(&self, req: impl FnOnce(Done) -> Req) -> Result<Lsn> {
+    async fn request(&self, job: Job) -> Result<Lsn> {
         let (done, rx) = oneshot::channel();
         self.tx
-            .send(req(done))
+            .send(Req::Retain { job, done })
             .map_err(|_| anyhow::anyhow!("wal writer stopped"))?;
         Self::durable(rx).await
     }
@@ -287,18 +288,16 @@ fn writer(
             }
         };
         match first {
-            Req::Copy { records, done } => {
-                let items: Vec<(Meta, &[u8])> =
-                    records.iter().map(|(m, p)| (m.clone(), &p[..])).collect();
+            Req::Retain { job, done } => {
                 let mut log = log.lock();
-                let r = log.append(&items).map_err(|e| e.to_string());
-                publish(&log, &stats, &fatal);
-                let _ = done.send(r);
-                continue;
-            }
-            Req::Drop { end, done } => {
-                let mut log = log.lock();
-                let r = log.flush().and_then(|_| log.drop_until(end));
+                let r = match job {
+                    Job::Copy(records) => {
+                        let items: Vec<(Meta, &[u8])> =
+                            records.iter().map(|(m, p)| (m.clone(), &p[..])).collect();
+                        log.append(&items)
+                    }
+                    Job::Drop(end) => log.drop_until(end),
+                };
                 publish(&log, &stats, &fatal);
                 let _ = done.send(r.map_err(|e| e.to_string()));
                 continue;
@@ -321,7 +320,7 @@ fn writer(
                     size += batch.bytes.len();
                     group.push((batch, replaces, done));
                 }
-                Ok(r @ (Req::Copy { .. } | Req::Drop { .. })) => {
+                Ok(r @ Req::Retain { .. }) => {
                     pending = Some(r);
                     break;
                 }

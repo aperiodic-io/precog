@@ -1598,12 +1598,11 @@ impl Log {
         n
     }
 
-    /// Drops the sealed segments that end at or below `end`, oldest first (never the active
-    /// one). Returns the new first LSN.
+    /// Makes everything written durable (write caching: a copy forward of what the dropped
+    /// segments hold may be unsynced), then drops the sealed segments that end at or below
+    /// `end`, oldest first (never the active one). Returns the new first LSN.
     pub fn drop_until(&mut self, end: Lsn) -> Result<Lsn> {
-        if let Some(f) = &self.failed {
-            return Err(Error::Fatal(f.clone()));
-        }
+        self.flush()?; // a fenced log refuses
         let drop_n = self
             .manifest
             .segs

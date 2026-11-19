@@ -2194,10 +2194,13 @@ mod model {
         prop_assert_eq!(log.first_lsn(), m.first);
         for (l, (meta, p)) in m.recs.iter().enumerate() {
             let got = r.read(l as u64).unwrap();
+            let time = r.time_ms(l as u64).unwrap();
             if (l as u64) < m.first {
                 prop_assert!(got.is_none(), "lsn {} below the floor", l);
+                prop_assert_eq!(time, None);
                 continue;
             }
+            prop_assert_eq!(time, Some(meta.time_ms));
             let got = got.unwrap();
             prop_assert_eq!(&got.meta, meta);
             prop_assert_eq!(&got.payload[..], &p[..]);
