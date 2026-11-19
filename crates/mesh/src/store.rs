@@ -486,7 +486,8 @@ impl Store {
     pub fn cursor_at(&self, stream: &str, time_ms: u64) -> Cursor {
         let g = self.inner.lock();
         let mut c = Cursor::new();
-        if let Some(sl) = g.by_stream.get(stream) {
+        // the end (u64::MAX) is polled often: no batch is at or after it, so skip the scan
+        if let Some(sl) = g.by_stream.get(stream).filter(|_| time_ms != u64::MAX) {
             for (lsn, (log, t, _)) in &sl.order {
                 if *t >= time_ms && !c.contains_key(log) {
                     c.insert(log.clone(), g.order[lsn].0.first_seq);
@@ -495,10 +496,12 @@ impl Store {
         }
         for log in g.streams.get(stream).into_iter().flatten() {
             if !c.contains_key(log) {
+                // a log's batches are keyed by first seq and do not overlap: its last durable
+                // one ends furthest
                 let end = g
                     .logs
                     .get(log)
-                    .and_then(|m| m.values().filter_map(|e| e.lsn.map(|_| e.shape.end)).max());
+                    .and_then(|m| m.values().rev().find_map(|e| e.lsn.map(|_| e.shape.end)));
                 c.insert(
                     log.clone(),
                     end.unwrap_or(0)
@@ -1154,6 +1157,40 @@ mod tests {
         t.durable(&xs[1]);
         let (got, _) = drain(&t.s, "s", c, 1 << 20);
         assert_eq!(got.iter().map(|i| i.first_seq).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn the_end_is_past_the_last_durable_batch_of_every_log_not_a_reserved_one() {
+        // Why: the end is polled often (brrrrr asks for it every 200 ms per caught-up stream), so
+        // it is read from each log's last batches instead of the whole stream; it must still be
+        // past every durable batch, gaps included, and never past one only reserved.
+        let mut t = store();
+        let xs: Vec<_> = (0..4).map(|i| on("s", "w", i)).collect();
+        for i in [0, 1, 3] {
+            t.s.reserve(&xs[i]);
+            t.durable(&xs[i]);
+        }
+        t.s.reserve(&xs[2]); // a gap: reserved, not durable
+        let y = on("s", "v", 0);
+        t.s.reserve(&y); // a log with nothing durable yet
+        let reserved_last = on("s", "w", 4);
+        t.s.reserve(&reserved_last);
+        let end = t.s.cursor_at("s", u64::MAX);
+        let w = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: xs[0].id.log.epoch,
+        };
+        assert_eq!(
+            end.get(&w),
+            Some(&4),
+            "past seq 3, not past the reserved 4: {end:?}"
+        );
+        assert_eq!(end.len(), 2, "{end:?}");
+        assert!(
+            end.values().any(|&v| v == 0),
+            "the log with nothing durable starts at 0"
+        );
     }
 
     #[test]
