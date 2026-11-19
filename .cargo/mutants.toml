@@ -26,6 +26,11 @@ exclude_re = [
     "wal\\.rs:\\d+:\\d+: replace << with >>$",
     # closes a race with concurrent retention; not reachable deterministically from a test
     "replace match guard self.trimmed\\(lsn\\) with false in Reader::read",
+    # `while pos < end` in written_end: one more pass at the end reads an empty window
+    "replace < with <= in written_end",
+    # the step over a decoded record in written_end: overshooting by the window offset lands
+    # later in the tail, where the 8-byte stepping goes on finding records
+    "replace - with \\+ in written_end",
     # Kani proof harnesses (`#[cfg(kani)] mod proofs`): not compiled into tests; the kani job
     # checks them
     "in proofs::",
