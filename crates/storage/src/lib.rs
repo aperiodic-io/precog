@@ -2,7 +2,7 @@
 pub mod log;
 pub mod record;
 
-pub use log::{Config, Entry, Failpoints, Log, Reader, Record, Stats};
+pub use log::{Config, Entry, Failpoints, Flush, Log, Reader, Record, Stats};
 
 /// Node-local log sequence number: one per record, contiguous, never reused.
 pub type Lsn = u64;

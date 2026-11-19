@@ -1452,30 +1452,121 @@ fn deferred(dir: &Path, segment_size: u64, bytes: u64) -> Config {
 }
 
 #[test]
-fn deferred_flush_syncs_once_per_bytes_threshold_not_per_group() {
+fn deferred_flush_never_fsyncs_in_append_and_falls_due_at_once_past_the_bytes_threshold() {
     // Why: Redpanda's write caching (live-ingestion runs it) acks after replication and fsyncs on a
     // 100 ms / 256 KiB cadence; matching it means a group is acknowledged once written, and the
-    // fsync cost is paid per threshold, not per group.
+    // fsync cost is paid per threshold, not per group. Under write caching the append runs on the
+    // caller's network thread under the log's lock, so the fsync is never in it: past the
+    // threshold the flush is due at once and the caller's flusher runs it.
     let d = tempfile::tempdir().unwrap();
     let mut log = Log::open(deferred(d.path(), 1 << 20, 64 * KB)).unwrap();
     fill(&mut log, 0, 10, 1, 1000); // ~10 KiB: under the threshold
-    assert_eq!(log.stats().syncs, 0, "no fsync before the threshold");
     check_all(&log, 0, 10, 1000); // readable once written
-    assert!(
-        log.flush_due().is_some(),
-        "unsynced data has a flush deadline"
-    );
+    let due = log.flush_due().expect("unsynced data has a flush deadline");
+    assert!(due > std::time::Instant::now(), "not due before the delay");
     fill(&mut log, 10, 60, 1, 1000); // past 64 KiB
-    let syncs = log.stats().syncs;
+    assert_eq!(log.stats().syncs, 0, "no fsync in an append");
     assert!(
-        (1..=2).contains(&syncs),
-        "one fsync per threshold, got {syncs}"
+        log.flush_due().unwrap() <= std::time::Instant::now(),
+        "due at once past the threshold"
     );
     log.flush().unwrap();
+    assert_eq!(log.stats().syncs, 1);
     assert!(log.flush_due().is_none(), "nothing left to flush");
-    let s = log.stats().syncs;
     log.flush().unwrap();
-    assert_eq!(log.stats().syncs, s, "flushing a synced log is free");
+    assert_eq!(log.stats().syncs, 1, "flushing a synced log is free");
+}
+
+#[test]
+fn a_flush_run_outside_the_log_lets_appends_go_on_and_leaves_them_due() {
+    // Why: the deferred fsync runs on the flusher thread without the log's lock, so the writers
+    // appending meanwhile never wait for the disk; what they write during it is not covered and
+    // keeps its own deadline.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(deferred(d.path(), 1 << 20, 1 << 20)).unwrap();
+    assert!(log.begin_flush().unwrap().is_none(), "nothing to flush");
+    fill(&mut log, 0, 5, 1, 100);
+    let f = log.begin_flush().unwrap().expect("unsynced groups");
+    assert!(
+        log.flush_due().is_none(),
+        "the flush covers what was written"
+    );
+    let before = std::time::Instant::now();
+    fill(&mut log, 5, 5, 1, 100); // while the fsync runs
+    let r = f.sync();
+    log.end_flush(f, r).unwrap();
+    assert_eq!(log.stats().syncs, 1);
+    let due = log.flush_due().expect("groups written during the flush");
+    assert!(due >= before + std::time::Duration::from_millis(100));
+    check_all(&log, 0, 10, 100);
+}
+
+#[test]
+fn unsynced_bytes_stay_bounded_while_a_flush_is_out() {
+    // Why: recovery tells a lost unsynced tail from interior damage by its size (the kernel writes
+    // unsynced pages back in any order), so a crash must never leave more than
+    // `Log::unsynced_bound` unsynced. Appends go on while the flusher's fsync runs outside the
+    // log, so past twice `flush_bytes` (what that fsync covers plus as much again) an append
+    // syncs itself.
+    let d = tempfile::tempdir().unwrap();
+    let c = deferred(d.path(), 1 << 20, 4 * KB);
+    assert_eq!(
+        Log::unsynced_bound(&c),
+        8 * KB + precog_storage::log::MAX_GROUP as u64
+    );
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 5, 1, 1000); // past flush_bytes: the flush is due, the append does not sync
+    assert_eq!(log.stats().syncs, 0);
+    let f = log.begin_flush().unwrap().unwrap();
+    fill(&mut log, 5, 2, 1, 1000); // ~7 KiB not yet synced, the fsync still out
+    assert_eq!(log.stats().syncs, 0, "below twice flush_bytes");
+    fill(&mut log, 7, 2, 1, 1000); // past twice flush_bytes
+    assert_eq!(log.stats().syncs, 1, "the append synced the bound back");
+    let r = f.sync();
+    log.end_flush(f, r).unwrap();
+    check_all(&log, 0, 9, 1000);
+}
+
+#[test]
+fn a_failed_flush_run_outside_the_log_fences_it() {
+    // Why: fsyncgate, as for a flush under the lock: whatever was acknowledged since rests on the
+    // replicas, and the log must refuse everything after the failure is known.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = deferred(d.path(), 1 << 20, 1 << 20);
+    c.failpoints.fail_data_sync_after = Some(0);
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 2, 1, 100);
+    let f = log.begin_flush().unwrap().unwrap();
+    let r = f.sync();
+    assert!(r.is_err());
+    fill(&mut log, 2, 1, 1, 100); // not known yet
+    assert!(matches!(log.end_flush(f, r), Err(Error::Fatal(_))));
+    assert!(log.is_fenced());
+    let m = meta(3);
+    assert!(log.append(&[(m, &payload(3, 100)[..])]).is_err());
+    assert!(matches!(log.begin_flush(), Err(Error::Fatal(_))));
+}
+
+#[test]
+fn a_roll_while_a_flush_is_out_syncs_the_segment_it_seals() {
+    // Why: the flush outside the lock may still be running (or fail) when a writer rolls; the
+    // roll cannot count on it, and a sealed segment is never written again.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(deferred(d.path(), 64 * KB, 1 << 30)).unwrap();
+    fill(&mut log, 0, 40, 1, 1000);
+    let f = log.begin_flush().unwrap().unwrap();
+    assert_eq!(log.stats().segments, 1);
+    let big = payload(40, 30_000); // does not fit: rolls
+    log.append(&[(meta(40), &big[..])]).unwrap();
+    assert_eq!(log.stats().segments, 2);
+    assert_eq!(
+        log.stats().syncs,
+        1,
+        "the roll synced the segment it sealed"
+    );
+    let r = f.sync();
+    log.end_flush(f, r).unwrap();
+    assert_eq!(log.stats().syncs, 2);
 }
 
 #[test]
@@ -1833,7 +1924,7 @@ fn under_write_caching_damage_before_more_than_the_unsynced_bound_still_fails_cl
 #[test]
 fn under_write_caching_the_unsynced_bound_is_exact_to_the_last_record_written() {
     // Why: the bound decides between dropping an unsynced tail and failing closed on damage; a
-    // record that ends past x + flush_bytes + MAX_GROUP was written after an fsync covered x.
+    // record that ends past x + Log::unsynced_bound was written after an fsync covered x.
     // Two later records: the second, found by stepping over the first, decides.
     for (past, opens) in [(0u64, true), (8, false)] {
         let d = tempfile::tempdir().unwrap();
@@ -1848,7 +1939,7 @@ fn under_write_caching_the_unsynced_bound_is_exact_to_the_last_record_written() 
         record::encode(&mut torn, generation, x, lsn, &meta(lsn), &[1; 100]);
         torn[80] ^= 0xff;
         patch(&active, x, &torn);
-        let bound = 4096 + precog_storage::log::MAX_GROUP as u64;
+        let bound = Log::unsynced_bound(&c());
         let first = x + 1024;
         let second = x + bound - record::HEADER as u64 + past;
         for (at, l) in [(first, lsn + 1), (second, lsn + 2)] {
