@@ -11,11 +11,14 @@ tables as Markdown.
 
 EUR = 1.08
 # segment: (monthly spend per customer in USD, new customers per quarter for Q1..Q12, quarterly churn)
+# Spend per customer: the low end of the researched range for each profile (market research in the
+# business plan's sources); new customers per quarter from Y1 Q2 (v1 is about two months of work).
 SEGMENTS = {
-    "Agent startups (self-serve)": (300, [0, 15, 30, 45, 60, 75, 90, 110, 130, 150, 170, 190], 0.08),
-    "Agent platforms and coding agents": (4_000, [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6], 0.03),
-    "EU regulated enterprises": (3_500, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], 0.02),
-    "Observability and agent-tool vendors (OEM)": (15_000, [0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 2, 2], 0.02),
+    "AI app builders (self-serve, AI SDK / Mastra / ex-Electric)": (300, [0, 15, 30, 45, 60, 75, 90, 110, 130, 150, 170, 190], 0.08),
+    "Agent platforms and frameworks (embedded / OEM)": (8_000, [0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4], 0.03),
+    "Voice and support agent vendors (EU first)": (12_000, [0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 3], 0.03),
+    "Coding-agent companies": (25_000, [0, 0, 0, 0, 1, 0, 1, 0, 1, 1, 1, 1], 0.03),
+    "EU regulated enterprises (AI Act logs from Dec 2027)": (5_000, [0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6], 0.02),
 }
 EXPANSION = 0.06            # quarterly growth of a retained customer's usage
 GROSS_COST_SHARE = 0.12     # marginal infrastructure as a share of revenue (model: 2-14%; 12% with support)
