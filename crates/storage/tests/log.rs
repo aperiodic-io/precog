@@ -2192,6 +2192,12 @@ mod model {
         let r = log.reader();
         prop_assert_eq!(log.next_lsn(), m.recs.len() as u64);
         prop_assert_eq!(log.first_lsn(), m.first);
+        let newest = m.recs[m.first as usize..].iter().map(|r| r.0.time_ms).max();
+        prop_assert_eq!(
+            log.max_time(),
+            newest.unwrap_or(0),
+            "the newest append time in the log"
+        );
         for (l, (meta, p)) in m.recs.iter().enumerate() {
             let got = r.read(l as u64).unwrap();
             let time = r.time_ms(l as u64).unwrap();
