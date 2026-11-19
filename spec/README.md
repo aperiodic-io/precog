@@ -140,7 +140,9 @@ Storing at a replica and replying are one step; a power loss between them is a l
 - `NoConflictingAcks`: a conflicting reuse of an identity is never acknowledged next to the
   original while no node has lost a copy (two ack sets of `copies > n/2` nodes share a node,
   and it refuses the second variant). After a lost disk the empty node can accept the second
-  variant: identity reuse is a writer bug, and the conflict is logged by repair.
+  variant, and both can be acknowledged (`MC_conflict` without the premise). Identity reuse is
+  a writer bug; a node that later finds itself in the minority gives its bytes up
+  (`yield_to_majority`, #19, not modelled), but an ack already given stands.
 - `OneCopyPerKey`: two producer replicas whose batches all reach one node (the stream's
   preferred node) store each key once.
 - `DedupLosesNothing`: every key of an acknowledged batch is kept (not a tombstone) in some
