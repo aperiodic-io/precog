@@ -867,15 +867,14 @@ impl Node {
                 .iter()
                 .filter_map(|&l| match self.wal.reader.read(l) {
                     Ok(Some(r)) => Some(r),
-                    Ok(None) => {
-                        tracing::error!("retention: lsn {l} to copy is gone");
-                        None
-                    }
-                    Err(e) => {
-                        tracing::error!("retention: lsn {l} to copy does not read: {e}");
+                    r => {
+                        tracing::error!("retention: lsn {l} to copy does not read: {:?}", r.err());
                         None
                     }
                 })
+                // a replacement may have superseded it since it was picked (the lock keeps
+                // replacements out from here to `moved`)
+                .filter(|r| self.store.retains(r.lsn, &r.meta))
                 .collect();
             if recs.is_empty() {
                 continue;
@@ -1767,6 +1766,17 @@ impl Node {
         else {
             bail!("no batch is held by a majority of {n} nodes");
         };
+        self.replace_with(theirs).await?;
+        tracing::warn!(
+            "{:?}: replaced bytes a majority does not hold with theirs",
+            ours.id
+        );
+        Ok(())
+    }
+
+    /// Logs `theirs` in place of the batch this node holds under its identity (other bytes over
+    /// the same range).
+    async fn replace_with(&self, theirs: &Batch) -> Result<()> {
         let _g = self.clean.lock().await;
         anyhow::ensure!(
             self.store.replaceable(theirs),
@@ -1774,10 +1784,6 @@ impl Node {
         );
         let lsn = self.wal.append_replacing(theirs.clone()).await?;
         self.store.replace(theirs, lsn);
-        tracing::warn!(
-            "{:?}: replaced bytes a majority does not hold with theirs",
-            ours.id
-        );
         Ok(())
     }
 
@@ -2198,6 +2204,57 @@ mod props_cleaner {
         drop(node);
         let node = Node::open(c).await.unwrap();
         assert_eq!(read(&node), (8..18).collect::<Vec<_>>(), "after a restart");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_replaced_after_the_cleaner_picked_it_is_not_copied() {
+        // Why: a replacement can land between the cleaner picking a batch and copying it. A copy
+        // of the superseded bytes logged after the replacement would conflict with it on disk:
+        // the next start refuses the log. The copy must take only what is still retained.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 64 << 10;
+        c.retention_bytes = Some(4 * (64 << 10));
+        c.streams.insert(
+            "low".into(),
+            StreamConfig {
+                retention_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+        );
+        let node = Node::open(c.clone()).await.unwrap();
+        let log = |stream: &str| LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let at = |stream: &str, seq: u64, v: u8| {
+            Batch::encode(&log(stream), seq, &[(seq, &[v; 1000][..])]).unwrap()
+        };
+        for seq in 0..5 {
+            assert!(node.append(1, at("low", seq, 1)).await.is_success());
+        }
+        for seq in 0..300 {
+            assert!(node.append(1, at("high", seq, 1)).await.is_success());
+        }
+        node.store.absorb();
+        let base = node.wal.retirable(None, None).0[0].base;
+        let keep = node.store.retained(&[base], |s| node.retains(s), 0);
+        assert!(!keep.is_empty());
+        let theirs = Batch::parse(at("low", 0, 2)).unwrap();
+        node.replace_with(&theirs).await.unwrap();
+        node.copy_forward(keep).await.unwrap();
+        let id = BatchId {
+            log: log("low"),
+            first_seq: 0,
+        };
+        assert_eq!(
+            node.store.get(&id).map(|b| b.bytes),
+            Some(theirs.bytes.clone())
+        );
+        drop(node);
+        let node = Node::open(c).await.expect("the log reopens");
+        assert_eq!(node.store.get(&id).map(|b| b.bytes), Some(theirs.bytes));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

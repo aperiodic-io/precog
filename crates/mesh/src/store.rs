@@ -116,8 +116,8 @@ struct Inner {
     /// Second copies of a batch logged twice (a repair raced a replicate), and absorbed batches
     /// a replacement took the place of: never served.
     dead: BTreeSet<Lsn>,
-    /// LSNs past `contiguous` of batches replaced or forgotten in RAM, and of dead copies:
-    /// durable, so `contiguous` steps over them.
+    /// LSNs past `contiguous` of batches replaced or forgotten in RAM: durable, so
+    /// `contiguous` steps over them.
     superseded: BTreeSet<Lsn>,
     /// Batches copied forward (`Store::moved`) to LSNs at or past `contiguous`: not new, so a
     /// live feed starting now does not join their logs at them.
@@ -668,6 +668,15 @@ impl Inner {
         }
     }
 
+    /// The batch logged at `lsn` (`m`), if it is still retained here: its log.
+    fn live(&self, lsn: Lsn, m: &Meta) -> Option<u32> {
+        let (l, _) = decode_record_key(&m.key).ok()?;
+        let ix = *self.ix.get(&l)?;
+        let age = (m.time_ms, m.first_seq, lsn);
+        (lsn >= self.floor && age >= self.stream_of(ix).floor && !self.dead.contains(&lsn))
+            .then_some(ix)
+    }
+
     /// Forgets the stream's oldest batches while `over` (its bytes, the batch) says so, oldest
     /// first by `Age`: a batch copied forward keeps its append time, so it still
     /// goes first. Returns how many. Reads one absorbed segment's runs at a time: the one whose
@@ -1109,27 +1118,23 @@ impl Store {
             .trim_while(&self.reader, stream, |bytes, x| f(bytes, x.lsn))
     }
 
+    /// Whether the batch logged at `lsn` (`m`) is still retained here (not forgotten, replaced
+    /// or copied since): what the cleaner may copy.
+    pub fn retains(&self, lsn: Lsn, m: &Meta) -> bool {
+        self.inner.lock().live(lsn, m).is_some()
+    }
+
     /// Batches the cleaner copied forward: each (old LSN, new LSN, its record's metadata,
-    /// payload length). A copy keeps the batch's identity and bytes and takes its place; the
-    /// old record is never served again. A copy of a batch retention forgot meanwhile is dead.
+    /// payload length), each of a batch it `retains`. A copy keeps the batch's identity and
+    /// bytes and takes its place; the old record is never served again.
     pub fn moved<'a>(&self, copies: impl IntoIterator<Item = (Lsn, Lsn, &'a Meta, u32)>) {
         let mut g = self.inner.lock();
         let inner = &mut *g;
         let mut new = vec![];
         for (old, lsn, m, len) in copies {
-            let ix = decode_record_key(&m.key)
-                .ok()
-                .and_then(|(l, _)| inner.ix.get(&l).copied());
-            let live = ix.is_some_and(|ix| {
-                old >= inner.floor
-                    && (m.time_ms, m.first_seq, old) >= inner.stream_of(ix).floor
-                    && !inner.dead.contains(&old)
-            });
-            let (Some(ix), true) = (ix, live) else {
-                inner.dead.insert(lsn);
-                inner.superseded.insert(lsn); // in the log all the same: `contiguous` steps over it
-                continue;
-            };
+            let ix = inner
+                .live(old, m)
+                .expect("a copy is of a retained batch: Node::copy_forward checks, under its lock");
             inner.dead.insert(old);
             let l = &mut inner.logs[ix as usize];
             let s = inner.streams.get_mut(&l.id.stream).unwrap();
@@ -2818,10 +2823,10 @@ mod tests {
         );
         // a trim up to (not past) a gap leaves the frontier where it is, unread
         let mut t = store_with(TINY);
-        for seq in [4, 0, 1, 2, 3, 6, 7, 8] {
+        for (i, seq) in [4, 0, 1, 2, 3, 6, 7, 8].into_iter().enumerate() {
             let x = on("g", "w", seq);
             t.s.reserve(&x);
-            t.durable(&x);
+            t.durable_at(&x, 1_000 + i as u64);
         }
         t.s.absorb();
         let one = on("g", "w", 0).bytes.len() as u64;
@@ -3152,17 +3157,20 @@ mod tests {
     fn copy(t: &mut T, kept: &[Kept]) {
         for k in kept {
             let r = t.log.reader().read(k.lsn).unwrap().unwrap();
+            if !t.s.retains(k.lsn, &r.meta) {
+                continue; // as Node::copy_forward: forgotten or replaced since picked
+            }
             let lsn = t.log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
             t.s.moved([(k.lsn, lsn, &r.meta, r.payload.len() as u32)]);
         }
     }
 
     #[test]
-    fn a_copy_of_a_batch_forgotten_meanwhile_does_not_hold_back_what_is_logged_after_it() {
+    fn a_batch_forgotten_after_the_cleaner_picked_it_is_not_copied() {
         // Why: the cleaner picks what streams retain, then copies it; the stream's retention can
-        // forget a batch in between. Its copy is dead, but its LSN is in the log: `contiguous`
-        // must step over it, or live feeds stall and nothing is absorbed again (so the node cap
-        // stops dropping segments).
+        // forget a batch in between. A copy of it would be dead on arrival with its LSN in the
+        // log, holding `contiguous` there for good: live feeds would stall and nothing would be
+        // absorbed again (so the node cap would stop dropping segments). It is not copied.
         let mut t = store_with(TINY);
         for seq in 0..4 {
             let x = on("s", "w", seq);
@@ -3498,6 +3506,9 @@ mod tests {
         assert_eq!(lsns, [1, 2, 3]);
         for k in &keep["s"] {
             let r = t.log.reader().read(k.lsn).unwrap().unwrap();
+            if !t.s.retains(k.lsn, &r.meta) {
+                continue; // as Node::copy_forward: forgotten or replaced since picked
+            }
             let lsn = t.log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
             t.s.moved([(k.lsn, lsn, &r.meta, r.payload.len() as u32)]);
         }
@@ -3521,6 +3532,9 @@ mod tests {
         assert_eq!(t.s.trim_stream("s", Some(6 * one), None, 0), 2);
         for k in &keep["s"] {
             let r = t.log.reader().read(k.lsn).unwrap().unwrap();
+            if !t.s.retains(k.lsn, &r.meta) {
+                continue; // as Node::copy_forward: forgotten or replaced since picked
+            }
             let lsn = t.log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
             t.s.moved([(k.lsn, lsn, &r.meta, r.payload.len() as u32)]);
         }
