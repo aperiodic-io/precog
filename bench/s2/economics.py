@@ -40,8 +40,12 @@ CPU_US_REC_GATEWAY = 1.75  # S2 REST/JSON gateway per record at 256 B, 100 per a
 CPU_US_PER_KIB = 1.0      # model: copies, CRCs and JSON per KiB beyond the measured size
 LINK_GBPS = 10            # with the 10G uplink add-on
 DISK_FILL = 0.8           # usable share of disks
-RAM_BYTES_PER_STREAM = 1000  # per node holding the stream (results/s2.md, million-stream probe)
+RAM_NODE_BYTES_PER_STREAM = 3_960  # per node holding the stream (results/s2-streams.jsonl, 1M streams)
+RAM_GW_BYTES_PER_STREAM = 8_800    # the owning gateway's streamer (500k streams, node subtracted)
 RAM_EUR_GB_MONTH = 259 / 128  # AX102: EUR 259 for 128 GB, all of it charged to RAM (an upper bound)
+# A proposed list: about half of s2.dev on bytes, streams priced at today's resident-RAM cost
+PROPOSED = dict(write=0.02, read=0.01, read_internet=0.02, store=0.025, ops_k=0.0, streams_k=0.05)
+AWS_EGRESS_USD_GB = 0.09    # what a customer running in AWS pays to send a GB to Hetzner
 STAFF_EUR = (15_000, 45_000)  # on-call SRE coverage and tooling per month: model, see the report
 
 
@@ -150,7 +154,7 @@ def main():
     ap.add_argument("--draws", type=int, default=20000)
     a = ap.parse_args()
     gm = 0.75
-    stream_cost_k = 3 * RAM_BYTES_PER_STREAM * 1000 / 1e9 * RAM_EUR_GB_MONTH * EUR  # USD per 1000 streams-month
+    stream_cost_k = (3 * RAM_NODE_BYTES_PER_STREAM + RAM_GW_BYTES_PER_STREAM) * 1000 / 1e9 * RAM_EUR_GB_MONTH * EUR  # USD per 1000 streams-month, all resident
 
     print("### 1. Marginal unit costs at fleet scale (USD), against s2.dev's list prices\n")
     print("Base: 50% target utilization, cores 1.5x the test VM's, 1 KiB records, 6 h on NVMe, EUR = "
@@ -175,7 +179,8 @@ def main():
 
     w, r, st, _ = unit_costs()
     print(f"\nPer 1000 streams-month: RAM for 3 copies of the per-stream state = {money(stream_cost_k)} "
-          f"(at {RAM_BYTES_PER_STREAM} B per stream per node); s2.dev charges ${S2['streams_k_month']:.2f}. "
+          f"(3 node copies x {RAM_NODE_BYTES_PER_STREAM:,} B + {RAM_GW_BYTES_PER_STREAM:,} B in the owner, every stream resident, "
+          f"all of the AX102's price charged to RAM); s2.dev charges ${S2['streams_k_month']:.2f}. "
           "Stream operations: CPU is already in the per-GiB costs; s2.dev charges $0.001 per 1000.\n")
 
     print("### 2. A price list at 75% gross margin on marginal cost, and at 30% under s2.dev\n")
@@ -187,6 +192,15 @@ def main():
     for name, cost, s2p in lines:
         price = cost / (1 - gm)
         print(f"| {name} | ${cost:.4f} | ${price:.4f} | ${s2p:.4f} | {price / s2p - 1:+.0%} | {1 - cost / (0.7 * s2p):.0%} |")
+
+    print("\n### 2b. A proposed list price (about half of s2.dev on bytes) and its margin per line\n")
+    print("| line | proposed | s2.dev | our marginal cost | GM |")
+    print("|---|---:|---:|---:|---:|")
+    for (name, cost, s2p), key in zip(lines, ["write", "read", "read_internet", "store", "streams_k"]):
+        print(f"| {name} | ${PROPOSED[key]:.4f} | ${s2p:.4f} | ${cost:.4f} | {1 - cost / PROPOSED[key]:.0%} |")
+    off_heap = (3 * 2_000) * 1000 / 1e9 * RAM_EUR_GB_MONTH * EUR
+    print(f"| 1000 streams-month, dormant streams off-heap (~2 KB resident per copy, as s2-lite after a restart) | "
+          f"${PROPOSED['streams_k']:.4f} | ${S2['streams_k_month']:.4f} | ${off_heap:.4f} | {1 - off_heap / PROPOSED['streams_k']:.0%} |")
 
     print("\n### 3. The fixed floor: the smallest production fleet, and staff\n")
     small = fleet(1, 7, 2, integral=True)
@@ -203,21 +217,24 @@ def main():
         fixed = floor_usd + staff * EUR
         print(f"| {money(fixed)} (staff EUR {staff:,}) | {money(fixed / gm)} | {money(fixed / contrib_30)} |")
 
-    print("\n### 4. Customer bills: s2.dev list against our list (75% GM) and against s2.dev -30%\n")
-    print("| customer | s2.dev standard | our list (75% GM) | saving | our marginal cost | our GM at s2.dev -30% |")
-    print("|---|---:|---:|---:|---:|---:|")
+    print("\n### 4. Customer bills: s2.dev list, our list at 75% GM, the proposed list\n")
+    print("| customer | s2.dev standard | our list (75% GM) | proposed list | proposed GM | our marginal cost | "
+          "customer's AWS egress to reach us (if they run in AWS) |")
+    print("|---|---:|---:|---:|---:|---:|---:|")
     for sc in SCENARIOS:
         b = bill(sc, S2["write_std_gib"], S2["read_private_gib"], S2["store_gib"], S2["stream_ops_k"], S2["streams_k_month"])
         c = bill(sc, w, r, st, 0, stream_cost_k)
         ours = c / (1 - gm)
+        prop = bill(sc, PROPOSED["write"], PROPOSED["read"], PROPOSED["store"], PROPOSED["ops_k"], PROPOSED["streams_k"])
+        egress = sc["write_mib_s"] * 2**20 * SEC_PER_MONTH / 1e9 * AWS_EGRESS_USD_GB
         print(f"| {sc['name']}: {sc['write_mib_s']} MiB/s, {sc['retention_d']} d, reads {sc['read_x']}x, "
-              f"{sc['streams']:,} streams | {money(b)} | {money(ours)} | {1 - ours / b:.0%} | {money(c)} | {1 - c / (0.7 * b):.0%} |")
+              f"{sc['streams']:,} streams | {money(b)} | {money(ours)} | {money(prop)} | {1 - c / prop:.0%} | {money(c)} | {money(egress)} |")
 
     rng = random.Random(a.seed)
     print(f"\n### 5. Monte Carlo ({a.draws:,} draws): net margin of a business priced at s2.dev -30%\n")
     print("Each draw: utilization U(0.3, 0.65); core speed U(1.0, 2.2); record size log-uniform 256 B-8 KiB; "
-          "EUR U(1.0, 1.2) USD; cold tier EC 3+2, 3 replicas or object storage (1/3 each); RAM per stream "
-          "log-uniform 0.3-10 KB; staff EUR 15k-45k/month; customers drawn from the mix above. Net margin = "
+          "EUR U(1.0, 1.2) USD; cold tier EC 3+2, 3 replicas or object storage (1/3 each); resident RAM per stream "
+          "log-uniform 2-25 KB (2 KB: dormant streams off-heap, as s2-lite after a restart); staff EUR 15k-45k/month; customers drawn from the mix above. Net margin = "
           "(revenue - marginal cost - fleet floor - staff) / revenue.\n")
     print("| monthly revenue at s2.dev -30% | net margin p10 | p50 | p90 | P(net margin > 0) | P(net > 50%) |")
     print("|---|---:|---:|---:|---:|---:|")
@@ -228,8 +245,8 @@ def main():
                       record_bytes=int(math.exp(rng.uniform(math.log(256), math.log(8192)))),
                       eur=rng.uniform(1.0, 1.2), cold=rng.choice(["ec", "rep3", "obj"]))
             uw, ur, us, _ = unit_costs(**kw)
-            ram = math.exp(rng.uniform(math.log(300), math.log(10_000)))
-            sk = 3 * ram * 1000 / 1e9 * RAM_EUR_GB_MONTH * kw["eur"]
+            ram = math.exp(rng.uniform(math.log(2_000), math.log(25_000)))
+            sk = ram * 1000 / 1e9 * RAM_EUR_GB_MONTH * kw["eur"]
             cost = sum(bill(sc, uw, ur, us, 0, sk) for sc in SCENARIOS)
             s2b = sum(bill(sc, S2["write_std_gib"], S2["read_private_gib"], S2["store_gib"], S2["stream_ops_k"], S2["streams_k_month"]) for sc in SCENARIOS)
             variable = cost / (0.7 * s2b)                     # marginal cost share of revenue

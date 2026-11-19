@@ -13,8 +13,8 @@ workspace).
    whose sequence numbers *are* the stream's `seq_num`s. A per-stream owner (a sequencer task, as
    in s2-lite) assigns them and checks `match_seq_num` and fencing tokens. The mesh supplies 2-of-3
    durability unchanged. The POC gateway serves S2's REST API this way at
-   **[A-precog3]** durable on 2 of 3 nodes, against s2-lite's **[A-silo]** on S3-compatible
-   storage, through the same HTTP/JSON client. The leaderless writer-log path stays as it is for
+   **229k records/s at 5.0 ms p50** durable on 2 of 3 nodes, against s2-lite's **31k at 51 ms**
+   on S3-compatible storage (99k at 14 ms with a 5 ms flush), through the same HTTP/JSON client. The leaderless writer-log path stays as it is for
    the workloads it was built for.
 2. **The zombie-owner problem is already solved by the mesh's conflict rule, provided acks need a
    majority.** Two owners numbering the same seq_num through different nodes: at 2 of 3, 200 of
@@ -23,19 +23,29 @@ workspace).
    path. It needs an owner lease (control plane), `copies` ≥ a majority, and cleanup of losing
    minority copies before repair spreads them.
 3. **Object storage should be a tier, not the ack path, by default.** Local-disk quorum acks are
-   **[lat-ratio]** faster than s2-lite on S3 at its default flush, and they don't pay per-PUT
+   26x faster at p50 than s2-lite on S3 at its default flush (1.98 against 51.2 ms at 10k records/s; 3x against a 5 ms flush), and they don't pay per-PUT
    charges, which force object-storage WALs to batch across streams. Long retention, though, is
    where S2's design wins on cost: $0.023/GB-month on S3, against ~$0.24 for three gp3 copies.
    Recommendation: tier sealed segments to S3 (M8 already plans a cold tier). Offer an opt-in
    "standard" class that acks after a PUT, for users who want S2's no-local-state property. The
-   POC's S3 group commit acks at **[s3-p50]** p50 on local Silo.
+   POC's S3 group commit acks at 4.5 ms p50 on local Silo.
 4. **Unlimited streams is the deepest gap.** Precog keeps per-log state in RAM on every node,
-   and the million-stream probe measures it at **[1M-precog]** against s2-lite's **[1M-lite]**.
+   and the million-stream probe measures 3.9 KB per stream per node, all resident (3.8 GiB at 1M, 8.9 s restart), against s2-lite's 2.2 KB while hot and 44 MiB after a restart.
    Competing needs dormant streams off-heap (index on disk, state loaded on demand). That is a
    redesign of the store's indexes, not of the write path.
 5. **Multi-tenancy (basins, scoped access tokens, quotas, metering) is a control-plane project.**
    It is the largest piece of work, and it is a product decision before it is an engineering one.
    It can coexist with the current deployment: one gateway tier in front of the same mesh.
+
+6. **Unit economics on bare metal (asked for; `reports/S2 bare-metal economics.md`).** On
+   Hetzner, a GiB written costs Precog about $0.003, a GiB read under $0.001 and a GiB-month
+   stored about $0.007, against s2.dev's list of $0.05 each. The reasons are free internal
+   traffic and cheap NVMe and HDD capacity. Priced at about half of s2.dev on bytes, the gross
+   margin is 71–98% per line. Two things stand in the way. A stream costs more than s2.dev charges
+   until dormant streams leave RAM (C7). And the fixed floor (a minimal fleet plus on-call staff)
+   needs ~$50k/month of revenue. On AWS the same design pays ~$0.048/GiB of inter-AZ copies, so
+   the edge exists only on bare metal, and only for customers who don't pay cloud egress to reach
+   it.
 
 What Precog keeps that S2 lacks: broker-side dedup, compacted streams, reader groups with stored
 positions, many independent writers per stream without coordination, millisecond failover with no
@@ -158,7 +168,7 @@ Three distinct things are called "object storage":
 | WAL to 3 one-zone buckets (S2 express) | PUTs to a quorum of 3 S3 Express buckets in 3 AZs | ~5–10 ms + flush | as above | multi-AZ durability at single-digit ms |
 
 The POC's `gw-s3` sink is C6: everything queued while a PUT slot is busy goes in one object. On
-local Silo it acks at **[s3-p50] p50**. That is Silo's PUT on loopback, not S3's: on S3 Standard the
+local Silo it acks at **4.5 ms p50** (2.25 ms idle). That is Silo's PUT on loopback, not S3's: on S3 Standard the
 same design would sit at tens of ms, which is S2's 400 ms budget for Standard with a large margin.
 The real constraint is the PUT bill (§5): an object WAL has to aggregate across all streams on a
 node (S2's channels do exactly that), and the flush interval trades latency against dollars.
@@ -168,7 +178,10 @@ node (S2's channels do exactly that), and the flush interval trades latency agai
 Every Precog node keeps, per writer log, a `BTreeMap` of batches, contiguous frontiers, and the
 stream's LSN order, and rebuilds them at start from index files. S2 keeps a dormant stream as
 metadata plus segments, and s2-lite keeps it as SlateDB keys. The probe creates N streams with
-one record each. **[1M table]** Needs: per-log index on disk (the plan's risk table already names
+one record each. At 1M streams a Precog node holds 3.8 GiB (3.9 KB per stream) and takes 8.9 s to restart,
+rebuilding every stream. s2-lite holds 2.1 GiB while they are hot, but only **44 MiB after a
+restart** (1.3 s), because it loads streams lazily. The POC gateway adds ~8.8 KB per stream in its
+streamer tasks (`results/s2.md`). Needs: per-log index on disk (the plan's risk table already names
 redb or index files), an LRU of hot logs, and repair that compares stream summaries instead of
 every log's frontier. Cost 6–10 weeks. It replaces the internal index; the API is unchanged.
 
@@ -192,12 +205,12 @@ a Porcupine-style linearizability check of owned streams against the gateway.
 
 | Dimension | S2 (object-storage durability) | Precog (local-disk quorum) |
 |---|---|---|
-| Write latency | Express ≤ 40 ms, Standard ≤ 400 ms (SLO); s2-lite on Silo **[silo-p50]** p50 at its default 50 ms flush, **[silo5-p50]** at 5 ms | **[precog3-p50]** p50 for 2-of-3 through the same gateway and client; ~1–3 ms natively |
+| Write latency | Express ≤ 40 ms, Standard ≤ 400 ms (SLO); s2-lite on Silo 51 ms p50 at its default 50 ms flush, 6.2 ms at 5 ms (10k records/s) | 1.98 ms p50, 5.0 ms p99 for 2-of-3 through the same gateway and client (10k records/s) |
 | Durability domain | multi-AZ object storage (11 nines) | k nodes in distinct failure domains; losing k disks loses data |
-| Cost per GB stored | S2 list price $0.05/GiB-month (S3 raw ~$0.023) | 3 × gp3 ≈ $0.24/GB-month, or instance NVMe (no list price; sized by the fleet) |
-| Cost per GB written | $0.05–0.075/GiB list; S3 PUTs amortized across streams | cross-AZ replication: 2 copies × $0.01–0.02/GB in AWS; free on-prem |
+| Cost per GB stored | S2 list price $0.05/GiB-month (S3 raw ~$0.023) | AWS: 3 × gp3 ≈ $0.24/GB-month. Hetzner: ~$0.007/GiB-month on erasure-coded SX295 HDDs or Hetzner Object Storage |
+| Cost per GB written | $0.05–0.075/GiB list; S3 PUTs amortized across streams | AWS: ~$0.048/GiB, almost all inter-AZ copies. Hetzner: ~$0.003/GiB (internal traffic free) |
 | Request cost | PUT-bound: 200 PUT/s per writer node ≈ $2,600/month on S3 Standard at $0.005/1000 | none |
-| Stream count | unlimited; dormant streams cost metadata only | bounded by RAM per node (**[1M-precog]** per million) |
+| Stream count | unlimited; dormant streams cost metadata only | bounded by RAM per node (3.8 GiB per million streams per node, all resident) |
 | Ordering | dense per-stream order, linearizable; conditional appends | per-writer order; any number of writers per stream with no coordination; optional owned streams (C1) |
 | Availability on a node loss | stream moves to another channel (speculative migration) | no election: clients retry on another node (≤ 71 ms measured) |
 | Operations | stateless compute; state in S3 | stateful nodes; repair after rejoin; disks to watch |

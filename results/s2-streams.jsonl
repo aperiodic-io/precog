@@ -1,0 +1,3 @@
+{"errors": 0, "label": "precog1-native", "secs": 23.8, "streams": 1000000, "streams_per_s": 41966.0, "system": "precog1-native", "rss_mib": 3778.1, "rss_after_restart_mib": 3563.8, "restart_s": 8.87, "disk_mib": 512.1, "bytes_per_stream_rss": 3962}
+{"errors": 0, "label": "s2lite-disk", "secs": 353.3, "streams": 1000000, "streams_per_s": 2830.0, "system": "s2lite-disk", "rss_mib": 2111.9, "rss_after_restart_mib": 44.5, "restart_s": 1.34, "disk_mib": 1794.9, "bytes_per_stream_rss": 2214}
+{"errors": 0, "label": "precog1-gw", "secs": 72.3, "streams": 500000, "streams_per_s": 6912.0, "system": "precog1-gw", "rss_mib": 6186.0, "rss_after_restart_mib": 1782.1, "restart_s": 3.45, "disk_mib": 512.1, "bytes_per_stream_rss": 12973}

@@ -80,11 +80,21 @@ The plan's gap table (§2) lists them feature by feature.
 2. **An S2-compatible gateway is cheap.** About 600 lines (`crates/s2-lab/src/bin/gateway.rs`)
    serve S2's append, read (unary and SSE) and check-tail endpoints over Precog. One driver runs
    the same JSON workload against s2-lite and the gateway, and the results table compares them.
-3. **Latency follows durability placement.** At the same HTTP layer, 2-of-3 local fsync acks in
-   low milliseconds. s2-lite on S3-compatible storage acks after SlateDB's flush, which is 50 ms
-   by default. An object-storage group commit in the gateway acks at Silo's PUT latency on
-   loopback; on real S3 it would be tens of milliseconds.
-4. **Stream count is RAM-bound in Precog.** The million-stream probe sizes it against s2-lite.
+3. **Latency follows durability placement.** At 10k records/s through the same HTTP layer:
+   - 2-of-3 local fsync acks at 1.98 ms p50 / 5.0 ms p99.
+   - s2-lite on S3-compatible Silo acks at 51 ms after SlateDB's default 50 ms flush, or 6.2 ms
+     with a 5 ms flush.
+   - Closed loop, Precog carried 229k records/s at 6.9 µs of CPU per record, against s2-lite's
+     31k–99k at 10–12 µs.
+   - An object-storage group commit in the gateway acks at 4.5 ms on loopback Silo; on real S3 it
+     would be tens of milliseconds.
+4. **Stream count is RAM-bound in Precog.** At 1M streams a Precog node holds 3.8 GiB with every
+   stream resident and restarts in 8.9 s. s2-lite holds 44 MiB after a restart, because it loads
+   streams lazily.
+5. **Unit economics** ([`S2 bare-metal economics.md`](S2%20bare-metal%20economics.md)). On
+   Hetzner a GiB costs Precog about $0.003 written, under $0.001 read and $0.007 stored-month,
+   against s2.dev's $0.05 each. The edge needs free internal traffic, which AWS does not offer:
+   there, inter-AZ copies alone cost ~$0.048/GiB written.
 
 ## Recommendation
 
