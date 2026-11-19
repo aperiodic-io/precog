@@ -7,3 +7,4 @@
 states/
 *_TTrace_*
 /crates/s2-lab/target
+__pycache__/
