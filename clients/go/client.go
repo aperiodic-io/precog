@@ -539,9 +539,21 @@ type Consumer struct {
 // Poll returns the next events (about maxBytes of batches), per writer in sequence order;
 // none when caught up. Fails over to the next node on an error.
 func (c *Consumer) Poll(ctx context.Context, maxBytes uint32) ([]Event, error) {
+	// a batch can hold no event for this reader (dedup dropped them all, or the cursor is past
+	// them): read on, so an empty poll still means caught up
+	for {
+		evs, batches, err := c.poll(ctx, maxBytes)
+		if err != nil || len(evs) > 0 || batches == 0 {
+			return evs, err
+		}
+	}
+}
+
+// poll is one read: the events and the number of batches that came back.
+func (c *Consumer) poll(ctx context.Context, maxBytes uint32) ([]Event, int, error) {
 	body, err := json.Marshal(control{Op: "read_cursor", Stream: c.stream, Cursor: c.cursor.wire(), MaxBytes: &maxBytes})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	n := len(c.cl.addrs)
 	for i := range n {
@@ -558,20 +570,22 @@ func (c *Consumer) Poll(ctx context.Context, maxBytes uint32) ([]Event, error) {
 			break
 		}
 	}
-	return nil, fmt.Errorf("precog: no node answered: %w", err)
+	return nil, 0, fmt.Errorf("precog: no node answered: %w", err)
 }
 
-func (c *Consumer) take(body []byte) ([]Event, error) {
+func (c *Consumer) take(body []byte) ([]Event, int, error) {
 	var out []Event
+	batches := 0
 	for len(body) >= 4 {
 		n := int(binary.LittleEndian.Uint32(body))
 		if len(body)-4 < n {
-			return nil, errors.New("precog: truncated batches")
+			return nil, 0, errors.New("precog: truncated batches")
 		}
 		b, err := parseBatch(body[4 : 4+n])
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
+		batches++
 		body = body[4+n:]
 		l := Log{b.log.Writer, b.log.Epoch}
 		from := c.cursor[l]
@@ -582,7 +596,7 @@ func (c *Consumer) take(body []byte) ([]Event, error) {
 		}
 		c.cursor[l] = b.end
 	}
-	return out, nil
+	return out, batches, nil
 }
 
 // Cursor is where the consumer is: a position valid on every node (a copy).

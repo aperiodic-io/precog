@@ -133,6 +133,7 @@ fn entries_report_each_payload_length_without_reading_it() {
         let got: Vec<usize> = log
             .reader()
             .entries(0, 1000)
+            .unwrap()
             .iter()
             .map(|e| e.payload_len as usize)
             .collect();
@@ -150,7 +151,7 @@ fn torn_final_group_is_dropped_even_if_later_pages_reached_disk() {
     {
         let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
         fill(&mut log, 0, 5, 3, 700);
-        let e = log.reader().entries(12, 3);
+        let e = log.reader().entries(12, 3).unwrap();
         last_group_offset = e[0].offset;
         assert_eq!(e.len(), 3);
     }
@@ -178,7 +179,7 @@ fn torn_tail_keeps_the_valid_prefix_of_the_last_group() {
     {
         let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
         fill(&mut log, 0, 4, 3, 700);
-        third = log.reader().entries(11, 1)[0].offset;
+        third = log.reader().entries(11, 1).unwrap()[0].offset;
     }
     // only the first two records of the last group reached disk
     let active = segment_files(d.path()).pop().unwrap();
@@ -195,7 +196,7 @@ fn damage_followed_by_a_later_group_fails_closed() {
     {
         let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
         fill(&mut log, 0, 6, 2, 700);
-        early = log.reader().entries(4, 1)[0].offset;
+        early = log.reader().entries(4, 1).unwrap()[0].offset;
     }
     let active = segment_files(d.path()).pop().unwrap();
     patch(&active, early + record::HEADER as u64 + 3, &[0x5A]);
@@ -211,7 +212,7 @@ fn sealed_segment_damage_is_refused_on_read() {
     let d = tempfile::tempdir().unwrap();
     let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
     fill(&mut log, 0, 100, 2, 1000);
-    let e = log.reader().entries(3, 1)[0].clone();
+    let e = log.reader().entries(3, 1).unwrap()[0].clone();
     let first = segment_files(d.path())[0].clone();
     patch(
         &first,
@@ -430,7 +431,7 @@ fn readers_see_appends_concurrently_and_hit_the_tail_cache() {
     assert!(log.stats().cache_hits > 0, "{:?}", log.stats());
 }
 
-mod property {
+mod props {
     use super::*;
     use proptest::prelude::*;
 
@@ -457,7 +458,7 @@ mod property {
                     i += *g as u64;
                 }
                 let n = log.next_lsn();
-                let e = log.reader().entries(0, n as usize);
+                let e = log.reader().entries(0, n as usize).unwrap();
                 // a record is complete once its bytes (not its zero padding) are on disk
                 for x in &e { ends.push(x.offset + (record::HEADER + x.meta.key.len() + size) as u64); }
                 let last_g = *groups.last().unwrap() as u64;
@@ -483,7 +484,7 @@ fn damaged_sealed_segment_without_index_fails_closed() {
     {
         let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
         fill(&mut log, 0, 100, 2, 1000);
-        off = log.reader().entries(5, 1)[0].offset;
+        off = log.reader().entries(5, 1).unwrap()[0].offset;
     }
     let first = segment_files(d.path())[0].clone();
     std::fs::remove_file(first.with_extension("idx")).unwrap();
@@ -519,7 +520,7 @@ fn segments_missing_at_the_head_count_as_retained() {
     ));
 }
 
-mod flips {
+mod props_flips {
     use super::*;
     use proptest::prelude::*;
 
@@ -543,7 +544,7 @@ mod flips {
                     i += *g as u64;
                 }
                 total = log.next_lsn();
-                let e = log.reader().entries(0, total as usize);
+                let e = log.reader().entries(0, total as usize).unwrap();
                 let last_g = *groups.last().unwrap() as u64;
                 last_start = e[(total - last_g) as usize].offset;
                 let l = e.last().unwrap();
@@ -673,7 +674,7 @@ fn damage_before_a_successor_segment_with_records_fails_closed() {
     {
         let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
         fill(&mut log, 0, 70, 2, 1000);
-        let e = log.reader().entries(0, 1000);
+        let e = log.reader().entries(0, 1000).unwrap();
         let last_seg = e.last().unwrap().segment;
         last_of_prev = e
             .iter()
@@ -705,7 +706,7 @@ fn damage_that_cuts_a_segment_short_never_discards_its_successor() {
     {
         let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
         fill(&mut log, 0, 70, 2, 1000);
-        let e = log.reader().entries(0, 1000);
+        let e = log.reader().entries(0, 1000).unwrap();
         let last_seg = e.last().unwrap().segment;
         mid = e
             .iter()
@@ -744,7 +745,7 @@ fn recovery_handles_torn_groups_beyond_the_first_read_chunk() {
     {
         let mut log = Log::open(cfg(d.path(), seg)).unwrap();
         fill(&mut log, 0, 200, 4, 15_000);
-        last = log.reader().entries(796, 1)[0].offset;
+        last = log.reader().entries(796, 1).unwrap()[0].offset;
     }
     let active = segment_files(d.path()).pop().unwrap();
     patch(&active, last + 8, &[0xFF; 4]);
@@ -834,7 +835,7 @@ fn reader_entries_and_bounds_across_segments() {
     fill(&mut log, 0, 100, 2, 1000);
     let r = log.reader();
     assert_eq!((r.first_lsn(), r.next_lsn()), (0, 200));
-    let all = r.entries(0, usize::MAX);
+    let all = r.entries(0, usize::MAX).unwrap();
     assert_eq!(
         all.iter().map(|e| e.lsn).collect::<Vec<_>>(),
         (0..200).collect::<Vec<_>>()
@@ -844,7 +845,7 @@ fn reader_entries_and_bounds_across_segments() {
         "spans segments"
     );
     for (from, limit) in [(0, 1), (37, 50), (59, 120), (150, 1000), (199, 5)] {
-        let e = r.entries(from, limit);
+        let e = r.entries(from, limit).unwrap();
         let want: Vec<u64> = (from..(from + limit as u64).min(200)).collect();
         assert_eq!(
             e.iter().map(|x| x.lsn).collect::<Vec<_>>(),
@@ -852,13 +853,13 @@ fn reader_entries_and_bounds_across_segments() {
             "from {from} limit {limit}"
         );
     }
-    assert!(r.entries(200, 10).is_empty());
-    assert!(r.entries(0, 0).is_empty());
+    assert!(r.entries(200, 10).unwrap().is_empty());
+    assert!(r.entries(0, 0).unwrap().is_empty());
     let floor = log.retain(Some(2 * 64 * KB), None).unwrap();
     let r = log.reader();
     assert_eq!(r.first_lsn(), floor);
     assert_eq!(
-        r.entries(0, 3)[0].lsn,
+        r.entries(0, 3).unwrap()[0].lsn,
         floor,
         "entries start at the retention floor"
     );
@@ -929,7 +930,7 @@ fn retention_boundaries_are_exact() {
         "one byte over: exactly one segment dropped"
     );
     // by age: the next segment's newest record has time 1000 + (its last lsn)
-    let e = log.reader().entries(floor, 1000);
+    let e = log.reader().entries(floor, 1000).unwrap();
     let first_seg = e[0].segment;
     let last_lsn = e.iter().rfind(|x| x.segment == first_seg).unwrap().lsn;
     assert_eq!(
@@ -1007,7 +1008,7 @@ fn a_recycled_head_segment_moves_the_floor_exactly() {
     {
         let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
         fill(&mut log, 0, 100, 2, 1000);
-        let e = log.reader().entries(0, 1000);
+        let e = log.reader().entries(0, 1000).unwrap();
         second_base = e.iter().find(|x| x.segment != e[0].segment).unwrap().lsn;
     }
     let segs = segment_files(d.path());
@@ -1228,7 +1229,7 @@ fn recovery_of_an_active_segment_larger_than_its_read_buffer() {
     {
         let mut log = Log::open(cfg(d.path(), seg)).unwrap();
         fill(&mut log, 0, 440, 4, 15_000);
-        last = log.reader().entries(1756, 4);
+        last = log.reader().entries(1756, 4).unwrap();
     }
     let active = segment_files(d.path()).pop().unwrap();
     // the first record of the last group is damaged, the rest of the group reached disk
@@ -1248,7 +1249,7 @@ fn interior_damage_far_from_the_end_of_a_large_segment_fails_closed() {
     {
         let mut log = Log::open(cfg(d.path(), seg)).unwrap();
         fill(&mut log, 0, 400, 4, 15_000);
-        early = log.reader().entries(1200, 1)[0].offset; // ~18 MiB in
+        early = log.reader().entries(1200, 1).unwrap()[0].offset; // ~18 MiB in
     }
     let active = segment_files(d.path()).pop().unwrap();
     patch(&active, early + 8, &[0xFF; 4]);
@@ -1258,29 +1259,14 @@ fn interior_damage_far_from_the_end_of_a_large_segment_fails_closed() {
     ));
 }
 
-/// Parses an index file into (header, entries as byte ranges) and rewrites it with a fixed CRC.
-fn index_entries(b: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let body = &b[..b.len() - 4];
-    let n = u32::from_le_bytes(body[32..36].try_into().unwrap()) as usize;
-    let mut o = 36;
-    let mut v = vec![];
-    for _ in 0..n {
-        let kl = u16::from_le_bytes(body[o + 36..o + 38].try_into().unwrap()) as usize;
-        v.push(body[o..o + 38 + kl].to_vec());
-        o += 38 + kl;
-    }
-    (body[..36].to_vec(), v)
-}
-
-fn write_index(path: &Path, header: &[u8], entries: &[Vec<u8>]) {
-    let mut b = header.to_vec();
-    b[32..36].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-    for e in entries {
-        b.extend_from_slice(e);
-    }
-    let c = crc32c::crc32c(&b);
-    b.extend_from_slice(&c.to_le_bytes());
-    std::fs::write(path, b).unwrap();
+/// Rewrites an index file's body (header, then 40-byte entries by LSN) under a fixed CRC.
+fn rewrite_index(path: &Path, f: impl FnOnce(&mut Vec<u8>)) {
+    let b = std::fs::read(path).unwrap();
+    let mut body = b[..b.len() - 4].to_vec();
+    f(&mut body);
+    let c = crc32c::crc32c(&body);
+    body.extend_from_slice(&c.to_le_bytes());
+    std::fs::write(path, body).unwrap();
 }
 
 #[test]
@@ -1291,11 +1277,12 @@ fn an_index_pointing_at_the_wrong_record_is_caught_on_read() {
         fill(&mut log, 0, 100, 2, 1000);
     }
     let idx = segment_files(d.path())[0].with_extension("idx");
-    let (h, mut e) = index_entries(&std::fs::read(&idx).unwrap());
-    let (a, b) = (e[0][..8].to_vec(), e[1][..8].to_vec());
-    e[0][..8].copy_from_slice(&b);
-    e[1][..8].copy_from_slice(&a);
-    write_index(&idx, &h, &e);
+    // swap the offsets of records 0 and 1
+    rewrite_index(&idx, |b| {
+        let (x, y) = (b[40..48].to_vec(), b[80..88].to_vec());
+        b[40..48].copy_from_slice(&y);
+        b[80..88].copy_from_slice(&x);
+    });
     let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
     assert_eq!(
         log.stats().index_rebuilds,
@@ -1316,9 +1303,11 @@ fn an_index_with_the_wrong_number_of_entries_is_rebuilt() {
         fill(&mut log, 0, 100, 2, 1000);
     }
     let idx = segment_files(d.path())[0].with_extension("idx");
-    let (h, mut e) = index_entries(&std::fs::read(&idx).unwrap());
-    e.pop();
-    write_index(&idx, &h, &e);
+    // one entry fewer than the segment holds, consistently
+    rewrite_index(&idx, |b| {
+        let n = u32::from_le_bytes(b[32..36].try_into().unwrap());
+        b[32..36].copy_from_slice(&(n - 1).to_le_bytes());
+    });
     let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
     assert_eq!(log.stats().index_rebuilds, 1);
     check_all(&log, 0, 200, 1000);
@@ -1397,7 +1386,7 @@ fn a_damaged_final_record_is_dropped_and_zeroed() {
     {
         let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
         fill(&mut log, 0, 10, 1, 100);
-        off = log.reader().entries(9, 1)[0].offset;
+        off = log.reader().entries(9, 1).unwrap()[0].offset;
     }
     let active = segment_files(d.path()).pop().unwrap();
     patch(&active, off + record::HEADER as u64 + 30, &[0xEE]); // payload: the checksum fails
@@ -1848,4 +1837,524 @@ fn spare_names_keep_counting_up_across_a_restart() {
         !new.is_empty() && new.iter().all(|&n| n > old[0]),
         "{old:?} then {new:?}"
     );
+}
+
+#[test]
+fn sealed_segments_serve_each_keys_records_from_their_index_file() {
+    // Why: the node looks up a writer log's older batches here (one read of that key's run in a
+    // segment's index file) instead of holding every record's index entry in RAM. The answer
+    // must match the records exactly, survive a restart, and drop with the segment.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    fill(&mut log, 0, 300, 1, 1000);
+    let keys: Vec<Vec<u8>> = (0..3).map(|i| format!("log-{i}").into_bytes()).collect();
+    let check = |log: &Log| {
+        let r = log.reader();
+        let sealed = r.sealed();
+        assert!(sealed.len() >= 3, "{sealed:?}");
+        assert_eq!(sealed[0].0, log.first_lsn());
+        for w in sealed.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "contiguous");
+        }
+        let active = sealed.last().unwrap().1;
+        assert!(active < log.next_lsn(), "the active segment is not sealed");
+        for &(base, end) in &sealed {
+            let all = r.entries(base, (end - base) as usize).unwrap();
+            for key in &keys {
+                let got = r.by_key(base, key).unwrap();
+                let want: Vec<_> = all.iter().filter(|e| &e.meta.key == key).collect();
+                assert!(!got.is_empty());
+                assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(want) {
+                    assert_eq!(
+                        (g.lsn, g.segment, g.offset, g.payload_len, &g.meta),
+                        (w.lsn, w.segment, w.offset, w.payload_len, &w.meta)
+                    );
+                }
+            }
+            assert!(r.by_key(base, b"log-9").unwrap().is_empty(), "no such key");
+            assert!(
+                r.by_key(base + 1, &keys[0]).unwrap().is_empty(),
+                "not a segment"
+            );
+        }
+        assert!(
+            r.by_key(active, &keys[0]).unwrap().is_empty(),
+            "the active one"
+        );
+        sealed
+    };
+    let sealed = check(&log);
+    drop(log);
+    let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert_eq!(log.stats().index_rebuilds, 0);
+    assert_eq!(check(&log), sealed, "after a restart, from the files");
+    let floor = log.retain(Some(4 * 64 * KB), None).unwrap();
+    assert!(floor > sealed[0].0);
+    let r = log.reader();
+    assert!(
+        r.by_key(sealed[0].0, &keys[0]).unwrap().is_empty(),
+        "dropped"
+    );
+    assert_eq!(r.sealed()[0].0, floor);
+}
+
+#[test]
+fn an_index_file_of_the_old_format_is_rebuilt() {
+    // the index format is versioned: version 1 files (entries held in RAM, no by-key section)
+    // are not misread, their segments are rescanned
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        fill(&mut log, 0, 100, 2, 1000);
+    }
+    let idx = segment_files(d.path())[0].with_extension("idx");
+    rewrite_index(&idx, |b| b[4..8].copy_from_slice(&1u32.to_le_bytes()));
+    let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    assert_eq!(log.stats().index_rebuilds, 1);
+    check_all(&log, 0, 200, 1000);
+    let base = log.reader().sealed()[0].0;
+    assert_eq!(log.reader().by_key(base, b"log-1").unwrap()[0].lsn, 1);
+}
+
+#[test]
+fn a_record_stays_readable_while_its_segment_is_sealed() {
+    // Why: a roll seals the previous segment (its index moves from RAM to its file) while
+    // readers read it. A read racing the seal must still find the record: a `None` for a
+    // durable record makes a consumer skip it
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 16 * KB);
+    c.tail_cache_bytes = 0;
+    let mut log = Log::open(c).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (r, done) = (log.reader(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let n = r.next_lsn();
+                    if n > 0 {
+                        assert!(r.read(n - 1).unwrap().is_some(), "lsn {} missing", n - 1);
+                    }
+                }
+            })
+        })
+        .collect();
+    fill(&mut log, 0, 5_000, 1, 300);
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in readers {
+        t.join().unwrap();
+    }
+}
+
+/// Appends `groups` groups of `per` records without asking for a sync; returns the offset of
+/// the first record.
+fn unsynced_groups(log: &mut Log, start: u64, groups: u64, per: u64, size: usize) -> u64 {
+    fill(log, start, groups, per, size);
+    log.reader().entries(start, 1).unwrap()[0].offset
+}
+
+#[test]
+fn a_power_loss_under_write_caching_drops_the_unsynced_tail_whatever_reached_disk() {
+    // Why: with write caching (live-ingestion's setting) several groups are unsynced at once and
+    // the kernel writes their pages back in any order, so a power loss can keep a later group and
+    // lose an earlier one. None of them was relied on locally (acks rested on the replicas), so
+    // the node must come back with its synced prefix and repair the rest, not refuse to start.
+    // Found by spec/storage (MC_caching_unfixed.cfg).
+    let d = tempfile::tempdir().unwrap();
+    let c = || deferred(d.path(), 1 << 20, 1 << 20);
+    let lost;
+    {
+        let mut log = Log::open(c()).unwrap();
+        fill(&mut log, 0, 4, 2, 300);
+        log.flush().unwrap();
+        lost = unsynced_groups(&mut log, 8, 3, 2, 300);
+        assert_eq!(log.stats().syncs, 1, "groups 8.. are unsynced");
+    }
+    // the first unsynced group never reached disk; the two after it did
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, lost, &[0u8; 64]);
+    let mut log = Log::open(c()).unwrap();
+    assert_eq!(
+        log.next_lsn(),
+        8,
+        "the synced prefix, nothing after the hole"
+    );
+    check_all(&log, 0, 8, 300);
+    // the dropped groups' records were zeroed: a shorter write cannot be followed by them
+    fill(&mut log, 8, 1, 1, 10);
+    log.flush().unwrap();
+    drop(log);
+    assert_eq!(Log::open(c()).unwrap().next_lsn(), 9);
+}
+
+#[test]
+fn under_write_caching_damage_before_more_than_the_unsynced_bound_still_fails_closed() {
+    // Why: at most flush_bytes plus one group (MAX_GROUP) can be unsynced, so a hole followed by
+    // more than that was synced: damage, not a lost tail. Dropping it would discard data the
+    // log had made durable.
+    let d = tempfile::tempdir().unwrap();
+    let c = || deferred(d.path(), 64 << 20, 64 * KB);
+    let early;
+    {
+        let mut log = Log::open(c()).unwrap();
+        fill(&mut log, 0, 4, 1, 300);
+        early = log.reader().entries(1, 1).unwrap()[0].offset;
+        // past MAX_GROUP + flush_bytes of synced groups after the damage
+        let big = (record::MAX_RECORD - 4096) as u64;
+        let n = (precog_storage::log::MAX_GROUP as u64 + 64 * KB) / big + 2;
+        for i in 0..n {
+            let m = meta(4 + i);
+            log.append(&[(m, &vec![7u8; big as usize][..])]).unwrap();
+        }
+        log.flush().unwrap();
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, early + record::HEADER as u64 + 3, &[0x5A]);
+    match Log::open(c()) {
+        Err(Error::Corrupt(msg)) => assert!(msg.contains("later"), "{msg}"),
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("opened a log with interior damage"),
+    }
+}
+
+#[test]
+fn under_write_caching_the_unsynced_bound_is_exact_to_the_last_record_written() {
+    // Why: the bound decides between dropping an unsynced tail and failing closed on damage; a
+    // record that ends past x + Log::unsynced_bound was written after an fsync covered x.
+    // Two later records: the second, found by stepping over the first, decides.
+    for (past, opens) in [(0u64, true), (8, false)] {
+        let d = tempfile::tempdir().unwrap();
+        let c = || deferred(d.path(), 64 << 20, 4096);
+        {
+            let mut log = Log::open(c()).unwrap();
+            fill(&mut log, 0, 2, 1, 100);
+            log.flush().unwrap();
+        }
+        let (active, generation, lsn, x) = active_end(d.path());
+        let mut torn = vec![];
+        record::encode(&mut torn, generation, x, lsn, &meta(lsn), &[1; 100]);
+        torn[80] ^= 0xff;
+        patch(&active, x, &torn);
+        let bound = Log::unsynced_bound(&c());
+        let first = x + 1024;
+        let second = x + bound - record::HEADER as u64 + past;
+        for (at, l) in [(first, lsn + 1), (second, lsn + 2)] {
+            let mut r = vec![];
+            record::encode(&mut r, generation, at, l, &meta(l), &[2; 100]);
+            patch(&active, at, &r);
+        }
+        match Log::open(c()) {
+            Ok(log) => {
+                assert!(opens, "{past} bytes past the bound must fail closed");
+                assert_eq!(log.next_lsn(), 2, "the unsynced tail is dropped");
+            }
+            Err(Error::Corrupt(msg)) => assert!(!opens, "within the bound: {msg}"),
+            Err(e) => panic!("wrong error: {e}"),
+        }
+    }
+}
+
+#[test]
+fn retention_names_the_segments_it_would_drop_and_drops_up_to_a_boundary() {
+    // Why: a node copies forward what its streams still retain from exactly the segments the
+    // cap drops, then drops those and no more: what it is told must be what retention does.
+    let d = tempfile::tempdir().unwrap();
+    let seg = 64 * KB;
+    let mut log = Log::open(cfg(d.path(), seg)).unwrap();
+    fill(&mut log, 0, 150, 2, 1000);
+    let total = log.stats().log_bytes;
+    let (segs, t) = log.segments();
+    assert_eq!(t, total);
+    assert_eq!(
+        segs.len() + 1,
+        log.stats().segments,
+        "all but the active one"
+    );
+    let gone = &segs[..log.retirable(Some(3 * seg), None)];
+    assert!(gone.len() >= 2, "{gone:?}");
+    let freed: u64 = gone.iter().map(|s| s.bytes).sum();
+    assert!(total - freed <= 3 * seg && total - freed + gone.last().unwrap().bytes > 3 * seg);
+    let sealed = log.reader().sealed();
+    assert_eq!(sealed.len(), segs.len());
+    for (s, (base, end)) in segs.iter().zip(&sealed) {
+        assert_eq!((s.base, s.end), (*base, *end));
+        assert_eq!(s.max_time, 1_000 + end - 1, "time_ms of its newest record");
+    }
+    // age: only segments whose newest record is older than the limit
+    assert_eq!(log.retirable(None, Some(1_000 + sealed[1].1)), 2);
+    assert_eq!(log.retirable(None, None), 0);
+    // the first one only, whatever the cap says
+    let floor = log.drop_until(gone[0].end).unwrap();
+    assert_eq!(floor, gone[0].end);
+    assert_eq!(log.stats().log_bytes, total - gone[0].bytes);
+    assert!(log.reader().read(floor - 1).unwrap().is_none());
+    check_all(&log, floor, 300, 1000);
+    assert_eq!(
+        log.drop_until(floor).unwrap(),
+        floor,
+        "nothing below it is left"
+    );
+    assert_eq!(
+        log.retain(Some(3 * seg), None).unwrap(),
+        gone.last().unwrap().end
+    );
+    // the active segment is never dropped
+    let next = log.next_lsn();
+    let floor = log.drop_until(next).unwrap();
+    assert!(floor < next && log.reader().read(next - 1).unwrap().is_some());
+}
+
+#[test]
+fn a_crash_while_retention_drops_segments_keeps_the_log_consistent() {
+    // Why: the cleaner deletes a segment only after copying what streams retain from it; a
+    // crash before the manifest names the drop keeps the old copy, one after keeps the new.
+    for (step, dropped) in [
+        ("retain:before_manifest", false),
+        ("retain:after_manifest", true),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = cfg(d.path(), 64 * KB);
+        c.failpoints.fail_at = Some(step);
+        let mut log = Log::open(c).unwrap();
+        fill(&mut log, 0, 150, 2, 1000);
+        let end = log.reader().sealed()[0].1;
+        assert!(
+            matches!(log.drop_until(end), Err(Error::Fatal(_))),
+            "{step}"
+        );
+        assert!(log.is_fenced(), "{step}");
+        drop(log);
+        let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        let first = if dropped { end } else { 0 };
+        assert_eq!(log.first_lsn(), first, "{step}");
+        check_all(&log, first, 300, 1000);
+    }
+}
+
+#[test]
+fn a_record_s_append_time_is_read_from_its_index() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    fill(&mut log, 0, 150, 2, 1000);
+    let r = log.reader();
+    for lsn in [0, 1, 150, 299] {
+        assert_eq!(r.time_ms(lsn).unwrap(), Some(1_000 + lsn), "lsn {lsn}");
+    }
+    assert_eq!(r.time_ms(300).unwrap(), None, "not written");
+    log.retain(Some(3 * 64 * KB), None).unwrap();
+    assert_eq!(r.time_ms(0).unwrap(), None, "dropped");
+}
+
+/// Model-based test: random appends, flushes, retention by size and age, cache drops, lost
+/// index files and reopens against a list of records. After every step every read API
+/// (`read`, `entries`, `sealed`, `by_key`) agrees with the model.
+mod model {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// records of (key 0..3, payload bytes), time step
+        Append(Vec<(u8, usize)>, u64),
+        Flush,
+        RetainBytes(u64),
+        RetainAge(u64),
+        ClearCache,
+        /// drop one sealed segment's index file, then reopen
+        LoseIndex(prop::sample::Index),
+        Reopen,
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        let rec = (0u8..3, 0usize..1500);
+        prop::collection::vec(
+            prop_oneof![
+                8 => (prop::collection::vec(rec, 1..4), 0u64..50).prop_map(|(r, t)| Op::Append(r, t)),
+                1 => Just(Op::Flush),
+                1 => (8u64..64).prop_map(|k| Op::RetainBytes(k * KB)),
+                1 => (0u64..2000).prop_map(Op::RetainAge),
+                1 => Just(Op::ClearCache),
+                1 => any::<prop::sample::Index>().prop_map(Op::LoseIndex),
+                1 => Just(Op::Reopen),
+            ],
+            1..40,
+        )
+    }
+
+    struct Model {
+        recs: Vec<(Meta, Vec<u8>)>,
+        first: u64,
+        time: u64,
+    }
+
+    fn check(log: &Log, m: &Model) -> Result<(), TestCaseError> {
+        let r = log.reader();
+        prop_assert_eq!(log.next_lsn(), m.recs.len() as u64);
+        prop_assert_eq!(log.first_lsn(), m.first);
+        let newest = m.recs[m.first as usize..].iter().map(|r| r.0.time_ms).max();
+        prop_assert_eq!(
+            log.max_time(),
+            newest.unwrap_or(0),
+            "the newest append time in the log"
+        );
+        for (l, (meta, p)) in m.recs.iter().enumerate() {
+            let got = r.read(l as u64).unwrap();
+            let time = r.time_ms(l as u64).unwrap();
+            if (l as u64) < m.first {
+                prop_assert!(got.is_none(), "lsn {} below the floor", l);
+                prop_assert_eq!(time, None);
+                continue;
+            }
+            prop_assert_eq!(time, Some(meta.time_ms));
+            let got = got.unwrap();
+            prop_assert_eq!(&got.meta, meta);
+            prop_assert_eq!(&got.payload[..], &p[..]);
+        }
+        let all = r.entries(0, usize::MAX).unwrap();
+        let want: Vec<u64> = (m.first..m.recs.len() as u64).collect();
+        prop_assert_eq!(all.iter().map(|e| e.lsn).collect::<Vec<_>>(), want);
+        for e in &all {
+            prop_assert_eq!(&e.meta, &m.recs[e.lsn as usize].0);
+        }
+        // the sealed segments tile the log from its floor, and each one's by-key lookup holds
+        // exactly its records of that key, by first_seq
+        let mut at = m.first;
+        for (base, end) in r.sealed() {
+            prop_assert_eq!(base, at);
+            prop_assert!(end > base && end <= m.recs.len() as u64);
+            for k in 0u8..4 {
+                let key = format!("k{k}").into_bytes();
+                let got: Vec<u64> = r
+                    .by_key(base, &key)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.lsn)
+                    .collect();
+                let mut want: Vec<u64> = (base..end)
+                    .filter(|&l| m.recs[l as usize].0.key == key)
+                    .collect();
+                want.sort_by_key(|&l| (m.recs[l as usize].0.first_seq, l));
+                prop_assert_eq!(got, want, "segment {} key {}", base, k);
+            }
+            at = end;
+        }
+        prop_assert!(
+            r.by_key(at, b"k0").unwrap().is_empty(),
+            "the active segment has no index"
+        );
+        Ok(())
+    }
+
+    fn run(caching: bool, ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = cfg(d.path(), 16 * KB);
+        c.tail_cache_bytes = 8 * KB as usize;
+        if caching {
+            c.flush_delay_ms = 1_000;
+            c.flush_bytes = 4 * KB;
+        }
+        let mut log = Log::open(c.clone()).unwrap();
+        let mut m = Model {
+            recs: vec![],
+            first: 0,
+            time: 1_000,
+        };
+        for op in ops {
+            match op {
+                Op::Append(rs, dt) => {
+                    m.time += dt;
+                    let items: Vec<(Meta, Vec<u8>)> = rs
+                        .iter()
+                        .map(|&(k, n)| {
+                            let i = m.recs.len() as u64;
+                            // first_seq descends within a key so by_key's order is not LSN order
+                            let meta = Meta {
+                                key: format!("k{k}").into_bytes(),
+                                first_seq: u64::MAX - i,
+                                count: 1,
+                                tag: i as u32,
+                                time_ms: m.time,
+                            };
+                            (meta, payload(i, n))
+                        })
+                        .collect();
+                    let refs: Vec<(Meta, &[u8])> =
+                        items.iter().map(|(a, p)| (a.clone(), &p[..])).collect();
+                    let first = log.append(&refs).unwrap();
+                    prop_assert_eq!(first, m.recs.len() as u64);
+                    m.recs.extend(items);
+                }
+                Op::Flush => log.flush().unwrap(),
+                Op::RetainBytes(max) => {
+                    let sealed = log.reader().sealed();
+                    let floor = log.retain(Some(max), None).unwrap();
+                    prop_assert!(floor >= m.first);
+                    prop_assert!(
+                        floor == m.first || sealed.iter().any(|s| s.1 == floor),
+                        "the floor moves to a segment boundary"
+                    );
+                    let left = log.reader().sealed();
+                    prop_assert!(
+                        left.is_empty() || log.stats().log_bytes <= max,
+                        "sealed segments remain past the budget: {:?}",
+                        log.stats()
+                    );
+                    m.first = floor;
+                }
+                Op::RetainAge(age) => {
+                    let t = m.time.saturating_sub(age);
+                    let sealed = log.reader().sealed();
+                    let floor = log.retain(None, Some(t)).unwrap();
+                    // exactly the leading run of sealed segments whose records are all older
+                    let old = |s: &(u64, u64)| (s.0..s.1).all(|l| m.recs[l as usize].0.time_ms < t);
+                    let want = sealed
+                        .iter()
+                        .take_while(|s| old(s))
+                        .last()
+                        .map_or(m.first, |s| s.1);
+                    prop_assert_eq!(floor, want.max(m.first));
+                    m.first = floor;
+                }
+                Op::ClearCache => log.reader().clear_cache(),
+                Op::LoseIndex(i) => {
+                    let sealed = log.reader().sealed();
+                    drop(log);
+                    let idx: Vec<_> = segment_files(d.path())
+                        .into_iter()
+                        .map(|p| p.with_extension("idx"))
+                        .filter(|p| p.exists())
+                        .collect();
+                    let lost = !idx.is_empty();
+                    if lost {
+                        std::fs::remove_file(&idx[i.index(idx.len())]).unwrap();
+                    }
+                    log = Log::open(c.clone()).unwrap();
+                    prop_assert_eq!(log.stats().index_rebuilds, u64::from(lost));
+                    prop_assert_eq!(log.reader().sealed(), sealed);
+                }
+                Op::Reopen => {
+                    // a clean close: with write caching the owner flushes first (`Wal` does)
+                    log.flush().unwrap();
+                    drop(log);
+                    log = Log::open(c.clone()).unwrap();
+                }
+            }
+            check(&log, &m)?;
+        }
+        Ok(())
+    }
+
+    proptest! {
+
+        #[test]
+        fn the_log_agrees_with_a_list_of_records(ops in ops()) {
+            run(false, ops)?;
+        }
+
+        #[test]
+        fn under_write_caching_the_log_agrees_with_a_list_of_records(ops in ops()) {
+            run(true, ops)?;
+        }
+    }
 }

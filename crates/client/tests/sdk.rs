@@ -27,7 +27,7 @@ struct Cluster {
     _dir: tempfile::TempDir,
 }
 
-/// Starts node `i` of the three; `repair_ms` is how often it repairs from its peers.
+/// Starts node `i` of the cluster; `repair_ms` is how often it repairs from its peers.
 async fn start(c: &mut Cluster, i: u32, repair_ms: u64) {
     let mut cfg = NodeConfig::single(
         i,
@@ -40,7 +40,7 @@ async fn start(c: &mut Cluster, i: u32, repair_ms: u64) {
             .parse()
             .unwrap(),
     );
-    cfg.peers = (0..3)
+    cfg.peers = (0..c.ports.len() as u32)
         .filter(|&j| j != i)
         .map(|j| PeerConfig {
             id: j,
@@ -66,7 +66,12 @@ async fn start(c: &mut Cluster, i: u32, repair_ms: u64) {
 
 /// Nodes `up` of three are started; the others' addresses stay dead.
 async fn cluster(up: &[u32]) -> Cluster {
-    let reserved: Vec<_> = (0..3).map(|_| Some(reserve())).collect();
+    cluster_of(3, up).await
+}
+
+/// Nodes `up` of `n`, each in its own failure domain.
+async fn cluster_of(n: usize, up: &[u32]) -> Cluster {
+    let reserved: Vec<_> = (0..n).map(|_| Some(reserve())).collect();
     let ports: Vec<u16> = reserved
         .iter()
         .map(|s| s.as_ref().unwrap().local_addr().unwrap().port())
@@ -139,6 +144,31 @@ async fn replicas_publish_the_same_events_and_a_reader_sees_each_once_in_writer_
             "{w} in order: {seqs:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poll_is_empty_only_when_caught_up_even_past_a_batch_dedup_emptied() {
+    // replica b's copy of a's event is a batch with every event dropped by dedup; a reader in
+    // small steps reaches it, and an empty poll there would read as "caught up" before b's next
+    let c = cluster(&[0, 1, 2]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    let (mut a, mut b) = (client.producer("s", "a"), client.producer("s", "b"));
+    a.send(1, b"id0", b"t0");
+    a.sync().await.unwrap();
+    b.send(2, b"id0", b"t0");
+    b.sync().await.unwrap();
+    b.send(3, b"id1", b"t1");
+    b.sync().await.unwrap();
+    let mut r = client.consumer("s", "g", Start::Beginning).await.unwrap();
+    let mut got = vec![];
+    loop {
+        let evs = r.poll(1).await.unwrap();
+        if evs.is_empty() {
+            break;
+        }
+        got.extend(evs);
+    }
+    assert_eq!(names(&got), ["t0", "t1"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -380,4 +410,28 @@ async fn the_end_of_a_stream_is_every_acked_event_even_when_one_node_is_behind()
         &end,
         "a new group at the end skips nothing it should not"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_of_a_stream_on_four_nodes_merges_enough_ends_to_meet_every_acked_copy() {
+    // Why: an acked batch is on `copies` nodes, so only the ends of nodes - copies + 1 nodes are
+    // sure to include one of them. On four nodes with 2 copies, two ends can both miss it, and a
+    // reader starting at the end would read acked events as new. Found by spec/mesh (MC_end4).
+    let mut c = cluster_of(4, &[0, 1]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    // clients of this stream ask node 2 first, then 3: the two nodes without the batches
+    let stream = (0..)
+        .map(|i| format!("raw.trades.{i}"))
+        .find(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()) % 4 == 2)
+        .unwrap();
+    let mut p = client.producer(&stream, "w");
+    for i in 0..10u64 {
+        p.send(i, format!("id{i}").as_bytes(), b"x");
+    }
+    p.sync().await.unwrap();
+    for i in [2, 3] {
+        start(&mut c, i, 3_600_000).await; // empty, and no repair within the test
+    }
+    let end = client.end(&stream).await.unwrap();
+    assert_eq!(end.values().sum::<u64>(), 10, "every acked event: {end:?}");
 }

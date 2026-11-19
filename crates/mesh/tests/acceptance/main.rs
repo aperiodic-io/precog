@@ -19,6 +19,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_precog-node");
 static NEXT_PORT: AtomicU16 = AtomicU16::new(17_100);
 
 struct WriterState {
+    stream: String,
     name: String,
     epoch: u64,
     acked: u64,
@@ -140,7 +141,7 @@ impl Mesh {
                 .iter()
                 .map(|&s| BatchId {
                     log: LogId {
-                        stream: "s".into(),
+                        stream: w.stream.clone(),
                         writer: w.name.clone(),
                         epoch: w.epoch,
                     },
@@ -181,7 +182,7 @@ impl Mesh {
         let c = self.client();
         let preferred = w % self.n;
         let ws = &mut self.writers[w];
-        let mut writer = Writer::new(c, "s", &ws.name, ws.epoch, preferred, ws.copies);
+        let mut writer = Writer::new(c, &ws.stream, &ws.name, ws.epoch, preferred, ws.copies);
         writer.next_seq = ws.acked;
         for _ in 0..n {
             let seq = writer.next_seq;
@@ -218,8 +219,17 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 
 // ---------------------------------------------------------------------------
 
-#[given(regex = r"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?$")]
-async fn cluster(w: &mut Mesh, n: usize, seg_mb: u64, retention_mb: String) {
+#[given(
+    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "(\w+)" retains (\d+) MiB)?$"#
+)]
+async fn cluster(
+    w: &mut Mesh,
+    n: usize,
+    seg_mb: u64,
+    retention_mb: String,
+    stream: String,
+    stream_mb: String,
+) {
     let dir = tempfile::tempdir().unwrap();
     let base = NEXT_PORT.fetch_add(10, Ordering::Relaxed);
     let mut cmd = Command::new(BIN);
@@ -246,6 +256,10 @@ async fn cluster(w: &mut Mesh, n: usize, seg_mb: u64, retention_mb: String) {
         let p = dir.path().join(format!("node-{i}.json"));
         let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         v["retention_interval_ms"] = 200.into();
+        if !stream.is_empty() {
+            let mb: u64 = stream_mb.parse().unwrap();
+            v["streams"] = serde_json::json!({ stream.clone(): { "retention_bytes": mb << 20 } });
+        }
         std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     }
     let cf: serde_json::Value =
@@ -296,6 +310,7 @@ async fn subscriber(w: &mut Mesh, node: usize) {
 fn new_writer(w: &mut Mesh, size: usize, copies: u8) -> usize {
     let i = w.writers.len();
     w.writers.push(WriterState {
+        stream: "s".into(),
         name: format!("writer-{i}"),
         epoch: 1,
         acked: 0,
@@ -305,9 +320,14 @@ fn new_writer(w: &mut Mesh, size: usize, copies: u8) -> usize {
     i
 }
 
-#[when(regex = r"^a writer appends (\d+) batches of (\d+) bytes with (\d+) cop(?:y|ies)$")]
-async fn append(w: &mut Mesh, n: u64, size: usize, copies: u8) {
+#[when(
+    regex = r#"^a writer appends (\d+) batches of (\d+) bytes(?: to stream "(\w+)")? with (\d+) cop(?:y|ies)$"#
+)]
+async fn append(w: &mut Mesh, n: u64, size: usize, stream: String, copies: u8) {
     let i = new_writer(w, size, copies);
+    if !stream.is_empty() {
+        w.writers[i].stream = stream;
+    }
     w.append(i, n).await;
 }
 
@@ -427,8 +447,8 @@ async fn damage(w: &mut Mesh, i: usize) {
     patch(&seg, off + record::HEADER as u64 + 40, &[0x5A, 0xA5]);
 }
 
-#[when(regex = r"^retention has run on node (\d+)$")]
-async fn retention_ran(_w: &mut Mesh, _i: usize) {
+#[when(regex = r"^retention has run on (?:node (\d+)|every node)$")]
+async fn retention_ran(_w: &mut Mesh, _node: String) {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 }
 
@@ -616,4 +636,48 @@ async fn main() {
         .fail_on_skipped()
         .run_and_exit("tests/acceptance/features")
         .await;
+}
+
+#[then(regex = r#"^a cursor reads every batch of stream "(\w+)" from every node$"#)]
+async fn cursor_reads_all(w: &mut Mesh, stream: String) {
+    let ws = w.writers.iter().find(|x| x.stream == stream).unwrap();
+    for i in 0..w.n {
+        let mut cursor: WireCursor = vec![];
+        let mut seqs = vec![];
+        loop {
+            let req = Control::ReadCursor {
+                stream: stream.clone(),
+                cursor: cursor.clone(),
+                max_bytes: 1 << 20,
+            };
+            let body = Bytes::from(serde_json::to_vec(&req).unwrap());
+            let f = w.client().call(i, Kind::Control, body).await.unwrap();
+            assert_eq!(f.kind, Kind::Batches);
+            if f.body.is_empty() {
+                break;
+            }
+            let mut b = &f.body[..];
+            while b.len() >= 4 {
+                let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+                let x = Batch::parse(f.body.slice_ref(&b[4..4 + n])).unwrap();
+                b = &b[4 + n..];
+                let e = x.events().next().unwrap();
+                assert_eq!(
+                    &e.payload[..],
+                    &payload(&ws.name, x.id.first_seq, ws.size)[..]
+                );
+                seqs.push(x.id.first_seq);
+                cursor = vec![(x.id.log.writer.clone(), x.id.log.epoch, x.end_seq())];
+            }
+        }
+        assert_eq!(seqs, (0..ws.acked).collect::<Vec<_>>(), "node {i}");
+    }
+}
+
+#[then(regex = r#"^the oldest batch of stream "(\w+)" is gone from every node$"#)]
+async fn oldest_gone_everywhere(w: &mut Mesh, stream: String) {
+    let ws = w.writers.iter().find(|x| x.stream == stream).unwrap();
+    for i in 0..w.n {
+        assert!(w.fetch(i, ws, &[0]).await.is_empty(), "node {i}");
+    }
 }

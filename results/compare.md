@@ -60,7 +60,7 @@ Equal durability at steady state (2026-11-19): fsync before every ack on both si
 |---|---:|---:|---:|---:|
 | Precog, fsync before every ack | 696,600 | 2.71 ms | 5.49 ms | 1.39 us |
 | Redpanda, fsync before every ack | 159,000 | 11.5 ms | 21.3 ms | 3.26 us |
-| **Precog vs Redpanda** | **4.4x** | **4.3x** | **3.9x** | **2.3x** |
+| **Precog vs Redpanda** | **4.4x** | **4.2x** | **3.9x** | **2.3x** |
 
 Runs: Precog 703k/2.67/5.49/1.337, 697k/2.71/5.48/1.386, 647k/2.93/6.05/1.551; Redpanda 150k/11.9/16.9/3.036,
 160k/11.5/19.2/3.576, 159k/11.5/25.1/3.789, 165k/11.3/21.3/3.256, 128k/13.3/23.6/2.713. CPU per record is under 3x
@@ -153,6 +153,71 @@ from 7.2% to 5.2%, and the node took 9% fewer samples while moving 5% more recor
 The target (<= ~1.0 us) is not reached on this VM: -7% at write caching. Ack coalescing per read was not attempted:
 the RPC writer task already coalesces every queued frame into one write, and with the append inline a replica's ack is
 ready in the same poll as its request.
+
+## Brokers at saturation (2026-11-19)
+
+With brokers at 1 CPU each, the 1-CPU load generator is the bottleneck: the brokers run at 25-50% of a core and about a
+fifth of their CPU is spent sleeping and waking per event. To measure busy brokers, the same harness with every broker
+capped at **0.5 CPU** (both systems: `run.sh` has no setting for this, so its broker `docker run` lines were edited from
+`--cpus 1` to `--cpus 0.5`; the load generators stay at 1 CPU), `WARMUP=20`, medians of 3 runs alternating Precog and Redpanda. The
+last runs overlapped other builds on the VM, so treat the spread as wider than usual.
+
+| | records/s | p50 ack | p99 ack | broker CPU per record |
+|---|---:|---:|---:|---:|
+| Precog, fsync before every ack | 348,500 | 4.87 ms | 15.2 ms | 1.73 us |
+| Redpanda, fsync before every ack | 114,100 | 12.1 ms | 128 ms | 4.20 us |
+| **Precog vs Redpanda** | **3.1x** | **2.5x** | **8.4x** | **2.4x** |
+| Precog, write caching | 388,700 | 4.32 ms | 14.2 ms | 1.36 us |
+| Redpanda, write caching | 125,000 | 11.3 ms | 114 ms | 3.48 us |
+| **Precog vs Redpanda** | **3.1x** | **2.6x** | **8.0x** | **2.6x** |
+
+Runs (records/s, p50, p99, us/record): Precog fsync 348k/4.10/15.0/1.728, 356k/4.87/15.2/1.579, 336k/5.08/16.3/1.800;
+Redpanda fsync 64k/11.9/380/4.203, 114k/12.1/128/4.210, 130k/12.5/32.9/4.166; Precog write caching 380k/4.09/30.1/1.424,
+389k/4.37/14.2/1.352, 403k/4.32/12.1/1.360; Redpanda write caching 125k/11.0/140/3.477, 128k/11.3/114/3.606,
+94k/13.2/51.8/3.451. CPU per record rises on both sides under the tighter quota, and the ratio stays at 2.4-2.6x:
+saturation does not change it.
+
+## Re-measured on main after #16 and #25 (2026-11-19, 12:10-12:45 UTC)
+
+Same harness and standard settings (brokers at 1 CPU / 4000Mi, `RETENTION=600000000 WARMUP=20 BATCH=250`, 20% resends,
+2,000 in flight), alternating Precog main (44741d2, with appends on the worker under write caching, #16), Precog #25 (RAM
+per retained batch off the heap) and Redpanda, 3 rounds per durability mode. The VM was slower than in the sections above:
+the build measured there (26ed4c7) ran 1.60-1.68 us/record against 1.12 then, in an A/B alternating with main (1.47-1.66),
+so absolute numbers are not comparable across sections, and main did not regress.
+
+| | records/s | p50 ack | p99 ack | broker CPU per record |
+|---|---:|---:|---:|---:|
+| Precog #25, write caching | 450,200 | 3.98 ms | 9.38 ms | 1.42 us |
+| Precog main, write caching | 425,800 | 4.21 ms | 10.4 ms | 1.50 us |
+| Redpanda, write caching | 138,700 | 11.1 ms | 44.3 ms | 3.81 us |
+| **Precog #25 vs Redpanda** | **3.2x** | **2.8x** | **4.7x** | **2.7x** |
+| Precog #25, fsync before every ack | 423,700 | 4.28 ms | 13.5 ms | 1.89 us |
+| Precog main, fsync before every ack | 405,600 | 4.46 ms | 16.0 ms | 1.96 us |
+| Redpanda, fsync before every ack | 138,500 | 11.8 ms | 40.4 ms | 4.45 us |
+| **Precog #25 vs Redpanda** | **3.1x** | **2.8x** | **3.0x** | **2.4x** |
+
+Runs (records/s, p50, p99, us/record):
+
+- **Write caching:**
+  - Precog #25: 454k/3.98/9.37/1.411, 450k/3.98/9.38/1.418, 434k/4.06/10.08/1.460.
+  - Precog main: 454k/3.98/9.26/1.418, 426k/4.21/10.36/1.495, 408k/4.27/10.76/1.522.
+  - Redpanda: 139k/11.03/44.3/3.803, 143k/11.47/35.3/3.810, 129k/11.12/57.5/4.043.
+- **fsync before every ack:**
+  - Precog #25: 424k/4.28/13.45/1.906, 413k/4.31/15.35/1.890, 437k/4.10/13.48/1.868.
+  - Precog main: 409k/4.46/12.44/1.926, 406k/4.42/16.02/1.956, 391k/4.48/18.18/2.134.
+  - Redpanda: 138k/11.89/42.9/4.529, 123k/11.81/40.4/4.452, 143k/11.78/36.1/4.401.
+
+Precog's CPU per record rose more than Redpanda's on the slower VM (about +40% against +12-36%), so the ratios narrow:
+throughput and p99 stay at 3x or more, CPU per record is 2.4-2.7x.
+
+A further attempt to cut CPU, sending each batch to `copies - 1` peers first with the third copy later and coalesced
+(hedged after 10 ms), was measured and not merged. Five alternating runs per build:
+
+- **Choosing the hot peer per writer log:** fsync per ack 1.965 → 1.977 us; write caching 1.524 → 1.475 us. Both are
+  within noise. Each replica's group commit still fsyncs back to back, because per-log choice keeps both replicas
+  busy.
+- **Choosing it per stream:** 11% less in both modes, but only because this benchmark has one stream on one accepting
+  node, which leaves one replica idle. When every node accepts streams, that saving goes away.
 
 ## How Precog got here (same harness, 250-record batches unless noted)
 

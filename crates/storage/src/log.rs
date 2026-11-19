@@ -3,8 +3,10 @@
 //! Files in `Config::dir`:
 //! - `seg-<id>.log`: a segment. A 4 KiB header page (magic, id, generation, base LSN, CRC)
 //!   followed by records (see `record`). Segments are written once, front to back.
-//! - `seg-<id>.idx`: the index of a sealed segment, one entry per record. Rebuilt from the
-//!   segment if missing or damaged.
+//! - `seg-<id>.idx`: the index of a sealed segment, read from disk, not held in RAM (a node
+//!   retains tens of millions of records): one fixed-size entry per record in LSN order, the
+//!   same entries grouped by key (keys in byte order, each key's records by `first_seq`), and the
+//!   key table. Rebuilt from the segment if missing, damaged or of an older version.
 //! - `spare-<n>.log`: preallocated (zero-filled) or recycled segment files, ready to be renamed
 //!   into place on a roll. A background thread keeps `Config::spares` of them.
 //! - `MANIFEST`: two checksummed slots, written alternately: segments, generations, the retention
@@ -24,14 +26,20 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-const SEG_HEADER: u64 = 4096;
+/// A segment's header page: what a roll adds to the log's bytes before any record.
+pub const SEG_HEADER: u64 = 4096;
 const SEG_MAGIC: u32 = u32::from_le_bytes(*b"PCSG");
 const IDX_MAGIC: u32 = u32::from_le_bytes(*b"PCIX");
 const MF_MAGIC: u32 = u32::from_le_bytes(*b"PCMF");
 const FORMAT_VERSION: u32 = 1;
+/// The index file's own version: 2 has fixed-size entries and the by-key section.
+const IDX_VERSION: u32 = 2;
+const IDX_HEADER: usize = 40;
+const IDX_ENTRY: usize = 40;
 /// ponytail: 64 KiB manifest slots hold ~1,300 segments (1.3 TB at 1 GiB); grow the slot when needed.
 const MF_SLOT: usize = 64 << 10;
 /// Largest write group. Bounds the recovery search window (2x this) on restart.
@@ -64,7 +72,8 @@ pub struct Failpoints {
     /// The data sync after this many successful ones fails.
     pub fail_data_sync_after: Option<u64>,
     /// Fail at a named step ("roll:after_spare_rename", "roll:after_header",
-    /// "roll:after_manifest", "roll:after_index").
+    /// "roll:after_manifest", "roll:after_index", "retain:before_manifest",
+    /// "retain:after_manifest").
     pub fail_at: Option<&'static str>,
 }
 
@@ -101,6 +110,16 @@ pub struct Stats {
     pub syncs: u64,
 }
 
+/// A sealed segment as retention sees it: its LSNs `base..end`, the bytes it adds to the log and
+/// the append time of its newest record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sealed {
+    pub base: Lsn,
+    pub end: Lsn,
+    pub bytes: u64,
+    pub max_time: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Record {
     pub lsn: Lsn,
@@ -130,12 +149,100 @@ struct Seg {
     generation: u64,
     base_lsn: Lsn,
     file: File,
+    /// The active segment's index, in RAM; emptied once the segment is sealed.
     entries: RwLock<Vec<IdxEntry>>,
+    /// A sealed segment's index, on disk.
+    disk: OnceLock<DiskIdx>,
 }
 
 impl Seg {
+    fn new(id: u64, generation: u64, base_lsn: Lsn, file: File, disk: Option<DiskIdx>) -> Seg {
+        Seg {
+            id,
+            generation,
+            base_lsn,
+            file,
+            entries: RwLock::new(vec![]),
+            disk: disk.map_or_else(OnceLock::new, OnceLock::from),
+        }
+    }
+
+    // `entries` is locked before `disk` is checked: `seal` sets `disk` before it empties
+    // `entries`, so a reader that finds `disk` unset still holds the full RAM index
     fn end_lsn(&self) -> Lsn {
-        self.base_lsn + self.entries.read().unwrap().len() as u64
+        let ents = self.entries.read().unwrap();
+        match self.disk.get() {
+            Some(d) => self.base_lsn + d.n as u64,
+            None => self.base_lsn + ents.len() as u64,
+        }
+    }
+
+    /// Up to `limit` index entries from the segment's `rel`-th record.
+    fn index(&self, rel: u64, limit: usize) -> Result<Vec<IdxEntry>> {
+        let ents = self.entries.read().unwrap();
+        match self.disk.get() {
+            Some(d) => {
+                drop(ents);
+                let n = (d.n as u64).saturating_sub(rel).min(limit as u64) as u32;
+                Ok(d.read(0, rel as u32, n)?.into_iter().map(|x| x.1).collect())
+            }
+            None => {
+                let from = (rel as usize).min(ents.len());
+                Ok(ents[from..ents.len().min(from.saturating_add(limit))].to_vec())
+            }
+        }
+    }
+}
+
+/// A sealed segment's index file: `n` records, and its keys (sorted) with each key's run in the
+/// by-key section.
+struct DiskIdx {
+    file: File,
+    n: u32,
+    keys: Keys,
+}
+
+/// A sealed segment's keys in byte order, each with its run (start, length) in the by-key
+/// section.
+type Keys = Vec<(Vec<u8>, u32, u32)>;
+
+impl DiskIdx {
+    /// `n` entries from the `i`-th of a section (0: by LSN, 1: by key), with each entry's key
+    /// field: its key's index in `keys` (by LSN) or its record's index (by key).
+    fn read(&self, section: u64, i: u32, n: u32) -> Result<Vec<(u32, IdxEntry)>> {
+        let mut b = vec![0u8; n as usize * IDX_ENTRY];
+        let at = IDX_HEADER as u64 + (section * self.n as u64 + i as u64) * IDX_ENTRY as u64;
+        self.file.read_exact_at(&mut b, at)?;
+        let keys = &self.keys;
+        b.chunks_exact(IDX_ENTRY)
+            .zip(i..)
+            .map(|(e, at)| {
+                let k = u32_at(e, 12);
+                let key = if section == 0 { k } else { self.key_of(at) };
+                let key = keys
+                    .get(key as usize)
+                    .ok_or_else(|| Error::Corrupt(format!("index key {key} out of range")))?;
+                Ok((
+                    k,
+                    IdxEntry {
+                        offset: u64_at(e, 0),
+                        len: u32_at(e, 8),
+                        meta: Meta {
+                            key: key.0.clone(),
+                            first_seq: u64_at(e, 16),
+                            count: u32_at(e, 24),
+                            tag: u32_at(e, 28),
+                            time_ms: u64_at(e, 32),
+                        },
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The key whose by-key run holds position `i`.
+    fn key_of(&self, i: u32) -> u32 {
+        self.keys.partition_point(|k| k.1 + k.2 <= i) as u32
     }
 }
 
@@ -210,12 +317,8 @@ impl Reader {
             }
             segs[i - 1].clone()
         };
-        let e = {
-            let ents = seg.entries.read().unwrap();
-            match ents.get((lsn - seg.base_lsn) as usize) {
-                Some(e) => e.clone(),
-                None => return Ok(None),
-            }
+        let Some(e) = seg.index(lsn - seg.base_lsn, 1)?.pop() else {
+            return Ok(None);
         };
         let mut buf = vec![0u8; e.len as usize];
         seg.file.read_exact_at(&mut buf, e.offset)?;
@@ -239,39 +342,82 @@ impl Reader {
         }
     }
 
+    /// The append time of the record at `lsn`, from its segment's index (`None`: not in the log).
+    pub fn time_ms(&self, lsn: Lsn) -> Result<Option<u64>> {
+        let seg = {
+            let segs = self.shared.segs.read().unwrap();
+            match segs.partition_point(|g| g.base_lsn <= lsn).checked_sub(1) {
+                Some(i) => segs[i].clone(),
+                None => return Ok(None),
+            }
+        };
+        let rel = lsn - seg.base_lsn;
+        // the active segment's (every append asks): its entry in RAM, without a copy of its key
+        if seg.disk.get().is_none()
+            && let Some(e) = seg.entries.read().unwrap().get(rel as usize)
+        {
+            return Ok(Some(e.meta.time_ms));
+        }
+        Ok(seg.index(rel, 1)?.first().map(|e| e.meta.time_ms))
+    }
+
     /// Below the retention floor.
     fn trimmed(&self, lsn: Lsn) -> bool {
         lsn < self.shared.first_lsn.load(Ordering::Acquire)
     }
 
-    /// Index entries from `from`, at most `limit`, of durable records only.
-    pub fn entries(&self, from: Lsn, limit: usize) -> Vec<Entry> {
+    /// Index entries from `from`, at most `limit`, of durable records only (a sealed segment's
+    /// are read from its index file).
+    pub fn entries(&self, from: Lsn, limit: usize) -> Result<Vec<Entry>> {
         let s = &self.shared;
         let end = s.next_lsn.load(Ordering::Acquire);
         let from = from.max(s.first_lsn.load(Ordering::Acquire));
         let segs = s.segs.read().unwrap().clone();
         let mut out = Vec::new();
         for seg in segs {
-            let ents = seg.entries.read().unwrap();
-            let seg_end = seg.base_lsn + ents.len() as u64;
-            if seg_end <= from {
-                continue;
-            }
-            let mut lsn = from.max(seg.base_lsn);
-            let stop = seg_end.min(end);
-            while lsn < stop && out.len() < limit {
-                let e = &ents[(lsn - seg.base_lsn) as usize];
-                out.push(Entry {
-                    lsn,
-                    segment: seg.id,
-                    offset: e.offset,
-                    payload_len: e.len - (record::HEADER + e.meta.key.len()) as u32,
-                    meta: e.meta.clone(),
-                });
-                lsn += 1;
-            }
+            let lsn = from.max(seg.base_lsn);
+            let n = end.min(seg.end_lsn()).saturating_sub(lsn);
+            let n = n.min((limit - out.len()) as u64) as usize;
+            let got = seg.index(lsn - seg.base_lsn, n)?;
+            out.extend(
+                got.into_iter()
+                    .enumerate()
+                    .map(|(i, e)| entry(&seg, lsn + i as u64, e)),
+            );
         }
-        out
+        Ok(out)
+    }
+
+    /// The sealed segments in the log: (first LSN, end LSN), oldest first.
+    pub fn sealed(&self) -> Vec<(Lsn, Lsn)> {
+        let segs = self.shared.segs.read().unwrap();
+        segs.iter()
+            .filter(|g| g.disk.get().is_some())
+            .map(|g| (g.base_lsn, g.end_lsn()))
+            .collect()
+    }
+
+    /// The records with this key of the sealed segment starting at `base`, by `first_seq` (two
+    /// reads of its index file). None for the active segment or one no longer in the log.
+    pub fn by_key(&self, base: Lsn, key: &[u8]) -> Result<Vec<Entry>> {
+        let seg = {
+            let segs = self.shared.segs.read().unwrap();
+            match segs.iter().find(|g| g.base_lsn == base) {
+                Some(g) => g.clone(),
+                None => return Ok(vec![]),
+            }
+        };
+        let Some(d) = seg.disk.get() else {
+            return Ok(vec![]);
+        };
+        let Ok(k) = d.keys.binary_search_by(|x| x.0.as_slice().cmp(key)) else {
+            return Ok(vec![]);
+        };
+        let (_, start, n) = d.keys[k];
+        Ok(d.read(1, start, n)?
+            .into_iter()
+            .map(|(rel, e)| entry(&seg, base + rel as u64, e))
+            .collect())
     }
 
     pub fn next_lsn(&self) -> Lsn {
@@ -284,6 +430,16 @@ impl Reader {
 
     pub fn clear_cache(&self) {
         self.shared.cache.lock().unwrap().clear();
+    }
+}
+
+fn entry(seg: &Seg, lsn: Lsn, e: IdxEntry) -> Entry {
+    Entry {
+        lsn,
+        segment: seg.id,
+        offset: e.offset,
+        payload_len: e.len - (record::HEADER + e.meta.key.len()) as u32,
+        meta: e.meta,
     }
 }
 
@@ -361,7 +517,8 @@ impl Manifest {
             return None;
         }
         let body = b.get(24..24usize.checked_add(u32_at(h, 16) as usize)?)?;
-        if crc32c::crc32c_append(crc32c::crc32c(&b[..20]), body) != u32_at(b, 20) {
+        if body.len() < 28 || crc32c::crc32c_append(crc32c::crc32c(&b[..20]), body) != u32_at(b, 20)
+        {
             return None;
         }
         let mut m = Manifest {
@@ -436,61 +593,116 @@ fn read_seg_header(f: &File) -> Option<(u64, u64, Lsn)> {
     Some((u64_at(&b, 8), u64_at(&b, 16), u64_at(&b, 24)))
 }
 
-fn encode_index(seg: &Seg) -> Vec<u8> {
-    let ents = seg.entries.read().unwrap();
-    let mut b = Vec::with_capacity(40 + ents.len() * 48);
+fn idx_entry(b: &mut Vec<u8>, e: &IdxEntry, k: u32) {
+    b.extend_from_slice(&e.offset.to_le_bytes());
+    b.extend_from_slice(&e.len.to_le_bytes());
+    b.extend_from_slice(&k.to_le_bytes());
+    b.extend_from_slice(&e.meta.first_seq.to_le_bytes());
+    b.extend_from_slice(&e.meta.count.to_le_bytes());
+    b.extend_from_slice(&e.meta.tag.to_le_bytes());
+    b.extend_from_slice(&e.meta.time_ms.to_le_bytes());
+}
+
+/// Header (magic, version, id, generation, base LSN, n records, k keys), n entries by LSN (key
+/// field: the key's index), the same n entries by key (key field: the record's index), the k
+/// keys (run start, run length, key length u16, key), CRC-32C of all before it.
+fn encode_index(id: u64, generation: u64, base_lsn: Lsn, ents: &[IdxEntry]) -> Vec<u8> {
+    let mut keys: Vec<&[u8]> = ents.iter().map(|e| e.meta.key.as_slice()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let key = |e: &IdxEntry| keys.binary_search(&e.meta.key.as_slice()).unwrap() as u32;
+    let mut b = Vec::with_capacity(IDX_HEADER + ents.len() * 2 * IDX_ENTRY + 4);
     b.extend_from_slice(&IDX_MAGIC.to_le_bytes());
-    b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    for v in [seg.id, seg.generation, seg.base_lsn] {
+    b.extend_from_slice(&IDX_VERSION.to_le_bytes());
+    for v in [id, generation, base_lsn] {
         b.extend_from_slice(&v.to_le_bytes());
     }
     b.extend_from_slice(&(ents.len() as u32).to_le_bytes());
-    for e in ents.iter() {
-        b.extend_from_slice(&e.offset.to_le_bytes());
-        b.extend_from_slice(&e.len.to_le_bytes());
-        b.extend_from_slice(&e.meta.first_seq.to_le_bytes());
-        b.extend_from_slice(&e.meta.count.to_le_bytes());
-        b.extend_from_slice(&e.meta.tag.to_le_bytes());
-        b.extend_from_slice(&e.meta.time_ms.to_le_bytes());
-        b.extend_from_slice(&(e.meta.key.len() as u16).to_le_bytes());
-        b.extend_from_slice(&e.meta.key);
+    b.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for e in ents {
+        idx_entry(&mut b, e, key(e));
+    }
+    let mut by_key: Vec<u32> = (0..ents.len() as u32).collect();
+    by_key.sort_by_key(|&i| (key(&ents[i as usize]), ents[i as usize].meta.first_seq, i));
+    for &i in &by_key {
+        idx_entry(&mut b, &ents[i as usize], i);
+    }
+    let mut start = 0u32;
+    for (k, kb) in keys.iter().enumerate() {
+        let n = by_key[start as usize..]
+            .iter()
+            .take_while(|&&i| key(&ents[i as usize]) == k as u32)
+            .count() as u32;
+        b.extend_from_slice(&start.to_le_bytes());
+        b.extend_from_slice(&n.to_le_bytes());
+        b.extend_from_slice(&(kb.len() as u16).to_le_bytes());
+        b.extend_from_slice(kb);
+        start += n;
     }
     let c = crc32c::crc32c(&b);
     b.extend_from_slice(&c.to_le_bytes());
     b
 }
 
-fn decode_index(b: &[u8], id: u64, generation: u64, base_lsn: Lsn) -> Option<Vec<IdxEntry>> {
+/// Checks an index file and returns its record count and key table.
+fn decode_index(b: &[u8], id: u64, generation: u64, base_lsn: Lsn) -> Option<(u32, Keys)> {
     let (body, crc) = b.split_at_checked(b.len().checked_sub(4)?)?;
     if crc32c::crc32c(body) != u32_at(crc, 0) {
         return None;
     }
-    let h = body.get(..36)?;
-    if u32_at(h, 0) != IDX_MAGIC || u32_at(h, 4) != FORMAT_VERSION {
+    let h = body.get(..IDX_HEADER)?;
+    if u32_at(h, 0) != IDX_MAGIC || u32_at(h, 4) != IDX_VERSION {
         return None;
     }
     if (u64_at(h, 8), u64_at(h, 16), u64_at(h, 24)) != (id, generation, base_lsn) {
         return None;
     }
-    let mut rest = &body[36..];
-    let mut v = Vec::with_capacity(u32_at(h, 32) as usize);
-    for _ in 0..u32_at(h, 32) {
-        let e = rest.get(..38)?;
-        let key = rest.get(38..38 + u16::from_le_bytes(e[36..38].try_into().unwrap()) as usize)?;
-        v.push(IdxEntry {
-            offset: u64_at(e, 0),
-            len: u32_at(e, 8),
-            meta: Meta {
-                first_seq: u64_at(e, 12),
-                count: u32_at(e, 20),
-                tag: u32_at(e, 24),
-                time_ms: u64_at(e, 28),
-                key: key.to_vec(),
-            },
-        });
-        rest = &rest[38 + key.len()..];
+    let (n, k) = (u32_at(h, 32), u32_at(h, 36));
+    let mut rest = body.get(IDX_HEADER + n as usize * 2 * IDX_ENTRY..)?;
+    let mut keys = Vec::with_capacity(k as usize);
+    let mut next = 0u32;
+    for _ in 0..k {
+        let e = rest.get(..10)?;
+        let (start, len) = (u32_at(e, 0), u32_at(e, 4));
+        let key = rest.get(10..10 + u16::from_le_bytes(e[8..10].try_into().unwrap()) as usize)?;
+        // the runs tile the by-key section in key order
+        if start != next
+            || keys
+                .last()
+                .is_some_and(|(p, _, _): &(Vec<u8>, _, _)| p.as_slice() >= key)
+        {
+            return None;
+        }
+        next = start.checked_add(len)?;
+        rest = &rest[10 + key.len()..];
+        keys.push((key.to_vec(), start, len));
     }
-    rest.is_empty().then_some(v)
+    (rest.is_empty() && next == n).then_some((n, keys))
+}
+
+/// Writes a sealed segment's index file and opens it for reads.
+fn write_index(dir: &Path, seg: &Seg, ents: &[IdxEntry]) -> Result<DiskIdx> {
+    let b = encode_index(seg.id, seg.generation, seg.base_lsn, ents);
+    let tmp = dir.join(format!("seg-{:016}.idx.tmp", seg.id));
+    let mut f = File::create(&tmp)?;
+    f.write_all(&b)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, idx_path(dir, seg.id))?;
+    sync_dir(dir)?;
+    let (n, keys) = decode_index(&b, seg.id, seg.generation, seg.base_lsn).unwrap();
+    Ok(DiskIdx {
+        file: File::open(idx_path(dir, seg.id))?,
+        n,
+        keys,
+    })
+}
+
+/// Seals `seg`: its index goes to disk and leaves RAM.
+fn seal(dir: &Path, seg: &Seg) -> Result<()> {
+    let d = write_index(dir, seg, &seg.entries.read().unwrap())?;
+    let _ = seg.disk.set(d);
+    *seg.entries.write().unwrap() = Vec::new();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -774,6 +986,7 @@ impl Log {
             inflight: 0,
         };
 
+        let unsynced = (log.cfg.flush_delay_ms > 0).then(|| Log::unsynced_bound(&log.cfg));
         // Sealed segments: drop ones missing at the head (retention whose manifest write was lost),
         // load their indexes (or rebuild them).
         let mut segs: Vec<Arc<Seg>> = vec![];
@@ -815,12 +1028,24 @@ impl Log {
                 let index = std::fs::read(idx_path(&dir, m.id))
                     .ok()
                     .and_then(|b| decode_index(&b, m.id, m.generation, m.base_lsn))
-                    .filter(|e| m.base_lsn + e.len() as u64 == m.end_lsn);
-                let rebuilt = index.is_none();
-                let entries = match index {
-                    Some(e) => e,
+                    .filter(|e| m.base_lsn + e.0 as u64 == m.end_lsn);
+                let seg = match index {
+                    Some((n, keys)) => {
+                        let file2 = File::open(idx_path(&dir, m.id))?;
+                        Seg::new(
+                            m.id,
+                            m.generation,
+                            m.base_lsn,
+                            file,
+                            Some(DiskIdx {
+                                file: file2,
+                                n,
+                                keys,
+                            }),
+                        )
+                    }
                     None => {
-                        let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset))?;
+                        let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset), None)?;
                         log.stats.index_rebuilds += 1;
                         log.stats.recovery_scanned_bytes += s.scanned;
                         if s.damaged {
@@ -835,29 +1060,22 @@ impl Log {
                                 m.id
                             )));
                         }
-                        s.entries
+                        let seg = Seg::new(m.id, m.generation, m.base_lsn, file, None);
+                        *seg.entries.write().unwrap() = s.entries;
+                        seal(&dir, &seg)?;
+                        seg
                     }
                 };
-                let seg = Arc::new(Seg {
-                    id: m.id,
-                    generation: m.generation,
-                    base_lsn: m.base_lsn,
-                    file,
-                    entries: RwLock::new(entries),
-                });
-                if rebuilt {
-                    write_index(&dir, &seg)?;
-                }
-                segs.push(seg);
+                segs.push(Arc::new(seg));
                 kept.push(m.clone());
             } else {
-                segs.push(Arc::new(Seg {
-                    id: m.id,
-                    generation: m.generation,
-                    base_lsn: m.base_lsn,
+                segs.push(Arc::new(Seg::new(
+                    m.id,
+                    m.generation,
+                    m.base_lsn,
                     file,
-                    entries: RwLock::new(vec![]),
-                }));
+                    None,
+                )));
                 kept.push(m.clone());
             }
         }
@@ -878,7 +1096,7 @@ impl Log {
             && !last.sealed
         {
             let seg = segs.pop().unwrap();
-            let s = scan(&seg.file, seg.generation, seg.base_lsn, None)?;
+            let s = scan(&seg.file, seg.generation, seg.base_lsn, None, unsynced)?;
             log.stats.recovery_scanned_bytes += s.scanned;
             next_lsn = seg.base_lsn + s.entries.len() as u64;
             active = Some((seg, s));
@@ -896,7 +1114,7 @@ impl Log {
                         && b == next_lsn
                         && g >= manifest.next_generation.saturating_sub(1) =>
                 {
-                    let s = scan(&file, g, b, None)?;
+                    let s = scan(&file, g, b, None, unsynced)?;
                     log.stats.recovery_scanned_bytes += s.scanned;
                     if let Some((prev, ps)) = active.take() {
                         // Lost records would make the successor's base LSN mismatch (refused
@@ -908,7 +1126,7 @@ impl Log {
                         mf.end_offset = ps.end;
                         mf.end_lsn = prev.end_lsn();
                         mf.max_time = ps.max_time;
-                        write_index(&dir, &prev)?;
+                        seal(&dir, &prev)?;
                         segs.push(prev);
                     }
                     manifest.segs.push(MfSeg {
@@ -920,13 +1138,7 @@ impl Log {
                     manifest.next_segment_id = id + 1;
                     manifest.next_generation = manifest.next_generation.max(g + 1);
                     next_lsn = b + s.entries.len() as u64;
-                    let seg = Arc::new(Seg {
-                        id,
-                        generation: g,
-                        base_lsn: b,
-                        file,
-                        entries: RwLock::new(vec![]),
-                    });
+                    let seg = Arc::new(Seg::new(id, g, b, file, None));
                     active = Some((seg, s));
                     log.write_manifest(&mut manifest)?;
                 }
@@ -991,6 +1203,15 @@ impl Log {
 
     pub fn next_lsn(&self) -> Lsn {
         self.shared.next_lsn.load(Ordering::Acquire)
+    }
+
+    /// The newest append time of a record in the log (0: none).
+    pub fn max_time(&self) -> u64 {
+        let sealed = self.manifest.segs.iter().map(|s| s.max_time);
+        sealed
+            .chain(self.active.as_ref().map(|a| a.max_time))
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn first_lsn(&self) -> Lsn {
@@ -1285,13 +1506,7 @@ impl Log {
             self.manifest = m;
             self.failpoint("roll:after_manifest", sealing)?;
 
-            let seg = Arc::new(Seg {
-                id,
-                generation,
-                base_lsn: base,
-                file: file.try_clone()?,
-                entries: RwLock::new(vec![]),
-            });
+            let seg = Arc::new(Seg::new(id, generation, base, file.try_clone()?, None));
             let capacity = file.metadata()?.len();
             let prev = self.active.replace(Active {
                 seg: seg.clone(),
@@ -1302,7 +1517,7 @@ impl Log {
             });
             self.shared.segs.write().unwrap().push(seg);
             if let Some(p) = prev {
-                write_index(&dir, &p.seg)?;
+                seal(&dir, &p.seg)?;
             }
             self.failpoint("roll:after_index", sealing)?;
             Ok(())
@@ -1346,28 +1561,58 @@ impl Log {
         if let Some(f) = &self.failed {
             return Err(Error::Fatal(f.clone()));
         }
-        let active_bytes = self.active.as_ref().map_or(0, |a| a.offset);
-        let mut total: u64 = self
-            .manifest
-            .segs
-            .iter()
-            .filter(|s| s.sealed)
-            .map(|s| s.end_offset)
-            .sum::<u64>()
-            + active_bytes;
-        let mut drop_n = 0;
-        for s in self.manifest.segs.iter().filter(|s| s.sealed) {
-            let by_size = max_bytes.is_some_and(|m| total > m);
+        let (segs, _) = self.segments();
+        match self.retirable(max_bytes, min_time_ms) {
+            0 => Ok(self.first_lsn()),
+            n => self.drop_until(segs[n - 1].end),
+        }
+    }
+
+    /// The sealed segments, oldest first, and the log's bytes now.
+    pub fn segments(&self) -> (Vec<Sealed>, u64) {
+        let segs = self.manifest.segs.iter().filter(|s| s.sealed);
+        let v = segs
+            .map(|s| Sealed {
+                base: s.base_lsn,
+                end: s.end_lsn,
+                bytes: s.end_offset,
+                max_time: s.max_time,
+            })
+            .collect();
+        (v, self.stats().log_bytes)
+    }
+
+    /// How many of the oldest sealed segments `retain` drops.
+    pub fn retirable(&self, max_bytes: Option<u64>, min_time_ms: Option<u64>) -> usize {
+        let (segs, mut left) = self.segments();
+        let mut n = 0;
+        for s in segs {
+            let by_size = max_bytes.is_some_and(|m| left > m);
             let by_age = min_time_ms.is_some_and(|t| s.max_time < t);
             if !(by_size || by_age) {
                 break;
             }
-            total -= s.end_offset;
-            drop_n += 1;
+            left -= s.bytes;
+            n += 1;
         }
+        n
+    }
+
+    /// Makes everything written durable (write caching: a copy forward of what the dropped
+    /// segments hold may be unsynced), then drops the sealed segments that end at or below
+    /// `end`, oldest first (never the active one). Returns the new first LSN.
+    pub fn drop_until(&mut self, end: Lsn) -> Result<Lsn> {
+        self.flush()?; // a fenced log refuses
+        let drop_n = self
+            .manifest
+            .segs
+            .iter()
+            .take_while(|s| s.sealed && s.end_lsn <= end)
+            .count();
         if drop_n == 0 {
             return Ok(self.first_lsn());
         }
+        self.failpoint("retain:before_manifest", true)?;
         let mut m = self.manifest.clone();
         let dropped: Vec<MfSeg> = m.segs.drain(..drop_n).collect();
         m.first_lsn = m.segs.first().map_or(self.next_lsn(), |s| s.base_lsn);
@@ -1378,6 +1623,7 @@ impl Log {
         let floor = self.manifest.first_lsn;
         self.shared.first_lsn.store(floor, Ordering::Release);
         self.shared.segs.write().unwrap().drain(..drop_n);
+        self.failpoint("retain:after_manifest", true)?;
         for s in dropped {
             let _ = std::fs::remove_file(idx_path(&self.cfg.dir, s.id));
             self.recycle_file(&seg_path(&self.cfg.dir, s.id))?;
@@ -1400,20 +1646,21 @@ impl Drop for Log {
     }
 }
 
-fn write_index(dir: &Path, seg: &Seg) -> Result<()> {
-    let tmp = dir.join(format!("seg-{:016}.idx.tmp", seg.id));
-    let mut f = File::create(&tmp)?;
-    f.write_all(&encode_index(seg))?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, idx_path(dir, seg.id))?;
-    sync_dir(dir)?;
-    Ok(())
-}
-
 /// Scans a segment's records. For a sealed segment `end` bounds the scan and any invalid
 /// record before it is damage. For the active segment the scan stops at the first invalid
 /// record and decides between a torn tail (truncate) and interior damage (error).
-fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result<Scan> {
+///
+/// `unsynced`: with write caching, at most this many bytes at the end can have been unsynced at
+/// a crash (`Log::unsynced_bound`), and the kernel writes them back in any order. Damage
+/// followed only by records within that bound is that tail, partly lost: it is dropped as a
+/// whole (none of it was acknowledged on this node's fsync). Found by spec/storage.
+fn scan(
+    file: &File,
+    generation: u64,
+    base_lsn: Lsn,
+    end: Option<u64>,
+    unsynced: Option<u64>,
+) -> Result<Scan> {
     let len = file.metadata()?.len();
     let limit = end.unwrap_or(len).min(len);
     let mut s = Scan {
@@ -1500,15 +1747,26 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
         }
         pos += 8;
     }
+    // With write caching, a later group may be part of the unsynced tail: everything written
+    // past x must then lie within the bound. `dirty` ends at or before the end of the furthest
+    // record (a record is at least its header).
+    let lost_tail = match (later, unsynced) {
+        (Some(_), Some(u)) => {
+            dirty = dirty.max(written_end(&mut w, pos, window_end, generation)?);
+            dirty <= x.saturating_add(u)
+        }
+        _ => false,
+    };
     s.scanned = w.scanned;
-    if let Some(g) = later {
+    if let Some(g) = later.filter(|_| !lost_tail) {
         return Err(Error::Corrupt(format!(
             "damage at offset {x} of the active segment is followed by a later group at offset {g}"
         )));
     }
-    match torn {
+    match torn.or(later.map(|_| x)) {
         Some(g) => {
-            // drop the whole torn group: it was never acknowledged
+            // drop the whole torn group (it was never acknowledged), and with write caching
+            // the unsynced groups after it
             s.entries
                 .truncate(s.entries.iter().take_while(|e| e.offset < g).count());
             s.end = g;
@@ -1523,6 +1781,24 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
         s.dirty_end = dirty.max(x + record::HEADER as u64).min(len);
     }
     Ok(s)
+}
+
+/// The end of the header of the last record of this generation written in `[pos, end)`
+/// (`pos` if none), skipping over the records that decode.
+fn written_end(w: &mut Window<'_>, mut pos: u64, end: u64, generation: u64) -> Result<u64> {
+    let mut last = pos;
+    while pos < end {
+        let rel = w.cover_ahead(pos, end)?;
+        if w.written_at(rel, generation) {
+            last = pos + record::HEADER as u64;
+            if let Decoded::Record { next, .. } = record::decode(&w.buf, rel, generation) {
+                pos += (next - rel) as u64;
+                continue;
+            }
+        }
+        pos += 8;
+    }
+    Ok(last)
 }
 
 /// How far past a torn write recovery looks for later records: a torn group spans at most
@@ -1660,6 +1936,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_manifest_body_too_short_for_its_fields_is_refused_not_a_panic() {
+        // Why: a slot is refused unless it decodes; a body shorter than its fixed fields under a
+        // valid checksum (a torn or foreign write that happens to check) must read as invalid,
+        // so the other slot is used. Found by the Kani proof `manifest_decode_never_panics`.
+        for n in 0..28usize {
+            let mut b = Vec::new();
+            b.extend_from_slice(&MF_MAGIC.to_le_bytes());
+            b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&(n as u32).to_le_bytes());
+            let body = vec![0u8; n];
+            let c = crc32c::crc32c_append(crc32c::crc32c(&b), &body);
+            b.extend_from_slice(&c.to_le_bytes());
+            b.extend_from_slice(&body);
+            assert!(Manifest::decode(&b).is_none(), "body of {n} bytes");
+        }
+        // exactly the fixed fields: a manifest of no segments (a fresh log's first slots)
+        assert_eq!(Manifest::decode(&mf(0).encode().unwrap()), Some(mf(0)));
+    }
+
     fn header_with(magic: u32, version: u32, id: u64, generation: u64, base: Lsn) -> Vec<u8> {
         let mut b = vec![];
         b.extend_from_slice(&magic.to_le_bytes());
@@ -1703,35 +2000,60 @@ mod tests {
 
     #[test]
     fn index_files_roundtrip_and_reject_damage() {
+        // Why: a sealed segment's index is read from disk, not RAM: by LSN for reads, and each
+        // key's records by first_seq for lookups; a damaged or foreign file must be refused
+        // (and the segment rescanned), never trusted
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("s");
-        std::fs::write(&p, b"").unwrap();
-        let entries: Vec<IdxEntry> = (0..5u64)
+        let keys: [&[u8]; 3] = [b"kb", b"ka", b"kab"];
+        let entries: Vec<IdxEntry> = (0..7u64)
             .map(|i| IdxEntry {
                 offset: 4096 + i * 100,
-                len: 90,
+                len: 90 + i as u32,
                 meta: Meta {
-                    key: vec![b'k'; i as usize],
-                    first_seq: i,
-                    count: 2,
-                    tag: 7,
-                    time_ms: 9,
+                    key: keys[i as usize % 3].to_vec(),
+                    first_seq: 10 - i, // each key's run is reordered by first_seq
+                    count: 2 + i as u32,
+                    tag: 7 * i as u32,
+                    time_ms: 9 + i,
                 },
             })
             .collect();
-        let seg = Seg {
-            id: 3,
-            generation: 4,
-            base_lsn: 50,
+        let b = encode_index(3, 4, 50, &entries);
+        let (n, ks) = decode_index(&b, 3, 4, 50).unwrap();
+        assert_eq!(n, 7);
+        let names: Vec<&[u8]> = ks.iter().map(|k| k.0.as_slice()).collect();
+        assert_eq!(names, [&b"ka"[..], b"kab", b"kb"], "keys in byte order");
+        let p = d.path().join("i");
+        std::fs::write(&p, &b).unwrap();
+        let idx = DiskIdx {
             file: File::open(&p).unwrap(),
-            entries: RwLock::new(entries.clone()),
+            n,
+            keys: ks.clone(),
         };
-        let b = encode_index(&seg);
-        let got = decode_index(&b, 3, 4, 50).unwrap();
-        assert_eq!(got.len(), 5);
-        for (a, e) in got.iter().zip(&entries) {
+        let by_lsn = idx.read(0, 0, 7).unwrap();
+        for ((_, a), e) in by_lsn.iter().zip(&entries) {
             assert_eq!((a.offset, a.len, &a.meta), (e.offset, e.len, &e.meta));
         }
+        assert_eq!(idx.read(0, 5, 2).unwrap()[1].1.offset, entries[6].offset);
+        for (k, (name, start, len)) in ks.iter().enumerate() {
+            let run = idx.read(1, *start, *len).unwrap();
+            let rels: Vec<u32> = run.iter().map(|x| x.0).collect();
+            let want: Vec<u32> = (0..7u32)
+                .rev()
+                .filter(|&i| keys[i as usize % 3] == name.as_slice())
+                .collect();
+            assert_eq!(rels, want, "key {k}: its records by first_seq");
+            for (rel, e) in &run {
+                let x = &entries[*rel as usize];
+                assert_eq!((e.offset, e.len, &e.meta), (x.offset, x.len, &x.meta));
+            }
+        }
+        // a read across runs gives each entry its own key
+        let all = idx.read(1, 0, 7).unwrap();
+        for (rel, e) in &all {
+            assert_eq!(e.meta.key, entries[*rel as usize].meta.key, "record {rel}");
+        }
+        assert!(idx.read(0, 6, 2).is_err(), "past the section");
         // another segment's identity, any flipped byte, or a cut: rejected
         assert!(decode_index(&b, 3, 5, 50).is_none());
         assert!(decode_index(&b, 2, 4, 50).is_none());
@@ -1744,27 +2066,43 @@ mod tests {
         for cut in [0, 10, 39, b.len() - 1] {
             assert!(decode_index(&b[..cut], 3, 4, 50).is_none(), "cut at {cut}");
         }
-        // a wrong magic or version is refused even under a valid checksum
-        for (at, bad) in [(0, 0xdead_beef_u32), (4, 9)] {
-            let mut v = b[..b.len() - 4].to_vec();
-            v[at..at + 4].copy_from_slice(&bad.to_le_bytes());
-            let c = crc32c::crc32c(&v);
-            v.extend_from_slice(&c.to_le_bytes());
-            assert!(decode_index(&v, 3, 4, 50).is_none(), "field at {at}");
+        // under a valid checksum: a wrong magic or version (version 1 is the old format), an
+        // entry or key count that lies, key runs that do not tile the section in key order
+        let resealed = |at: usize, v: &[u8]| {
+            let mut x = b[..b.len() - 4].to_vec();
+            x[at..at + v.len()].copy_from_slice(v);
+            let c = crc32c::crc32c(&x);
+            x.extend_from_slice(&c.to_le_bytes());
+            decode_index(&x, 3, 4, 50)
+        };
+        let keys_at = IDX_HEADER + 7 * 2 * IDX_ENTRY;
+        for (at, v) in [
+            (0, 0xdead_beef_u32),
+            (4, 1),
+            (32, 6),
+            (32, 8),
+            (36, 2),
+            (36, 4),
+            (keys_at, 1),     // the first run starts past 0
+            (keys_at + 4, 3), // the first run is one too long
+        ] {
+            assert!(
+                resealed(at, &v.to_le_bytes()).is_none(),
+                "field at {at} = {v}"
+            );
         }
-        // a valid checksum over a body that lies about its entry count
-        let mut lie = b[..b.len() - 4].to_vec();
-        lie[32..36].copy_from_slice(&6u32.to_le_bytes());
-        let c = crc32c::crc32c(&lie);
-        lie.extend_from_slice(&c.to_le_bytes());
-        assert!(decode_index(&lie, 3, 4, 50).is_none());
-        let mut short = b[..b.len() - 4].to_vec();
-        short[32..36].copy_from_slice(&4u32.to_le_bytes());
-        let c = crc32c::crc32c(&short);
-        short.extend_from_slice(&c.to_le_bytes());
+        assert!(resealed(keys_at + 10, b"kc").is_none(), "keys out of order");
+        let mut trailing = b[..b.len() - 4].to_vec();
+        trailing.push(0);
+        let c = crc32c::crc32c(&trailing);
+        trailing.extend_from_slice(&c.to_le_bytes());
         assert!(
-            decode_index(&short, 3, 4, 50).is_none(),
-            "trailing bytes after the entries"
+            decode_index(&trailing, 3, 4, 50).is_none(),
+            "a byte after the keys"
+        );
+        assert!(
+            resealed(keys_at, &0u32.to_le_bytes()).is_some(),
+            "unchanged"
         );
     }
 
@@ -1773,5 +2111,64 @@ mod tests {
         let mut c = TailCache::default();
         c.push(rec(1, 10));
         assert!(c.get(1).is_none());
+    }
+}
+
+/// Bounded proofs (Kani): the decoders of the files recovery reads never panic, whatever the
+/// bytes. CRC-32C is stubbed with an unconstrained value, so every checksum may or may not
+/// match: the proofs cover torn or foreign writes that happen to check.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn crc(_b: &[u8]) -> u32 {
+        kani::any()
+    }
+    fn crc_append(_c: u32, _b: &[u8]) -> u32 {
+        kani::any()
+    }
+
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::stub(crc32c::crc32c_append, crc_append)]
+    #[kani::unwind(3)]
+    fn manifest_decode_never_panics() {
+        let b: [u8; 24 + 28 + 49] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= b.len());
+        let _ = Manifest::decode(&b[..n]);
+    }
+
+    /// A version-2 index file of `N` bytes, at most `k` keys declared, never panics the decoder,
+    /// and an accepted one declares what it holds and its key runs cover its by-key section:
+    /// what `DiskIdx::read` and `Reader::by_key` index by (key order: the unit tests).
+    fn index_decodes<const N: usize>(k: u32) {
+        let b: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= b.len());
+        kani::assume(u32_at(&b, 36) <= k);
+        if let Some((n, keys)) = decode_index(&b[..len], kani::any(), kani::any(), kani::any()) {
+            assert_eq!(n, u32_at(&b, 32));
+            assert_eq!(keys.len(), u32_at(&b, 36) as usize);
+            // the runs cover the by-key section: the first starts at 0, together they hold n
+            assert!(keys.first().is_none_or(|k| k.1 == 0));
+            assert_eq!(keys.iter().map(|k| k.2).sum::<u32>(), n);
+        }
+    }
+
+    /// No records, up to two keys of up to 2 bytes.
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::unwind(3)]
+    fn index_decode_two_keys() {
+        index_decodes::<{ IDX_HEADER + 2 * (10 + 2) + 4 }>(2);
+    }
+
+    /// Up to one record in both sections and one key of up to 4 bytes: its run covers it.
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::unwind(3)]
+    fn index_decode_covers_records() {
+        index_decodes::<{ IDX_HEADER + 2 * IDX_ENTRY + 10 + 4 + 4 }>(1);
     }
 }

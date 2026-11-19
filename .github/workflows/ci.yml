@@ -67,6 +67,45 @@ jobs:
         env: { PRECOG_NODE: "${{ github.workspace }}/target/release/precog-node" }
         run: test -z "$(gofmt -l .)" && go vet ./... && go test ./...
 
+  # Formal coverage (AGENTS.md, Formal verification): every line a pull request adds or changes
+  # in the product crates must be run by a property or model test (`mod props` / `mod model`)
+  formal-coverage:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "false" }
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with: { tool: "cargo-nextest,cargo-llvm-cov" }
+      - run: >-
+          cargo llvm-cov nextest $WS --exclude precog-bench --lcov --output-path formal.lcov
+          -E 'test(/(^|::)(props|model)(_[a-z_]+)?::/)'
+      - run: scripts/formal-gate.py formal.lcov origin/${{ github.base_ref }}
+
+  # TLA+ models of the protocols (spec/README.md): every spec/*/MC_*.cfg at its PR bounds.
+  # ubuntu-latest has Java; the script fetches tla2tools.jar by checksum.
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: spec/check.sh pr
+
+  # Kani bounded proofs beside the code (`#[cfg(kani)] mod proofs`, spec/README.md)
+  kani:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "${{ github.ref == 'refs/heads/main' }}", shared-key: kani }
+      - run: cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup
+      # the proofs' stubs are used only through #[kani::stub]: -D warnings would call them dead
+      # (unset, not empty: an empty RUSTFLAGS reaches the compiler as an empty argument)
+      - run: env -u RUSTFLAGS cargo kani -p precog-storage -Z stubbing
+
   # One shard per 150 mutants of the diff, at most 4; none without mutants. Drafts skip it.
   mutants-plan:
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft

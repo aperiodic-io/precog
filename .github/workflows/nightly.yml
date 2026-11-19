@@ -1,6 +1,7 @@
 name: nightly
 # What is too slow for every PR: the whole acceptance suite (@stress included), every mutant of
-# both crates, and the comparison with Apache Iggy.
+# both crates, the TLA+ models at their nightly bounds, the property and model tests at 2,000
+# cases, and the comparison with Apache Iggy.
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -17,6 +18,29 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test -p precog-mesh --test acceptance
+
+  # TLA+ models at bigger bounds: spec/*/Nightly_*.cfg as well as the PR configs
+  tla:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: spec/check.sh nightly
+
+  # property and model tests (`mod props` / `mod model`): those on proptest's default case
+  # count (256 on a PR) run 2,000; those that set their own keep it
+  props:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with: { tool: cargo-nextest }
+      - env: { PROPTEST_CASES: "2000" }
+        run: >-
+          cargo nextest run --release --workspace --exclude storage-bench --exclude precog-bench
+          -E 'test(/(^|::)(props|model)(_[a-z_]+)?::/)'
 
   mutants:
     runs-on: ubuntu-latest
