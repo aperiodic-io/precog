@@ -696,14 +696,18 @@ impl Node {
             .retirable(self.cfg.retention_bytes, self.cfg.retention_ms);
         // absorbed ones only: a segment with a batch not marked durable yet waits for a pass
         let absorbed = self.store.absorbed_end();
-        let segs: Vec<_> = segs.into_iter().take_while(|s| s.end <= absorbed).collect();
+        let n = segs.iter().take_while(|s| s.end <= absorbed).count();
+        // the later ones' bytes take no room from the copies, or a segment waiting a pass would
+        // force a cut of what streams retain; the log can be over the cap by them for that pass
+        let waiting: u64 = segs[n..].iter().map(|s| s.bytes).sum();
+        let segs = &segs[..n];
         // the node's age limit is a ceiling: nothing older than it is copied
         let min_time = self.cfg.retention_ms.map_or(0, |a| now.saturating_sub(a));
         let cap = self.cfg.retention_bytes.unwrap_or(u64::MAX);
         let limit = self.copy_limit();
         // the segments the bounds drop, and as many more as the copies of what streams retain in
         // them need room for
-        let (mut n, mut left, mut keep) = (0, total, HashMap::<String, Vec<Kept>>::new());
+        let (mut n, mut left, mut keep) = (0, total - waiting, HashMap::<String, Vec<Kept>>::new());
         let mut cost = 0;
         while let Some(s) = segs.get(n)
             && (n < want || !fits(cost, limit, cap.saturating_sub(left)))
@@ -1817,6 +1821,64 @@ mod cleaner_tests {
             }
             let cost: u64 = costs.iter().sum();
             prop_assert!(copy_bytes(cost, limit) >= cost + precog_storage::SEG_HEADER * gs.len() as u64);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_segment_waiting_to_be_absorbed_does_not_force_a_cut() {
+        // Why: the cleaner drops only absorbed segments; a sealed one holding a batch not marked
+        // durable yet waits a pass. Its bytes are not what streams retain: counting them against
+        // the copies' room cut a stream within its retention, the loss the cleaner prevents.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 64 << 10;
+        let cap = 4 * (64 << 10);
+        c.retention_bytes = Some(cap);
+        c.streams.insert(
+            "low".into(),
+            StreamConfig {
+                retention_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+        );
+        let node = Node::open(c).await.unwrap();
+        let at = |stream: &str, seq: u64| {
+            let log = LogId {
+                stream: stream.into(),
+                writer: "w".into(),
+                epoch: 1,
+            };
+            Batch::encode(&log, seq, &[(seq, &[1u8; 1000][..])]).unwrap()
+        };
+        for seq in 0..20 {
+            assert!(node.append(1, at("low", seq)).await.is_success());
+        }
+        for seq in 0..150 {
+            assert!(node.append(1, at("high", seq)).await.is_success());
+        }
+        // written to the log, not marked durable yet: absorption waits for it
+        let slow = Batch::parse(at("slow", 0)).unwrap();
+        assert!(matches!(node.store.reserve(&slow), Reserve::New));
+        let lsn = node.wal.append(slow.clone()).await.unwrap();
+        for seq in 150..450 {
+            assert!(node.append(1, at("high", seq)).await.is_success());
+        }
+        node.apply_retention().await.unwrap();
+        assert!(node.forced.lock().is_empty(), "{:?}", node.forced.lock());
+        node.store.mark_durable(&slow, lsn);
+        node.apply_retention().await.unwrap();
+        assert!(node.forced.lock().is_empty(), "{:?}", node.forced.lock());
+        assert!(node.wal.stats.log_bytes.load(Ordering::Relaxed) <= cap);
+        for seq in 0..20 {
+            let id = BatchId {
+                log: LogId {
+                    stream: "low".into(),
+                    writer: "w".into(),
+                    epoch: 1,
+                },
+                first_seq: seq,
+            };
+            assert!(node.store.get(&id).is_some(), "low {seq}");
         }
     }
 
