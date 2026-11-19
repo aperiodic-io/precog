@@ -217,11 +217,13 @@ pub struct Node {
     /// claimed them (the log commits in order and fences on any write error).
     dedup: parking_lot::Mutex<Option<Streams>>,
     dedup_dropped: AtomicU64,
-    /// Compacted streams: key -> (LSN, payload) of its newest event.
+    /// Compacted streams: key -> its newest event (see `Compacted`).
     compact: parking_lot::Mutex<HashMap<String, Compacted>>,
     /// This node's writer log for consumer-position commits (a new epoch per boot).
     pos_log: LogId,
     pos_seq: AtomicU64,
+    /// The event time (us) of this node's last position commit: commits get increasing times.
+    pos_time: AtomicU64,
 }
 
 /// The internal compacted stream of consumer positions, keyed by group and stream.
@@ -231,19 +233,33 @@ fn position_key(group: &str, stream: &str) -> Vec<u8> {
     [group.as_bytes(), b"\0", stream.as_bytes()].concat()
 }
 
-type Compacted = BTreeMap<Vec<u8>, (u64, Bytes)>;
+/// Where an event stands in read order: (event time, writer, epoch, seq).
+type Order = (u64, String, u64, u64);
 
-const SNAP_MAGIC: &[u8; 4] = b"PCS1";
+/// A compacted stream: key -> (its newest event's place in read order, LSN here, payload).
+/// The newest is the last in read order, not the last logged here: replication and repair bring
+/// batches to each node in its own order, and every node must pick the same value (spec/consumers).
+type Compacted = BTreeMap<Vec<u8>, (Order, u64, Bytes)>;
 
-/// A compacted stream's snapshot: magic, count, then (key len u16, key, lsn u64, payload len
-/// u32, payload) per key, then CRC-32C of everything before it.
+const SNAP_MAGIC: &[u8; 4] = b"PCS2";
+/// Format 1 (no read order: LSN only) still reads, its entries older than any event.
+const SNAP_MAGIC_V1: &[u8; 4] = b"PCS1";
+
+/// A compacted stream's snapshot: magic, count, then (key len u16, key, time u64, writer len
+/// u16, writer, epoch u64, seq u64, lsn u64, payload len u32, payload) per key, then CRC-32C of
+/// everything before it.
 fn encode_snapshot(m: &Compacted) -> Vec<u8> {
     let mut b = SNAP_MAGIC.to_vec();
     b.extend_from_slice(&(m.len() as u64).to_le_bytes());
-    for (k, (lsn, p)) in m {
+    for (k, ((time, writer, epoch, seq), lsn, p)) in m {
         b.extend_from_slice(&(k.len() as u16).to_le_bytes());
         b.extend_from_slice(k);
-        b.extend_from_slice(&lsn.to_le_bytes());
+        b.extend_from_slice(&time.to_le_bytes());
+        b.extend_from_slice(&(writer.len() as u16).to_le_bytes());
+        b.extend_from_slice(writer.as_bytes());
+        for v in [epoch, seq, lsn] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
         b.extend_from_slice(&(p.len() as u32).to_le_bytes());
         b.extend_from_slice(p);
     }
@@ -257,8 +273,9 @@ fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
     let (body, crc) = b
         .split_at_checked(b.len().checked_sub(4).ok_or_else(fail)?)
         .ok_or_else(fail)?;
+    let v1 = body.get(..4) == Some(&SNAP_MAGIC_V1[..]);
     if crc32c::crc32c(body) != u32::from_le_bytes(crc.try_into()?)
-        || body.get(..4) != Some(&SNAP_MAGIC[..])
+        || !(v1 || body.get(..4) == Some(&SNAP_MAGIC[..]))
     {
         return Err(fail());
     }
@@ -273,9 +290,19 @@ fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
     for _ in 0..n {
         let kl = u16::from_le_bytes(take(2)?.try_into()?) as usize;
         let k = take(kl)?.to_vec();
+        let order = if v1 {
+            (0, String::new(), 0, 0)
+        } else {
+            let time = u64::from_le_bytes(take(8)?.try_into()?);
+            let wl = u16::from_le_bytes(take(2)?.try_into()?) as usize;
+            let writer = String::from_utf8(take(wl)?.to_vec()).map_err(|_| fail())?;
+            let epoch = u64::from_le_bytes(take(8)?.try_into()?);
+            let seq = u64::from_le_bytes(take(8)?.try_into()?);
+            (time, writer, epoch, seq)
+        };
         let lsn = u64::from_le_bytes(take(8)?.try_into()?);
         let pl = u32::from_le_bytes(take(4)?.try_into()?) as usize;
-        m.insert(k, (lsn, Bytes::copy_from_slice(take(pl)?)));
+        m.insert(k, (order, lsn, Bytes::copy_from_slice(take(pl)?)));
     }
     if !c.is_empty() {
         return Err(fail());
@@ -298,7 +325,7 @@ fn digests(batch: &Batch) -> Vec<(usize, u64)> {
         .collect()
 }
 
-/// Applies a durable batch at `lsn` to a compacted stream's newest values.
+/// Applies a durable batch at `lsn` to a compacted stream's newest values (by read order).
 fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
     let kvs = match batch.keyed() {
         Ok(kvs) => kvs,
@@ -312,9 +339,11 @@ fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
             return;
         }
     };
-    for (k, p) in kvs {
-        if m.get(&k).is_none_or(|(l, _)| *l <= lsn) {
-            m.insert(k, (lsn, p));
+    let log = &batch.id.log;
+    for (seq, time, k, p) in kvs {
+        let order = (time, log.writer.clone(), log.epoch, seq);
+        if m.get(&k).is_none_or(|(o, ..)| *o <= order) {
+            m.insert(k, (order, lsn, p));
         }
     }
 }
@@ -435,6 +464,7 @@ impl Node {
                     .as_nanos() as u64,
             },
             pos_seq: AtomicU64::new(0),
+            pos_time: AtomicU64::new(0),
         });
         Ok(node)
     }
@@ -521,10 +551,20 @@ impl Node {
             .collect();
         let payload = serde_json::to_vec(&entries)?;
         let seq = self.pos_seq.fetch_add(1, Ordering::Relaxed);
+        // the commit time orders commits across nodes (the newest wins everywhere); on this node
+        // it only increases. ponytail: commits through two nodes closer together than their
+        // clock skew may keep the earlier one; an order from the reader if that matters.
+        let now = crate::store::now_ms() * 1000;
+        let prev = self
+            .pos_time
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                Some(now.max(t + 1))
+            })
+            .unwrap();
         let b = Batch::encode_keyed(
             &self.pos_log,
             seq,
-            &[(0, &position_key(group, stream), &payload)],
+            &[(now.max(prev + 1), &position_key(group, stream), &payload)],
         )?;
         let copies = (1 + self.targets().len()).min(2) as u8;
         let ack = self.append(copies, b).await;
@@ -538,7 +578,7 @@ impl Node {
     /// A reader group's committed position in a stream, if it has one.
     pub fn position(&self, group: &str, stream: &str) -> Option<Cursor> {
         let g = self.compact.lock();
-        let (_, p) = g.get(POSITIONS)?.get(&position_key(group, stream))?;
+        let (_, _, p) = g.get(POSITIONS)?.get(&position_key(group, stream))?;
         let entries: Vec<(String, u64, u64)> = serde_json::from_slice(p).ok()?;
         Some(
             entries
@@ -560,7 +600,9 @@ impl Node {
     /// A compacted stream's newest value of every key, by key.
     pub fn latest(&self, stream: &str) -> Vec<(Vec<u8>, Bytes)> {
         self.compact.lock().get(stream).map_or(vec![], |m| {
-            m.iter().map(|(k, (_, p))| (k.clone(), p.clone())).collect()
+            m.iter()
+                .map(|(k, (_, _, p))| (k.clone(), p.clone()))
+                .collect()
         })
     }
 
@@ -646,7 +688,7 @@ impl Node {
         let positions: Vec<(Vec<u8>, u64, Bytes)> =
             self.compact.lock().get(POSITIONS).map_or(vec![], |m| {
                 m.iter()
-                    .map(|(k, (lsn, p))| (k.clone(), *lsn, p.clone()))
+                    .map(|(k, (_, lsn, p))| (k.clone(), *lsn, p.clone()))
                     .collect()
             });
         out.push_str(
@@ -1496,6 +1538,45 @@ pub fn parse_frame_ack(f: &Frame) -> Result<Ack> {
 }
 
 #[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn a_format_1_snapshot_still_reads_and_any_newer_event_replaces_its_values() {
+        // Why: every node has a __positions snapshot written before read-order compaction; a
+        // node must start from it (formats read or are refused loudly, never silently).
+        let mut b = SNAP_MAGIC_V1.to_vec();
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(b"k");
+        b.extend_from_slice(&42u64.to_le_bytes()); // lsn
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(b"old");
+        let c = crc32c::crc32c(&b);
+        b.extend_from_slice(&c.to_le_bytes());
+        let mut m = decode_snapshot(&b).unwrap();
+        assert_eq!(
+            m[&b"k"[..]],
+            ((0, String::new(), 0, 0), 42, Bytes::from("old"))
+        );
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let batch = Batch::parse(Batch::encode_keyed(&log, 0, &[(0, b"k", b"new")]).unwrap());
+        apply_compacted(&mut m, &batch.unwrap(), 1);
+        assert_eq!(m[&b"k"[..]].2, Bytes::from("new"));
+        let mut bad = b.clone();
+        bad[0] = b'X';
+        assert!(
+            decode_snapshot(&bad).is_err(),
+            "an unknown format is refused"
+        );
+    }
+}
+
+#[cfg(test)]
 mod props {
     use super::*;
     use proptest::prelude::*;
@@ -1507,12 +1588,13 @@ mod props {
         fn snapshots_round_trip_and_damaged_ones_are_refused(
             m in prop::collection::btree_map(
                 prop::collection::vec(any::<u8>(), 0..4),
-                (any::<u64>(), prop::collection::vec(any::<u8>(), 0..4)),
+                ((any::<u64>(), "[a-z0-9-]{0,6}", any::<u64>(), any::<u64>()), any::<u64>(),
+                 prop::collection::vec(any::<u8>(), 0..4)),
                 0..4,
             ),
             at in any::<prop::sample::Index>(), v: u8, cut in any::<prop::sample::Index>(),
         ) {
-            let m: Compacted = m.into_iter().map(|(k, (l, p))| (k, (l, Bytes::from(p)))).collect();
+            let m: Compacted = m.into_iter().map(|(k, (o, l, p))| (k, (o, l, Bytes::from(p)))).collect();
             let b = encode_snapshot(&m);
             prop_assert_eq!(decode_snapshot(&b).unwrap(), m);
             let mut body = b[..b.len() - 4].to_vec();

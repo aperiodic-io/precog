@@ -37,6 +37,8 @@ pub const BATCH_MAGIC_Z: &[u8; 4] = b"PCZ2";
 const DROPPED: u32 = 1 << 31;
 /// An event as `walk` yields it: (seq, time, key, payload).
 type Walked<'a> = (u64, u64, &'a [u8], Bytes);
+/// An event as `keyed` yields it: (seq, time, key, payload).
+pub type Keyed = (u64, u64, Vec<u8>, Bytes);
 /// A PCZ2 event column: (time, key, payload length, dropped).
 type ZColumn<'a> = (u64, &'a [u8], u32, bool);
 /// `(time, Some((key, payload)))`, or `(time, None)` for a tombstone.
@@ -469,12 +471,13 @@ impl Batch {
         })
     }
 
-    /// `(key, payload)` of every event but tombstones; an empty key for keyless events.
-    pub fn keyed(&self) -> Result<Vec<(Vec<u8>, Bytes)>> {
+    /// `(seq, time, key, payload)` of every event but tombstones; an empty key for keyless
+    /// events.
+    pub fn keyed(&self) -> Result<Vec<Keyed>> {
         Ok(self
             .walk()?
             .into_iter()
-            .map(|(_, _, k, p)| (k.to_vec(), p))
+            .map(|(seq, t, k, p)| (seq, t, k.to_vec(), p))
             .collect())
     }
 
