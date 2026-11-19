@@ -13,8 +13,13 @@
 //! (`Reader::by_key`: one read of the log's run in it), only for the segments whose range
 //! covers what is asked.
 //!
-//! ponytail: index reads of sealed segments run under the store's lock; move them out if old
-//! reads (a consumer replaying retention) measurably stall appends.
+//! A consumer replaying retention (`read_cursor`, `cursor_at`, the event-time `read`) reads
+//! absorbed segments' indexes on a copy of their metadata, without the store's lock, which
+//! every append takes.
+//!
+//! ponytail: other old lookups (a late retry's `reserve`, `has`/`get`, repair's `log_batches`,
+//! retention, `tail`'s chunk of at most 1024 entries) read under the lock: each reads a few
+//! segments' runs. Move them onto a view too if they measurably stall appends.
 
 use crate::proto::{Batch, BatchId, Event, Frontier, LogId, decode_log_key, encode_log_key};
 use parking_lot::Mutex;
@@ -103,7 +108,7 @@ struct Inner {
     floor: Lsn,
     /// Second copies of a batch logged twice (a repair raced a replicate): never served.
     dead: BTreeSet<Lsn>,
-    /// Index reads of absorbed segments (`Reader::by_key`) so far.
+    /// Index reads of absorbed segments (`Reader::by_key`) so far, made under the store's lock.
     reads: std::cell::Cell<u64>,
     batches: u64,
     events: u64,
@@ -498,6 +503,38 @@ impl Inner {
         }
     }
 
+    /// A copy of what reading the stream's absorbed segments takes (O(its logs and segments)):
+    /// its logs, with only `hot(log)` of their RAM batches, their absorbed runs, the floors and
+    /// the dead copies. Its index reads then need no lock.
+    fn view(&self, stream: &str, hot: impl Fn(&Log) -> Vec<(u64, Entry)>) -> Inner {
+        let mut v = Inner {
+            floor: self.floor,
+            cold_end: self.cold_end,
+            dead: self.dead.clone(),
+            ..Default::default()
+        };
+        let Some(s) = self.streams.get(stream) else {
+            return v;
+        };
+        let mut sl = StreamLog {
+            cold: s.cold.clone(),
+            floor: s.floor,
+            ..Default::default()
+        };
+        for &ix in &s.logs {
+            let l = &self.logs[ix as usize];
+            sl.logs.insert(v.logs.len() as u32);
+            v.logs.push(Log {
+                id: l.id.clone(),
+                batches: hot(l).into_iter().collect(),
+                cold: l.cold.clone(),
+                ..*l
+            });
+        }
+        v.streams.insert(stream.into(), sl);
+        v
+    }
+
     /// Moves the batches of every sealed segment that ends at or below `upto` out of RAM.
     fn absorb(&mut self, r: &Reader, upto: Lsn) {
         for (base, end) in r.sealed() {
@@ -544,6 +581,8 @@ impl Inner {
 pub struct Store {
     inner: Mutex<Inner>,
     reader: Reader,
+    /// Index reads of absorbed segments made without the lock (`Inner::reads`: under it).
+    unlocked_reads: std::sync::atomic::AtomicU64,
     /// Woken whenever a batch becomes durable (live subscriptions).
     pub durable_notify: tokio::sync::Notify,
 }
@@ -555,6 +594,7 @@ impl Store {
         let s = Store {
             inner: Mutex::default(),
             reader,
+            unlocked_reads: Default::default(),
             durable_notify: tokio::sync::Notify::new(),
         };
         {
@@ -886,6 +926,46 @@ impl Store {
         (out, next)
     }
 
+    /// Visits the stream's durable batches in LSN order from the LSN `start` picks (on the
+    /// view; None: nothing to visit), until `f` returns false: those in absorbed segments on a
+    /// view of them, their index reads without the store's lock, then the rest under it (up to
+    /// `contiguous` for a reader that must never skip one). Skips absorbed segments with nothing
+    /// logged at or after `min_time`.
+    fn visit_stream(
+        &self,
+        stream: &str,
+        hot: impl Fn(&Log) -> Vec<(u64, Entry)>,
+        start: impl FnOnce(&Inner) -> Res<Option<Lsn>>,
+        (contiguous, min_time): (bool, u64),
+        mut f: impl FnMut(&Log, Rec) -> bool,
+    ) -> Res<()> {
+        let r = &self.reader;
+        let v = self.inner.lock().view(stream, hot);
+        let mut done = false;
+        let read = start(&v).and_then(|from| {
+            let Some(from) = from else {
+                done = true;
+                return Ok(from);
+            };
+            v.stream_from(r, stream, (from, v.cold_end), min_time, |x| {
+                done = !f(&v.logs[x.ix as usize], x);
+                !done
+            })?;
+            Ok(Some(from))
+        });
+        self.unlocked_reads
+            .fetch_add(v.reads.get(), std::sync::atomic::Ordering::Relaxed);
+        let from = read?;
+        let Some(from) = from.filter(|_| !done) else {
+            return Ok(());
+        };
+        let g = self.inner.lock();
+        let upto = if contiguous { g.contiguous } else { Lsn::MAX };
+        g.stream_from(r, stream, (from.max(v.cold_end), upto), min_time, |x| {
+            f(&g.logs[x.ix as usize], x)
+        })
+    }
+
     /// The stream's durable batches the cursor has not covered, in this node's order, up to about
     /// `max_bytes`, and the cursor past them. A writer's batch waits until its predecessor is
     /// here (per-writer order); nothing is skipped (only LSNs below `contiguous` are read).
@@ -895,59 +975,58 @@ impl Store {
         cursor: &Cursor,
         max_bytes: usize,
     ) -> (Vec<bytes::Bytes>, Cursor) {
+        let r = &self.reader;
         let mut next = cursor.clone();
-        let lsns: Vec<Lsn> = {
-            let g = self.inner.lock();
-            let r = &self.reader;
-            let Some(sl) = g.streams.get(stream) else {
-                return (vec![], next);
-            };
-            let from = |l: &Log| cursor.get(&l.id).copied().unwrap_or(l.trimmed);
-            // start at the earliest LSN of an unread batch of any of the stream's logs
+        let from = |l: &Log| cursor.get(&l.id).copied().unwrap_or(l.trimmed);
+        // each log's first RAM batch past its cursor (the one holding it, else the next): an
+        // unread batch in RAM may precede the log's absorbed ones
+        let hot = |l: &Log| {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let c = from(l);
+            let at = l.batches.range(..=c).next_back();
+            at.into_iter()
+                .chain(l.batches.range((Excluded(c), Unbounded)).next())
+                .map(|(&s, &e)| (s, e))
+                .collect()
+        };
+        // start at the earliest LSN of an unread batch of any of the stream's logs
+        let start = |v: &Inner| {
             let mut start: Option<Lsn> = None;
-            for &ix in &sl.logs {
+            for ix in 0..v.logs.len() as u32 {
                 let mut lsn = None;
-                let read = g.log_from(r, ix, from(&g.logs[ix as usize]), |_, e| {
+                v.log_from(r, ix, from(&v.logs[ix as usize]), |_, e| {
                     lsn = e.durable().then_some(e.lsn);
                     false
-                });
-                if let Err(e) = read {
-                    tracing::error!("reading the index of stream {stream}: {e}");
-                    return (vec![], next);
-                }
+                })?;
                 if let Some(l) = lsn {
                     start = Some(start.map_or(l, |s| s.min(l)));
                 }
             }
-            let Some(start) = start else {
-                return (vec![], next);
-            };
-            let (mut size, mut out, mut blocked) = (0usize, vec![], BTreeSet::new());
-            let read = g.stream_from(r, stream, (start, g.contiguous), 0, |x| {
-                if size >= max_bytes {
-                    return false;
-                }
-                let l = &g.logs[x.ix as usize];
-                let c = next.get(&l.id).copied().unwrap_or_else(|| from(l));
-                let end = x.first + x.e.count as u64;
-                if blocked.contains(&x.ix) || end <= c {
-                    return true;
-                }
-                if x.first > c {
-                    blocked.insert(x.ix); // its predecessor is not here yet
-                    return true;
-                }
-                next.insert(l.id.clone(), end);
-                size += x.e.len as usize;
-                out.push(x.lsn);
-                true
-            });
-            if let Err(e) = read {
-                tracing::error!("reading the index of stream {stream}: {e}");
-            }
-            out
+            Ok(start)
         };
-        let bytes = lsns
+        let (mut size, mut out, mut blocked) = (0usize, vec![], BTreeSet::new());
+        let read = self.visit_stream(stream, hot, start, (true, 0), |l, x| {
+            if size >= max_bytes {
+                return false;
+            }
+            let c = next.get(&l.id).copied().unwrap_or_else(|| from(l));
+            let end = x.first + x.e.count as u64;
+            if blocked.contains(&l.id) || end <= c {
+                return true;
+            }
+            if x.first > c {
+                blocked.insert(l.id.clone()); // its predecessor is not here yet
+                return true;
+            }
+            next.insert(l.id.clone(), end);
+            size += x.e.len as usize;
+            out.push(x.lsn);
+            true
+        });
+        if let Err(e) = read {
+            tracing::error!("reading the index of stream {stream}: {e}");
+        }
+        let bytes = out
             .into_iter()
             .filter_map(|lsn| self.read_batch(lsn).map(|b| b.bytes))
             .collect();
@@ -956,25 +1035,32 @@ impl Store {
 
     /// A cursor at the first batch this node logged at or after `time_ms`; `u64::MAX`: the end.
     pub fn cursor_at(&self, stream: &str, time_ms: u64) -> Cursor {
-        let g = self.inner.lock();
         let mut c = Cursor::new();
-        let Some(sl) = g.streams.get(stream) else {
-            return c;
-        };
         // the end (u64::MAX) is polled often: no batch is at or after it, so skip the scan
         if time_ms != u64::MAX {
-            let read = g.stream_from(&self.reader, stream, (0, u64::MAX), time_ms, |x| {
-                let log = &g.logs[x.ix as usize].id;
-                if x.time >= time_ms && !c.contains_key(log) {
-                    c.insert(log.clone(), x.first);
-                }
-                c.len() < sl.logs.len()
-            });
+            let logs = std::cell::Cell::new(0);
+            let start = |v: &Inner| {
+                logs.set(v.logs.len());
+                Ok(Some(0))
+            };
+            let read = self.visit_stream(
+                stream,
+                |_| vec![],
+                start,
+                (false, time_ms),
+                |l, x| {
+                    if x.time >= time_ms && !c.contains_key(&l.id) {
+                        c.insert(l.id.clone(), x.first);
+                    }
+                    c.len() < logs.get()
+                },
+            );
             if let Err(e) = read {
                 tracing::error!("reading the index of stream {stream}: {e}");
             }
         }
-        for &ix in &sl.logs {
+        let g = self.inner.lock();
+        for &ix in g.streams.get(stream).into_iter().flat_map(|s| &s.logs) {
             let l = &g.logs[ix as usize];
             if !c.contains_key(&l.id) {
                 c.insert(l.id.clone(), l.high.max(l.trimmed));
@@ -1089,23 +1175,29 @@ impl Store {
     /// ponytail: reads the whole stream from the log; an event-time index per sealed segment
     /// replaces this when streams outgrow a scan.
     pub fn read(&self, stream: &str, from: u64, limit: usize) -> (Vec<Event>, Vec<Frontier>) {
-        let (lsns, cov) = {
+        // what the read covers, taken before it: batches durable meanwhile may be read too, but
+        // are never claimed without being read
+        let mut cov: Vec<Frontier> = {
             let g = self.inner.lock();
-            let mut lsns = vec![];
-            let mut cov = vec![];
-            for &ix in g.streams.get(stream).into_iter().flat_map(|s| &s.logs) {
-                cov.push(Self::frontier_of(&g.logs[ix as usize]));
-            }
-            let read = g.stream_from(&self.reader, stream, (0, u64::MAX), 0, |x| {
+            let logs = g.streams.get(stream).into_iter().flat_map(|s| &s.logs);
+            logs.map(|&ix| Self::frontier_of(&g.logs[ix as usize]))
+                .collect()
+        };
+        cov.sort_by(|a, b| a.log.cmp(&b.log));
+        let mut lsns = vec![];
+        let read = self.visit_stream(
+            stream,
+            |_| vec![],
+            |_| Ok(Some(0)),
+            (false, 0),
+            |_, x| {
                 lsns.push(x.lsn);
                 true
-            });
-            if let Err(e) = read {
-                tracing::error!("reading the index of stream {stream}: {e}");
-            }
-            cov.sort_by(|a, b| a.log.cmp(&b.log));
-            (lsns, cov)
-        };
+            },
+        );
+        if let Err(e) = read {
+            tracing::error!("reading the index of stream {stream}: {e}");
+        }
         let mut out: Vec<Event> = lsns
             .into_iter()
             .filter_map(|l| self.read_batch(l))
@@ -2113,7 +2205,12 @@ mod tests {
             }
         }
         t.s.absorb();
-        let reads = |t: &T| t.s.inner.lock().reads.get();
+        let reads = |t: &T| {
+            t.s.inner.lock().reads.get()
+                + t.s
+                    .unlocked_reads
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        };
         let cost = |t: &T, f: &dyn Fn(&Store)| {
             let r0 = reads(t);
             f(&t.s);
@@ -2183,6 +2280,30 @@ mod tests {
             "the oldest segment, nothing past the gap"
         );
         assert_eq!(t.s.frontiers(Some("g"))[0].contiguous, 5);
+    }
+
+    #[test]
+    fn replaying_old_batches_reads_their_index_without_the_stores_lock() {
+        // Why: appends take the store's lock (reserve, mark_durable). Consumers replaying
+        // retention (live-ingestion's archivers start 2 h back) read many segment indexes; under
+        // that lock they would stall every producer's append
+        let mut t = store_with(TINY);
+        for (stream, w) in [("s", "w1"), ("s", "w2")] {
+            for seq in 0..20 {
+                let x = on(stream, w, seq);
+                t.s.reserve(&x);
+                t.durable(&x);
+            }
+        }
+        t.s.absorb();
+        let locked = |t: &T| t.s.inner.lock().reads.get();
+        let r0 = locked(&t);
+        let (got, _) = drain(&t.s, "s", Cursor::new(), 300);
+        assert_eq!(got.len(), 40);
+        assert_eq!(t.s.read("s", 0, 100).0.len(), 40);
+        let c = t.s.cursor_at("s", 0);
+        assert_eq!(c.values().collect::<Vec<_>>(), [&0, &0]);
+        assert_eq!(locked(&t), r0, "index reads under the lock");
     }
 
     #[test]

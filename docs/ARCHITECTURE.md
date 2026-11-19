@@ -68,7 +68,9 @@ fixed-size entry per record in LSN order and the same entries grouped by key, ea
 `first_seq`. Once a segment is sealed and every batch in it durable, `Store::absorb` (run with
 retention) drops its batches from RAM. A lookup of an older batch (a late retry, `has`/`get`,
 repair's `FetchLog`, a cursor reading old data, retention by stream) reads, per segment whose
-range covers it, that log's run from the segment's index: one read. Recovery streams the index
+range covers it, that log's run from the segment's index: one read. A consumer replaying old
+data (a cursor, a seek by time, the event-time read) does those reads on a copy of the stream's
+metadata, without the store's lock, so it does not stall appends. Recovery streams the index
 a chunk at a time and absorbs each sealed segment as it goes, so it never holds the whole
 index either.
 
