@@ -71,6 +71,28 @@ A recycling log no longer zero-fills spares: with the log at its retention, a ro
 wrote a whole segment of zeros (11% of a node's CPU at 100 MB/s) that the next retention pass then deleted, having
 recycled a segment anyway. The preallocator now waits up to 5 s for that recycle.
 
+## Brokers at saturation (2026-11-19)
+
+With brokers at 1 CPU each, the 1-CPU load generator is the bottleneck: the brokers run at 25-50% of a core and about a
+fifth of their CPU is spent sleeping and waking per event. To measure busy brokers, the same harness with every broker
+capped at **0.5 CPU** (both systems, `--cpus 0.5`), `WARMUP=20`, medians of 3 runs alternating Precog and Redpanda. The
+last runs overlapped other builds on the VM, so treat the spread as wider than usual.
+
+| | records/s | p50 ack | p99 ack | broker CPU per record |
+|---|---:|---:|---:|---:|
+| Precog, fsync before every ack | 348,500 | 4.87 ms | 15.2 ms | 1.73 us |
+| Redpanda, fsync before every ack | 114,100 | 12.1 ms | 128 ms | 4.20 us |
+| **Precog vs Redpanda** | **3.1x** | **2.5x** | **8.4x** | **2.4x** |
+| Precog, write caching | 388,700 | 4.32 ms | 14.2 ms | 1.36 us |
+| Redpanda, write caching | 125,000 | 11.3 ms | 114 ms | 3.48 us |
+| **Precog vs Redpanda** | **3.1x** | **2.6x** | **8.0x** | **2.6x** |
+
+Runs (records/s, p50, p99, us/record): Precog fsync 348k/4.10/15.0/1.728, 356k/4.87/15.2/1.579, 336k/5.08/16.3/1.800;
+Redpanda fsync 64k/11.9/380/4.203, 114k/12.1/128/4.210, 130k/12.5/32.9/4.166; Precog write caching 380k/4.09/30.1/1.424,
+389k/4.37/14.2/1.352, 403k/4.32/12.1/1.360; Redpanda write caching 125k/11.0/140/3.477, 128k/11.3/114/3.606,
+94k/13.2/51.8/3.451. CPU per record rises on both sides under the tighter quota, and the ratio stays at 2.4-2.6x:
+saturation does not change it.
+
 ## How Precog got here (same harness, 250-record batches unless noted)
 
 | change | CPU/record |
