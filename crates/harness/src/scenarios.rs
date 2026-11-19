@@ -375,11 +375,9 @@ impl Sender {
                     .map(|e| rskafka::record::Record {
                         key: None,
                         value: Some(e.body.clone()),
-                        headers: if e.id.is_empty() {
-                            Default::default()
-                        } else {
-                            [("redpanda-dedup-key".to_string(), e.id.clone())].into()
-                        },
+                        // an empty id travels as an empty header: the fork refuses a record
+                        // without one on a dedup topic
+                        headers: [("redpanda-dedup-key".to_string(), e.id.clone())].into(),
                         timestamp: rskafka::chrono::DateTime::from_timestamp_millis(
                             precog_client::now_ms() as i64,
                         )
@@ -665,8 +663,18 @@ async fn dedup_ids(ctx: &mut Ctx, o: &mut Outcome) -> Result<()> {
     let mut g = Gen::new("live-producer-empty-0", 3, 0.0);
     g.empty_ids = true;
     let empty = evs(&mut g, 100);
-    s.send(&empty).await?;
-    s.send(&empty).await?;
+    let r = s.send(&empty).await;
+    o.check(
+        "accepted: 100 events with empty ids",
+        r.is_ok(),
+        format!("{r:?}"),
+    );
+    let r = s.send(&empty).await;
+    o.check(
+        "accepted: 100 events with empty ids again",
+        r.is_ok(),
+        format!("{r:?}"),
+    );
     // one id, two different bodies (a collision, or a producer bug): the id decides
     let mut g = Gen::new("live-producer-coll-0", 3, 0.0);
     let first = evs(&mut g, 100);
@@ -678,8 +686,14 @@ async fn dedup_ids(ctx: &mut Ctx, o: &mut Outcome) -> Result<()> {
             ..g2.next().0
         })
         .collect();
-    s.send(&first).await?;
-    s.send(&second).await?;
+    let r = s.send(&first).await;
+    o.check("accepted: 100 ids", r.is_ok(), format!("{r:?}"));
+    let r = s.send(&second).await;
+    o.check(
+        "accepted: the same 100 ids with other bodies",
+        r.is_ok(),
+        format!("{r:?}"),
+    );
     // two ids, one body: both kept
     let mut g3 = Gen::new("live-producer-twin-0", 3, 0.0);
     let twins: Vec<Ev> = evs(&mut g3, 100);
@@ -690,14 +704,26 @@ async fn dedup_ids(ctx: &mut Ctx, o: &mut Outcome) -> Result<()> {
             ..e.clone()
         })
         .collect();
-    s.send(&twins).await?;
-    s.send(&twins2).await?;
+    let r = s.send(&twins).await;
+    o.check("accepted: 100 bodies", r.is_ok(), format!("{r:?}"));
+    let r = s.send(&twins2).await;
+    o.check(
+        "accepted: the same 100 bodies under other ids",
+        r.is_ok(),
+        format!("{r:?}"),
+    );
     for (i, r) in ctx.read(stream).await?.iter().enumerate() {
-        o.check(
-            format!("empty ids are never deduplicated (view {i})"),
-            copies_of(r, &empty) == (0, 0, 100),
-            json!({"zero_one_more": copies_of(r, &empty)}),
-        );
+        let detail = json!({"zero_one_more": copies_of(r, &empty)});
+        if ctx.precog() {
+            o.check(
+                format!("empty ids are never deduplicated (view {i})"),
+                copies_of(r, &empty) == (0, 0, 100),
+                detail,
+            );
+        } else {
+            // the fork refuses a record without the header, and dedups an empty one as one id
+            o.info(format!("empty dedup keys (view {i})"), detail);
+        }
         o.check(
             format!("one id with two bodies keeps the first (view {i})"),
             copies_of(r, &first) == (0, 100, 0) && copies_of(r, &second) == (100, 0, 0),
@@ -749,7 +775,8 @@ async fn dedup_restart(ctx: &mut Ctx, o: &mut Outcome) -> Result<()> {
         o.check(
             format!("fresh ids after the restart are appended (view {i})"),
             copies_of(r, &fresh) == (0, 2000, 0),
-            json!({"zero_one_more": copies_of(r, &fresh)}),
+            json!({"zero_one_more": copies_of(r, &fresh),
+                   "missing": fresh.iter().filter(|e| !r.iter().any(|x| x.uid == e.uid)).map(|e| &e.uid).take(5).collect::<Vec<_>>()}),
         );
     }
     Ok(())
