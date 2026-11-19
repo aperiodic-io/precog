@@ -450,6 +450,14 @@ impl Node {
                 Some((pos, next, HashMap::<LogId, BTreeMap<u64, Batch>>::new())),
             )
         };
+        // An empty push confirms the starting point: the client's subscribe waits for it.
+        if tx
+            .send(Frame::new(Kind::Push, req.req_id, Bytes::new()))
+            .await
+            .is_err()
+        {
+            return;
+        }
         loop {
             let notified = self.store.durable_notify.notified();
             tokio::pin!(notified);

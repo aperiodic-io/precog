@@ -141,9 +141,15 @@ impl MeshClient {
             stream: stream.map(str::to_owned),
             from_start,
         })?;
-        let rx = c
+        let mut rx = c
             .subscribe(Kind::Subscribe, Bytes::from(body), 1024)
             .await?;
+        // The node's empty push: the feed starts no later than this.
+        let start = tokio::time::timeout(self.rpc_timeout, rx.recv()).await;
+        anyhow::ensure!(
+            matches!(&start, Ok(Some(f)) if f.body.is_empty()),
+            "node {node} did not confirm the subscription"
+        );
         Ok(Subscription {
             rx,
             from_start,
