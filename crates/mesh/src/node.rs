@@ -10,7 +10,7 @@
 use crate::dedup::{self, Dedup};
 use crate::proto::*;
 use crate::rpc::{BoxRead, BoxWrite, RpcClient, read_frame, write_loop};
-use crate::store::{Reserve, State, Store};
+use crate::store::{Cursor, Reserve, State, Store};
 use crate::transport::Addr;
 use crate::wal::Wal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -175,6 +175,16 @@ pub struct Node {
     dedup_dropped: AtomicU64,
     /// Compacted streams: key -> (LSN, payload) of its newest event.
     compact: parking_lot::Mutex<HashMap<String, Compacted>>,
+    /// This node's writer log for consumer-position commits (a new epoch per boot).
+    pos_log: LogId,
+    pos_seq: AtomicU64,
+}
+
+/// The internal compacted stream of consumer positions, keyed by group and stream.
+pub const POSITIONS: &str = "__positions";
+
+fn position_key(group: &str, stream: &str) -> Vec<u8> {
+    [group.as_bytes(), b"\0", stream.as_bytes()].concat()
 }
 
 type Compacted = BTreeMap<Vec<u8>, (u64, Bytes)>;
@@ -302,15 +312,19 @@ impl Node {
         // compacted streams: their snapshots, then whatever the log holds that is newer
         let mut compact: HashMap<String, Compacted> = HashMap::new();
         let mut replay = vec![];
-        for (name, s) in cfg.streams.iter().filter(|(_, s)| s.compacted) {
+        let compacted = cfg
+            .streams
+            .iter()
+            .filter(|(_, s)| s.compacted)
+            .map(|(n, _)| n.as_str());
+        for name in compacted.chain([POSITIONS]) {
             let p = snapshot_path(&cfg.data_dir, name);
             let m = match std::fs::read(&p) {
                 Ok(b) => decode_snapshot(&b).with_context(|| format!("{}", p.display()))?,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Compacted::new(),
                 Err(e) => return Err(e.into()),
             };
-            compact.insert(name.clone(), m);
-            let _ = s;
+            compact.insert(name.to_string(), m);
         }
         for e in &entries {
             if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
@@ -346,6 +360,7 @@ impl Node {
                 down_until: Default::default(),
             }));
         }
+        let cfg_id = cfg.id;
         let node = Arc::new(Node {
             cfg,
             store,
@@ -357,6 +372,14 @@ impl Node {
             dedup: parking_lot::Mutex::new(dedup),
             dedup_dropped: AtomicU64::new(0),
             compact: parking_lot::Mutex::new(compact),
+            pos_log: LogId {
+                stream: POSITIONS.into(),
+                writer: format!("node-{cfg_id}"),
+                epoch: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos() as u64,
+            },
+            pos_seq: AtomicU64::new(0),
         });
         Ok(node)
     }
@@ -428,6 +451,57 @@ impl Node {
     }
 
     /// Applies the configured retention to the log and forgets trimmed batches.
+    /// Commits a reader group's position in a stream, durably on as many nodes as possible
+    /// (up to 2); the newest commit wins.
+    pub async fn commit_position(
+        self: &Arc<Self>,
+        group: &str,
+        stream: &str,
+        cursor: &Cursor,
+    ) -> Result<()> {
+        let entries: Vec<(&str, u64, u64)> = cursor
+            .iter()
+            .filter(|(l, _)| l.stream == stream)
+            .map(|(l, s)| (l.writer.as_str(), l.epoch, *s))
+            .collect();
+        let payload = serde_json::to_vec(&entries)?;
+        let seq = self.pos_seq.fetch_add(1, Ordering::Relaxed);
+        let b = Batch::encode_keyed(
+            &self.pos_log,
+            seq,
+            &[(0, &position_key(group, stream), &payload)],
+        )?;
+        let copies = (1 + self.targets().len()).min(2) as u8;
+        let ack = self.append(copies, b).await;
+        anyhow::ensure!(
+            ack.is_success(),
+            "position commit not acknowledged: {ack:?}"
+        );
+        Ok(())
+    }
+
+    /// A reader group's committed position in a stream, if it has one.
+    pub fn position(&self, group: &str, stream: &str) -> Option<Cursor> {
+        let g = self.compact.lock();
+        let (_, p) = g.get(POSITIONS)?.get(&position_key(group, stream))?;
+        let entries: Vec<(String, u64, u64)> = serde_json::from_slice(p).ok()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|(writer, epoch, s)| {
+                    (
+                        LogId {
+                            stream: stream.into(),
+                            writer,
+                            epoch,
+                        },
+                        s,
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// A compacted stream's newest value of every key, by key.
     pub fn latest(&self, stream: &str) -> Vec<(Vec<u8>, Bytes)> {
         self.compact.lock().get(stream).map_or(vec![], |m| {
@@ -767,11 +841,7 @@ impl Node {
         }
         let mut batch = batch;
         let mut claimed = false;
-        let compacted = self
-            .cfg
-            .streams
-            .get(&batch.id.log.stream)
-            .is_some_and(|s| s.compacted);
+        let compacted = self.compact.lock().contains_key(&batch.id.log.stream);
         if let Some(d) = g.as_mut().filter(|_| !compacted) {
             let ds = digests(&batch);
             if !ds.is_empty() {
