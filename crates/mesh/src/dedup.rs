@@ -127,7 +127,10 @@ impl Dedup {
     /// Every quarter window, drops expired entries in one pass; at the cap, the oldest quarter
     /// of what is kept too (the window shortens instead of memory growing).
     fn sweep(&mut self, now_s: u64) {
-        let full = self.seen.len() > self.max_entries;
+        // the cap raises the floor at most to the current second: past it nothing would be a
+        // duplicate. ponytail: within one second the cap is soft (that second's ids are all
+        // kept); evict within a second (per-entry order) if a single second can outgrow memory
+        let full = self.seen.len() > self.max_entries && self.oldest_s < now_s;
         if !full && now_s < self.swept_s + (self.window_s / 4).max(1) {
             return;
         }
@@ -244,6 +247,34 @@ mod tests {
         assert_eq!(
             dups(&mut d, &[digest(1, &99_999u64.to_le_bytes())], now),
             [true]
+        );
+    }
+
+    #[test]
+    fn at_the_cap_the_newest_ids_are_caught_even_when_they_arrived_within_one_second() {
+        // Why: a burst past the cap within one second raised the floor past the clock, one second
+        // per batch, and from then on nothing was a duplicate, not even within a batch
+        let mut d = Dedup::new(300, 3, 10_000);
+        let ids =
+            |r: std::ops::Range<u64>| r.map(|i| digest(1, &i.to_le_bytes())).collect::<Vec<_>>();
+        let now = 1_000;
+        for b in 0..60u64 {
+            dups(&mut d, &ids(b * 500..(b + 1) * 500), now);
+        }
+        assert!(
+            d.oldest_s <= now,
+            "the floor ran ahead of the clock: {}",
+            d.oldest_s
+        );
+        assert_eq!(
+            dups(&mut d, &ids(29_500..30_000), now),
+            vec![true; 500],
+            "the newest batch"
+        );
+        assert_eq!(
+            dups(&mut d, &[7, 7], now),
+            [false, true],
+            "a batch still sees itself"
         );
     }
 
