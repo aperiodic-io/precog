@@ -102,7 +102,8 @@ impl Wal {
         Self::durable(self.submit(batch)?).await
     }
 
-    /// Queues the batch: batches reach the log in the order they are submitted.
+    /// Queues the batch (under write caching: writes it on the caller): batches reach the log in
+    /// the order they are submitted.
     pub fn submit(&self, batch: Batch) -> Result<oneshot::Receiver<Result<Lsn, String>>> {
         if self.fatal.load(Ordering::Acquire) {
             bail!("storage is fenced after a fatal error");
@@ -120,6 +121,9 @@ impl Wal {
 
     /// Write caching: appends the batch on the calling thread, and wakes the WAL thread only when
     /// the flush deadline moves (the first unsynced write, or `flush_bytes` crossed).
+    /// ponytail: a roll (its fsyncs, a zero-fill when no spare is ready) or the WAL thread's
+    /// `retain` holds the lock and stalls every submitting worker; move rolls off the worker if
+    /// `roll_stalls` or p99 say so.
     fn write(&self, batch: &Batch) -> Result<Lsn, String> {
         let mut log = self.log.lock();
         let due = log.flush_due();
@@ -174,8 +178,11 @@ fn meta(b: &Batch, time_ms: u64) -> Meta {
 }
 
 fn publish(log: &precog_storage::Log, stats: &WalStats, fatal: &AtomicBool) {
-    // a fatal error fences the log for good; the node stops acknowledging until restart
-    fatal.store(log.is_fenced(), Ordering::Release);
+    // a fatal error fences the log for good; the node stops acknowledging until restart. Only
+    // ever raise it: the node also fences on its own (a claimed batch that failed to store).
+    if log.is_fenced() {
+        fatal.store(true, Ordering::Release);
+    }
     let s = log.stats();
     stats.syncs.store(s.syncs, Ordering::Relaxed);
     stats.bytes.store(s.bytes, Ordering::Relaxed);

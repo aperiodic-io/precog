@@ -341,3 +341,27 @@ fn without_write_caching_batches_queued_during_an_fsync_share_the_next_one() {
     let syncs = wal.stats.syncs.load(std::sync::atomic::Ordering::Relaxed);
     assert!(syncs < 100, "{syncs} fsyncs for 200 batches");
 }
+
+#[test]
+fn a_fence_the_node_sets_survives_the_wal_threads_deferred_flush() {
+    // Why: the node fences the WAL itself when a batch whose dedup ids it claimed fails to store
+    // (those ids stay claimed in the index). Its housekeeping must never lift that: acking again
+    // would drop later events carrying those ids as duplicates.
+    use precog_mesh::wal::Wal;
+    use std::sync::atomic::Ordering;
+    let d = tempfile::tempdir().unwrap();
+    let mut c = precog_storage::Config::new(d.path());
+    c.segment_size = 1 << 20;
+    c.flush_delay_ms = 20;
+    let (wal, _) = Wal::open(c).unwrap();
+    wal.submit(Batch::parse(batch("w", 0, 100)).unwrap())
+        .unwrap();
+    wal.fatal.store(true, Ordering::Release); // as node.rs does for a failed claimed batch
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while wal.stats.syncs.load(Ordering::Relaxed) == 0 {
+        assert!(std::time::Instant::now() < deadline, "never flushed");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20)); // past its publish
+    assert!(wal.fatal.load(Ordering::Acquire), "the fence was lifted");
+}
