@@ -111,7 +111,9 @@ repair key on identity and sequence and answer as before (`store::tests::a_batch
 Peers see the same frontiers and bytes, so repair fetches nothing. A live feed drops a batch below
 its log's next sequence, so it never pushes a copy again; a replay delivers each batch once
 (`a_batch_copied_forward_is_not_new_to_feeds_or_peers`). A stream trims oldest first by append
-time, which a copy keeps, so a copy does not outlive the batches logged after it. A cursor read
+time, which a copy keeps, so a copy does not outlive the batches logged after it. Append times
+never go back (the WAL stamps the later of now and the newest time it gave, seeded from the log),
+so a clock stepped back does not put a new batch below a stream's trim floor. A cursor read
 holds a log's batches that a copy put ahead of their predecessor, and a seek by time takes each
 log's lowest sequence logged at or after the time.
 
@@ -129,7 +131,11 @@ copies need room for (a group's bytes plus a segment header per group, at most).
 retain exceeds the cap, the cap wins: it cuts the oldest batches of the stream furthest over its
 share (the cap divided equally among the streams with a retention of their own: the one retaining
 the most bytes, down to the next one, then both), counted in
-`precog_retention_forced_total{stream}`. Copy volume per pass is at most what streams retain in
+`precog_retention_forced_total{stream}`. A sealed segment not absorbed yet (it holds a batch not
+marked durable yet) waits a pass; its bytes take no room from the copies, so the log can be over
+the cap by them for that pass, but nothing retained is cut for them. A retained record that does
+not read back (a checksum failure) goes with its segment, logged, as before copying: the pass
+goes on and the cap keeps dropping. Copy volume per pass is at most what streams retain in
 the dropped segments, written in groups of at most 4 MiB, so no write holds the log longer than
 an ordinary group. Steady state, a retained batch is copied once per turnover of the log: copy
 volume is about what streams retain beyond the newest segments per cap's worth written. Metrics:
@@ -169,9 +175,11 @@ What Iggy's VSR provides and the mesh deliberately does not:
 
 ## Not implemented (POC limits)
 
-* Data is also held in RAM. There is no segment engine, retention, compaction or
-  erasure-coded cold tier. The production plan keeps the WAL as the only
-  synchronous write and builds segments and indexes off the ack path.
+* Storage is one segment log per node (`crates/storage`): segments, index files, a
+  manifest, recovery, the node cap and each stream's own retention (the segment cleaner
+  above). A compacted stream keeps each key's newest value in a snapshot; segments are not
+  rewritten by key. There is no cold tier (erasure-coded or object store): a node keeps what
+  it retains on its own disk.
 * Placement is static: every node targets 3 copies, chosen as the first peer per
   distinct domain. There is no controller, membership changes, rebalancing or
   rack/zone awareness beyond labels.
