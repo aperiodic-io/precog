@@ -1,211 +1,146 @@
-# Precog broker mesh POC vs Apache Iggy
+# Precog
 
-A proof of concept for a **leaderless writer-log mesh**, benchmarked against
-**current Apache Iggy**: server 0.10.0 (`apache/iggy:latest`, Nov 2026) with its
-official Rust SDK 0.12.0 and its VSR cluster. Both systems are driven by the
-same benchmark harness.
+A leaderless, durable event broker built to replace `redpanda-raw-internal`, the raw-data Redpanda
+cluster in live-ingestion. Each source owns a writer log and numbers its own events. Any node accepts
+any append, and an append is acknowledged once 2 of 3 nodes hold it. No consensus runs per message,
+and no partition has a leader to fail over.
 
-* `crates/mesh`: the mesh node, client and CLI. It has a group-commit WAL, direct
-  peer replication with durable-N acks, anti-entropy repair, event-time reads, and
-  TCP transport (QUIC/Iroh was removed: TCP measured 1.4–1.6x faster). Design and guarantees are in
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-* `crates/bench`: one closed-loop producer benchmark with two backends, Iggy
-  through `iggy::IggyClient::send_messages` and the mesh through `Writer::append`.
-* `scripts/`: start native Iggy (single or 3-node VSR cluster) and mesh
-  clusters, the benchmark suite, the failover experiment and the summariser.
-* `results/`: raw JSONL, the [full tables](results/RESULTS.md) and the logs from the runs below.
+On the same machine, the same workload and the same durability, Precog beats the Redpanda build
+live-ingestion runs by **4.4–4.8x on throughput** and **3.9–7.4x on ack latency**, using **2.3–3.0x
+less broker CPU per record** ([results](#results-against-redpanda)).
 
-The previous agent's patch was missing, so this POC is a fresh implementation of
-the handover's design: writer logs, durable-2 out of 3 target copies, event-time
-merge, and no consensus on the data path. It is a standalone data path, **not** an Iggy fork.
+Design and guarantees: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Plan of record:
+[docs/PLAN.md](docs/PLAN.md).
 
-## Headline results
+## What it does
 
-4 vCPU Xeon @ 2.1 GHz VM, ext4 on virtio disk (fdatasync ≈ 180 µs p50).
-Everything runs on one machine over loopback: nodes, client, all of it. Median of
-3 runs × 10 s after 2 s warm-up, 256 B messages, 100 per batch, one batch in flight
-per producer. Each Iggy producer owns a partition; each mesh producer owns a writer log.
-Iggy nodes run 1 shard each and mesh nodes 1 Tokio worker each.
+Only what live-ingestion uses is built.
 
-| Durable acknowledgement (fsync) | Iggy 0.10 | Mesh (TCP) | Mesh (Iroh, since removed) |
-|---|---:|---:|---:|
-| 1 node, 16 producers | 344k msg/s, p50 4.5 ms | **907k msg/s, p50 1.7 ms (2.6×)** | — |
-| 3 nodes, 2-of-3 durable, 6 producers | 129k msg/s, p50 4.5 ms | **366k, p50 1.5 ms (2.8×)** | 259k, p50 2.1 ms (2.0×) |
-| 3 nodes, 2-of-3 durable, 24 producers | 179k msg/s, p50 13.1 ms | **596k, p50 3.6 ms (3.3×)** | 379k, p50 5.6 ms (2.1×) |
-| …same, Iggy tuned: all producers on **1 partition** | 373k msg/s, p50 6.0 ms | **619k, p50 3.5 ms (1.66×)** | |
-| 3 nodes, small batches (10 msgs), 6 producers | 17k msg/s, p50 3.4 ms | **61k, p50 0.9 ms (3.5×)** | |
-| 3 nodes, large batches (1000 msgs), 6 producers | 556k msg/s, p50 10.2 ms | **743k, p50 7.1 ms (1.34×)** | |
-| Server CPU per message (3 nodes, 6 producers) | 15.6 µs | **4.8 µs** | 8.5 µs |
-| **Control: no fsync** (Iggy `replicated`, mesh `--no-sync`) | 620k msg/s | 672k (**1.08×**) | |
+| Feature | What it replaces in Redpanda |
+|---|---|
+| **Streams**, named like the raw topics, each with retention by bytes and by age | topics with `retention.bytes` / `retention.ms` |
+| **Compacted streams**: the newest value of every key survives retention and restarts | `cleanup.policy=compact` (the collectors' `<name>.state` topics) |
+| **Broker-side dedup** by each event's dedup id, kept for a window (5 minutes on the raw streams) | the dedup fork's `redpanda.dedup.window.ms` keyed by `redpanda-dedup-key` |
+| **Durable acks on 2 of 3 nodes**, fsync before the ack by default | `acks=all` with RF=3 |
+| **Write caching**, opt-in (`flush_delay_ms: 100`, `flush_bytes` 256 KiB by default): ack once written on 2 nodes, fsync within 100 ms / 256 KiB; a failed fsync still fences the node | `write_caching_default=true`, as live-ingestion runs it |
+| **Anti-entropy repair**: every node converges to the union of all copies, so a restarted node catches up by itself | partition replication and recovery |
+| **Cursors valid on every node** and **reader groups** with committed positions: consumers fail over between nodes and resume where they committed | consumer groups and committed offsets |
+| **A stream's end on a quorum** (`Client::end`), for readers that must prove they have read everything acked | high watermark |
+| **Lag and health**: `/metrics` (`precog_group_lag_events`, `precog_group_commit_age_seconds`) and `/health` | Redpanda's metrics endpoint |
+| **Kubernetes deployment**: StatefulSet config from DNS peers, the node id from the pod's ordinal, image `ghcr.io/aperiodic-io/precog` | the Redpanda StatefulSet |
 
-Failover, 3 nodes, 6 producers, durable-2. Node 0 is killed or frozen 8 s into a
-20 s run. The numbers are the worst per-producer time without an ack, from 3 runs:
+Deliberately not built: users, ACLs and TLS (one shared in-cluster token), a Kafka-compatible API,
+transactions, and membership changes beyond the 3 configured nodes.
 
-| Fault on node 0 | Iggy 0.10 VSR (heartbeat 2 s, its minimum) | Mesh |
-|---|---|---|
-| `SIGKILL` (crash, peers see RST) | 2 producers stall **1.8–2.7 s** (view change); 0 errors | all producers ≤ **71 ms**; 0 errors |
-| `SIGSTOP` (hung host / partition) | 2 producers stall **30 s** (SDK request timeout) then error; 1–2 batches committed but never acked to the client | 2 producers stall **1.0 s** (= client RPC timeout, tunable) then fail over; 0 errors |
-| Rejoin after crash | — | restarted node pulled ~4.5 M missed events by anti-entropy in ~24 s |
+## Clients
 
-Every mesh run was checked after the fact: all three nodes hold exactly the
-acknowledged event count. Iggy's topic counter matched the acknowledged count,
-except for the unknown-outcome batches noted in the SIGSTOP row.
+- **Rust SDK, `precog-client`** (`crates/client`):
+  - `Producer` batches the events of one writer log, each with a dedup id. It keeps up to 8 batches in flight and retries a failed append with the same bytes on the next node, which is idempotent.
+  - `Consumer` reads from a cursor, starting at a committed position, the beginning, the end or a time, and commits.
+  - `Client::latest` returns a compacted stream's newest value of every key.
+- **Go client** (`clients/go`): the same protocol, used by live-producers' Go collectors and derived-seed.
 
-## Live feed with multiple subscribers
+The users in live-ingestion:
+- the producers and collectors (aperiodic-io/live-producers);
+- brrrrr's `--precog` source (aperiodic-io/brrrrr);
+- the Rust archivers;
+- maritime-analytics.
 
-Each subscriber receives **every** message of the stream while 6 producers
-write with durable-2 acks on 3 nodes. Subscribers are spread across the nodes.
+## Results against Redpanda
 
-* **Iggy:** standalone `PartitionReader`s over all partitions, using long-poll fetch.
-* **Mesh:** `Subscription`s with server push of raw batches.
+[`bench/compare/run.sh`](bench/compare/run.sh) on one 4-vCPU VM. Each system runs 3 brokers in containers capped at 1 CPU and
+4000Mi, the size of live-ingestion's raw brokers. Each batch is kept on 3 nodes and acknowledged at 2, with a 5-minute dedup
+window and 20% resends. The workload is live-ingestion's own: 8 producers × 3 symbols of ~230-byte JSON trades, 2,000 records
+in flight, each load generator in its own 1-CPU container. Redpanda is the dedup fork image live-ingestion pins, driven by
+live-ingestion's franz-go load generator. All numbers are medians of 3+ runs alternating the two systems. Full tables, per-run
+numbers and caveats are in [results/compare.md](results/compare.md).
 
-End-to-end latency runs from the producer's timestamp before sending to the
-moment the subscriber receives the message. Medians are over 3 runs. Every
-subscriber received every acknowledged message in all 33 runs.
+| Durability | | records/s | p50 ack | p99 ack | broker CPU / record |
+|---|---|---:|---:|---:|---:|
+| **Write caching** (as live-ingestion runs Redpanda) | Precog | 650,700 | 2.85 ms | 6.2 ms | 1.12 µs |
+| | Redpanda | 135,000 | 11.1 ms | 45.6 ms | 3.39 µs |
+| | **ratio** | **4.8x** | **3.9x** | **7.4x** | **3.0x** |
+| **fsync before every ack** | Precog | 696,600 | 2.71 ms | 5.49 ms | 1.39 µs |
+| | Redpanda | 159,000 | 11.5 ms | 21.3 ms | 3.26 µs |
+| | **ratio** | **4.4x** | **4.2x** | **3.9x** | **2.3x** |
 
-| Fixed load, 60k msg/s | Iggy e2e p50 / p99 | Mesh (TCP) e2e p50 / p99 | Server CPU per produced msg, Iggy → mesh |
-|---|---|---|---|
-| 1 subscriber | 2.7 / 5.9 ms | **0.95 / 2.6 ms** | 17.7 → 7.2 µs |
-| 4 subscribers | 2.7 / 5.5 ms | **1.0 / 3.0 ms** | 19.5 → 6.8 µs |
-| 16 subscribers | 4.0 / 9.3 ms | **1.3 / 3.5 ms** (Iroh: 2.1 / 4.8) | 24.5 → 7.8 µs |
-| 32 subscribers | 6.6 / 18.8 ms | **1.4 / 3.3 ms** | 30.3 → 10.5 µs |
+At these caps the load generator saturates before the brokers, which run at 25–50% of a core.
 
-| As fast as possible, 16 subscribers | Iggy | Mesh (TCP) |
-|---|---:|---:|
-| Produced (durable-2) | 90k msg/s | **284k msg/s (3.1×)** |
-| Delivered, summed over subscribers | 1.44M msg/s | **4.54M msg/s** |
-| e2e p50 / p99 | 7.1 / 15.6 ms | **2.0 / 6.1 ms** |
+The write-caching row predates appends on the worker thread (#16): in an A/B on a smaller-segment setup, that change cut
+broker CPU per record by 6.9% under write caching and left fsync-per-ack unchanged (`results/compare.md`).
 
-What this shows:
+With every broker capped at 0.5 CPU, so the brokers are the bottleneck:
+- Precog does 3.1x the throughput and 8x lower p99.
+- It uses 2.4–2.6x less CPU per record.
 
-* **Mesh latency stays flat as subscribers are added. Iggy's grows** (p99 went
-  from 5.9 to 18.8 ms between 1 and 32 subscribers). Iggy's producers slow down
-  too, because polls compete with writes on the same shards. A mesh node keeps one
-  in-memory log, and every subscription is just a cursor into it. It pushes the
-  same refcounted batch bytes to every subscriber, so it does no per-subscriber
-  encoding and no polling round trips.
-* **Visibility is not identical.** A mesh node pushes a batch once it is durable
-  *on that node*. Iggy delivers only committed messages, which means quorum. A
-  mesh subscriber can therefore see a batch whose durable-2 ack has not yet
-  reached the producer. A "deliver at k copies" mode would make the two
-  equivalent; it is not built yet.
-* **POC limits of the feed:** there is no resume or failover of a subscription
-  to another node (resuming by per-log frontiers is the plan), and no consumer
-  groups or stored offsets.
+Dedup drops exactly the resent share on both systems (Redpanda 19.99%).
 
-## Further performance work, ranked by expected gain
+Where Precog's CPU goes and what was tried to lower it is also in `results/compare.md`. CPU per record is the one ratio not clearly above 3x:
+- it is 3.0x with write caching, with no margin;
+- it is 2.3x with an fsync before every ack.
 
-| # | Change | Why | Evidence / expected |
-|---|---|---|---|
-| 1 | **Pipelining per writer** (several batches in flight per writer log) | Sequences are assigned by the writer, so in-flight batches never conflict; the store already accepts out-of-order ranges. | Closed-loop producers are latency-bound today. Expect several-× per-producer throughput. |
-| 2 | **Client-side linger batching** (combine small appends for ~0.5–1 ms) | Per-batch cost dominates small batches. | Measured: 10-message batches 61k msg/s vs 1000-message batches 743k msg/s. |
-| 3 | **Preallocated WAL segments** (fallocate + zero, recycle files) | `fdatasync` on an appending file also commits the file-size metadata. | **Measured on this disk: 27 KB fdatasync p50 297 → 123 µs (2.4×).** |
-| 4 | **Several WAL files per node** (one per core, or per NVMe queue) | A single file allows only one sync in flight, and NVMe can run many in parallel. | Raises the per-node durable ceiling on real NVMe. |
-| 5 | **Fan-out to `copies-1` peers first**, the rest later (hedged after a delay) | Today every append goes to 2 peers. For durable-2 one peer is enough on the hot path. | ~⅓ less network and replica CPU per message. |
-| 6 | **Vectored writes / zero-copy framing** | `write_loop` copies every batch into a frame buffer, once per connection. That hurts most with many subscribers. | Lower CPU per delivered message. |
-| 7 | **Thread-per-core runtime** (like Iggy's compio) and shard the store lock per log | Removes cross-thread hops (Tokio ↔ WAL thread) and one global mutex. | Matters past ~8 cores. |
-| 8 | **Coalesce subscriber wakeups** | Every durable batch wakes every subscription. | CPU at high subscriber counts. |
+## The wire protocol
 
-## Why the mesh is faster here, and what it costs
+The protocol was chosen by measurement. [results/protocol.md](results/protocol.md) compares more than a dozen append-path proofs of concept
+(`crates/lab`), each changing one idea:
+- pipelining;
+- batching on backlog, with linger;
+- cumulative acks;
+- interned stream and writer ids;
+- fixed record columns with a dedup-hash column;
+- varint and dictionary columns;
+- client-side lz4;
+- zero-copy buffers;
+- standby shadows.
 
-**1. The gain is in the durability path, not in a faster server.** With fsync
-off, the two are within 8 % of each other (the control row). Everything above
-that comes from how many fsync barriers and round trips each acknowledged byte
-pays for:
+The research behind them is in [reports/Native protocol design space.md](reports/Native%20protocol%20design%20space.md).
 
-* **Group commit across all writers.** The mesh has one WAL per node, and every
-  append queued while an fdatasync runs joins the next one. That works out to
-  about 2 batches per sync at 4 producers, more as load grows. Iggy groups only
-  *within one partition*, because each partition has its own VSR group and WAL.
-  With one producer per partition there is nothing to group. Forcing all 24
-  producers onto one partition doubles Iggy's throughput (179k → 373k) and cuts
-  its CPU per message by 3×. That is the strongest evidence for this
-  explanation, and it shows that partitioning for parallelism actively hurts
-  Iggy's durable throughput. Iggy's `wal_group_commit_delay_micros = 300` made no
-  difference in this workload.
-* **A shorter commit path.** The mesh writes locally and to its peers in
-  parallel, then acks at the second durable copy: one network RTT plus one
-  fsync. Iggy's persisted path goes through the primary's prepare pipeline,
-  waits for quorum `prepare_ok` *with* stable-storage proofs, then commits and
-  applies. Its p50 at one producer is 1.6 ms against 0.8 ms for the mesh.
-* **Less work per message.** A mesh batch is opaque bytes plus a checksum. The
-  node never re-encodes it, assigns no offsets and keeps no index on the ack path.
+The ideas kept there compose. Precog's protocol ships these:
+- pipelining (8 batches in flight);
+- fixed 14-byte event headers with the dedup keys outside the compressed payload;
+- per-batch lz4 that the broker never decompresses to deduplicate.
 
-**2. Availability comes from having no leader.** In Iggy a partition can only
-be written through its primary, so a dead primary means a view change: at least
-one heartbeat timeout, and 2 s is the floor Iggy accepts. In the mesh any node
-accepts any writer log, and a retry of the same bytes is idempotent. The client
-moves on as soon as it notices the failure: immediately on a reset, or after its
-own RPC timeout on a hang. Nothing has to be elected. A hung node is the worst
-case for Iggy here, because clients seeded with that node waited out the full
-30 s SDK timeout. That last part is client behaviour and could be tuned. The
-view-change floor could not be tuned further.
+The rest of the ideas kept there aren't built yet: linger, cumulative acks, interned ids and standby shadows.
+Varint and dictionary columns and the zero-copy buffer management bought too little and were dropped.
 
-**3. What is given up.** These are not free wins. The mesh has **no per-partition
-total order across producers**. It orders within each writer log, and readers
-merge by source event time, so late data and completeness windows become the
-reader's problem. Consumer groups, linearizable offsets, retention, segment
-storage, and placement or membership changes are not built. Iggy does all of
-these, and some of them would add cost to the mesh: segment indexing off the ack
-path, a small control plane. The mesh POC also keeps all data in RAM. The
-fair claim is therefore narrower:
+## Layout
 
-> For ingest workloads with many independent sources, where the order you need
-> is per source plus an event-time merge, removing per-partition consensus from
-> the write path gives **~2–3.5× durable throughput, ~2–4× lower median latency,
-> ~3× less server CPU per message, and fault recovery in tens of ms instead of
-> seconds** on commodity hardware. The gap narrows to ~1.3–1.7× when Iggy's
-> workload is shaped to amortize its fsyncs (big batches, few hot partitions).
+| Path | What |
+|---|---|
+| `crates/storage` | `precog-storage`: segment log, group commit across all writers, recycled preallocated segments, CRC-32C framing with generations, index files, manifest, recovery, retention, tail cache |
+| `crates/mesh` | `precog-mesh`: node, replication, repair, dedup, RPC, TCP transport, the node binary (`precog-node`), acceptance tests |
+| `crates/client` | `precog-client`, the Rust SDK, and the `loadgen` example used by the benchmarks |
+| `clients/go` | Go client |
+| `crates/lab` | protocol and dedup proofs of concept (evidence, not part of the product) |
+| `crates/bench`, `crates/storage-bench` | the earlier Apache Iggy comparison and the storage-backend comparison (evidence) |
+| `bench/compare`, `bench/redpanda`, `bench/perf-gate` | the Redpanda comparison, its baseline, and CI's wall-clock gate |
+| `deploy/k8s`, `Dockerfile` | the Kubernetes manifest and the broker image |
+| `docs/`, `reports/`, `results/` | plan, architecture, research reports, raw benchmark results |
 
-**4. QUIC/Iroh was removed: TCP measured 1.4–1.6x faster** at every load (`mesh-c2-tcp` vs `mesh-c2-iroh` in `results/RESULTS.md`).
-
-## Caveats (read before quoting numbers)
-
-* Everything ran on one 4-vCPU VM. Three nodes and the client share the CPUs,
-  and all nodes **share one disk**, so "2 independent durable copies" here does
-  not mean independent hardware. Loopback has about 0 RTT. Real cross-machine
-  RTT adds to both systems' replication path. It would add more to Iggy when
-  the partition primary is remote from the client, since the mesh writes to
-  the nearest node, but **this was not measured**.
-* The mesh POC holds data in memory and has no read-path, consumer or retention
-  load. Iggy is a complete broker. Neither system's tail read latency was benchmarked.
-* The Iggy configuration is defaults plus topic `durability`, `replication_factor`,
-  1 shard per node and a 2 s heartbeat. Other tuning, such as more shards or
-  pinning, may change its numbers. The `iggyfair` section is the attempt to give
-  it its best layout.
-* The harness counts message payload bytes only. Iggy messages carry a 64 B
-  header each, mesh events 12 B.
-
-## Reproduce
+## Build, test, run
 
 ```bash
-cargo test                       # 11 unit + 7 multi-node tests (TCP, live feed)
-cargo build --release
+cargo build --release -p precog-mesh --bin precog-node -p precog-client --example loadgen
 ```
 
-Iggy binaries come from the official image:
+(`storage-bench` links RocksDB and needs libclang; nothing else does, so the commands here leave it out.)
 
 ```bash
-mkdir -p run/bin && id=$(docker create apache/iggy:latest) && docker cp $id:/usr/local/bin/iggy-server run/bin/ && docker rm $id
+cargo nextest run --workspace --exclude storage-bench
 ```
 
 ```bash
-REPS=3 DUR=10 scripts/bench_suite.sh          # ~25 min -> results/suite.jsonl
+cargo test -p precog-mesh --test acceptance -- --tags 'not @nightly and not @stress'
 ```
 
-```bash
-OUT=results/subs.jsonl scripts/bench_suite.sh subs   # live-feed section, ~15 min
-```
+CI runs all of these, plus the following ([AGENTS.md](AGENTS.md) has the commands):
+- coverage gate;
+- mutation testing of every PR's diff;
+- instruction-count bench gate;
+- wall-clock perf gate;
+- the Go client's tests.
 
-```bash
-scripts/failover.sh iggy kill 0; scripts/failover.sh mesh stop 0   # etc.
-```
-
-```bash
-python3 scripts/summarize.py > results/RESULTS.md
-```
-
-Try the mesh by hand:
+A local 3-node cluster:
 
 ```bash
 target/release/precog-node init --nodes 3 --dir run/demo
@@ -216,18 +151,31 @@ for i in 0 1 2; do target/release/precog-node serve --config run/demo/node-$i.js
 ```
 
 ```bash
-target/release/precog-node demo --cluster run/demo/cluster.json --count 5 --copies 2
+target/release/precog-node status --cluster run/demo/cluster.json
+```
+
+The Redpanda comparison needs Docker, the release binaries built above (`precog-node` and the `loadgen` example) and live-ingestion's franz-go load generator (`benchmarks/redpanda-dedup/loadgen`
+there). Precog first, then Redpanda at equal durability:
+
+```bash
+RETENTION=600000000 WARMUP=20 BATCH=250 FLUSH_MS=100 bench/compare/run.sh precog-wc precog 0.2 2000
 ```
 
 ```bash
-target/release/precog-node read --cluster run/demo/cluster.json --node 2   # event-time order
+RP_WRITE_CACHING=true WARMUP=20 FRANZ_LOADGEN=/path/to/loadgen bench/compare/run.sh redpanda-wc redpanda 0.2 2000
 ```
 
-## Suggested next steps
+## Status
 
-1. Run on 3 separate machines and inject RTT/jitter with `tc netem` between
-   nodes to measure the remote-primary effect.
-2. Build a segment engine off the ack path and benchmark reads and tailing against
-   Iggy polls.
-3. Add event-time watermarks and completeness signals for readers, plus a minimal
-   control plane for consumer offsets.
+- Merged to `main`; the image workflow publishes `ghcr.io/aperiodic-io/precog:sha-<commit>` from every push to `main` and every `v*` tag.
+- live-ingestion deploys Precog on staging beside `redpanda-raw-internal`, pinned to a published commit. From there it moves the
+  producers to dual-write and then switches every raw-topic client with one setting (`rawBroker: precog`).
+- The rollout steps and rollbacks are in live-ingestion's `docs/operations.md`, section "Precog".
+
+## History
+
+Precog started as a proof of concept against Apache Iggy 0.10. Durable on 2 of 3 nodes, it measured 2.1–3.3x Iggy's throughput
+at Iggy's defaults (1.3–1.7x against Iggy tuned to one partition or 1000-message batches). Producers failed over within
+71 ms of a node being killed, where Iggy stalled up to 2.7 s, and within 1 s (the client's RPC timeout) of a node hanging,
+where Iggy stalled 30 s. Those numbers and their harness are kept in [results/RESULTS.md](results/RESULTS.md),
+`results/failover.jsonl` and `crates/bench`.

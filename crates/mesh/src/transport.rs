@@ -1,7 +1,5 @@
 //! Connectivity: plain TCP to `tcp://<host>:<port>`, where host is an IP address or a DNS name
 //! (resolved at every dial, so a StatefulSet pod that moves keeps its name).
-//!
-//! QUIC/Iroh was removed: TCP measured 1.4-1.6x faster at every load.
 
 use crate::rpc::RpcClient;
 use anyhow::{Result, anyhow, bail};
