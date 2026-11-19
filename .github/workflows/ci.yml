@@ -80,6 +80,8 @@ jobs:
   kani:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # the proofs' stubs are used only through #[kani::stub]: -D warnings would call them dead
+    env: { RUSTFLAGS: "" }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
