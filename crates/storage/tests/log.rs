@@ -1718,3 +1718,43 @@ fn a_spare_of_the_right_size_is_reused_after_a_restart() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(names(), before, "the same spare, not a new one");
 }
+
+#[test]
+fn spare_names_keep_counting_up_across_a_restart() {
+    // a name below one already on disk could be reused and its rename overwrite a pooled spare
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 64 * 1024);
+    c.prealloc_bytes_per_s = 0;
+    let numbers = || -> Vec<u64> {
+        let mut v: Vec<u64> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().to_string();
+                n.strip_prefix("spare-")?.strip_suffix(".log")?.parse().ok()
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let wait = |want: usize| {
+        let t = std::time::Instant::now();
+        while numbers().len() < want && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    {
+        let _log = Log::open(c.clone()).unwrap();
+        wait(1);
+    }
+    let old = numbers();
+    assert_eq!(old.len(), 1);
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 40, 2, 1000); // ~80 KiB: a roll takes the old spare
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait(1);
+    let new = numbers();
+    assert!(
+        !new.is_empty() && new.iter().all(|&n| n > old[0]),
+        "{old:?} then {new:?}"
+    );
+}
