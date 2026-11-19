@@ -57,7 +57,7 @@ or damaged record; the Kani proofs cover the decoder itself), and other segments
 |---|---|---|---|---|---|
 | `MC_sync` | 5 records | ≤ 2 | 2 | media faults | 168,792 |
 | `MC_caching` | 6 | ≤ 2 | 2 | flush at 2, bound 4 | 224,200 |
-| `Nightly_sync` | 7 | ≤ 3 | 3 | media faults | see nightly |
+| `Nightly_sync` | 6 | ≤ 3 | 2 | media faults | 1,502,239 |
 | `Nightly_caching` | 7 | ≤ 2 | 2 | flush at 3, bound 5, media faults (`Prefix`) | 13,972,478 |
 
 **Found.** Under write caching several groups are unsynced at once and the kernel writes them
