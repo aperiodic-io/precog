@@ -17,7 +17,7 @@ IMAGE_RP=${IMAGE_RP:-ghcr.io/dream-faster/redpanda:71f80ccdf79917925ec1e3fb4e958
 here=$(cd "$(dirname "$0")" && pwd); root=$(cd "$here/../.." && pwd)
 work=$(mktemp -d)
 
-down() { for i in 0 1 2; do docker rm -f "cmp-$i" >/dev/null 2>&1 || true; done; }
+down() { for i in 0 1 2; do docker rm -f -v "cmp-$i" >/dev/null 2>&1 || true; done; }
 cpu_ns() { local t=0; for i in 0 1 2; do id=$(docker inspect -f '{{.Id}}' "cmp-$i"); t=$((t + $(cat /sys/fs/cgroup/cpuacct/docker/$id/cpuacct.usage))); done; echo $t; }
 trap '[ -n "${KEEP:-}" ] || down; rm -rf "$work"' EXIT
 docker network inspect "$NET" >/dev/null 2>&1 || docker network create --subnet "$SUBNET" "$NET" >/dev/null
@@ -34,7 +34,8 @@ json.dump({"id": 0, "domain": "", "data_dir": "/var/lib/precog", "token": "in-cl
            "listen_tcp": "0.0.0.0:7000", "peers": peers, "target_copies": 3,
            "segment_size": 268435456, "dedup_window_ms": (None if __import__("os").environ.get("NODEDUP") else 300000),
            "retention_bytes": int(__import__("os").environ.get("RETENTION", "1252698794")), "retention_interval_ms": 1000,
-           "repair_interval_ms": int(__import__("os").environ.get("REPAIR_MS", "1000"))}, open(sys.argv[1], "w"))
+           "repair_interval_ms": int(__import__("os").environ.get("REPAIR_MS", "1000")),
+           "flush_delay_ms": int(__import__("os").environ.get("FLUSH_MS", "0"))}, open(sys.argv[1], "w"))
 PY
   for i in 0 1 2; do
     docker run -d --name "cmp-$i" --hostname "cmp-$i" --network "$NET" --ip "$(ip $i)" --cpus 1 --memory 4000m \

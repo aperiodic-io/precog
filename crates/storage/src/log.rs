@@ -11,8 +11,11 @@
 //!   floor. The manifest is a cache of what the segment headers already say: a successor segment
 //!   with a valid header and contiguous LSNs is adopted even if the manifest missed it.
 //!
-//! Durability: `append` returns after `fdatasync`. Any I/O error on the write path is fatal
-//! (fsyncgate): the log refuses further writes and the caller must restart and recover.
+//! Durability: `append` returns after `fdatasync`, or, with a deferred flush
+//! (`Config::flush_delay_ms`), once written: the fsync then follows within the delay or once
+//! `flush_bytes` are unsynced, as Redpanda's write caching does (the replicas carry durability in
+//! between). Any I/O error on the write path is fatal (fsyncgate): the log refuses further writes
+//! and the caller must restart and recover.
 
 use crate::record::{self, Decoded, Meta};
 use crate::{Error, Lsn, Result};
@@ -47,6 +50,11 @@ pub struct Config {
     /// saturates the disk and the log's fsyncs queue behind it; 64 MiB/s readies a 1 GiB spare
     /// in 16 s. A roll that finds no spare fills one at full speed (counted in `roll_stalls`).
     pub prealloc_bytes_per_s: u64,
+    /// 0: `append` fsyncs every group. Otherwise a group is acknowledged once written and the
+    /// fsync is deferred: it runs once `flush_bytes` are unsynced, or when the caller's `flush`
+    /// finds the oldest unsynced group this old (`flush_due` says when).
+    pub flush_delay_ms: u64,
+    pub flush_bytes: u64,
     pub failpoints: Failpoints,
 }
 
@@ -68,6 +76,8 @@ impl Config {
             spares: 1,
             tail_cache_bytes: 64 << 20,
             prealloc_bytes_per_s: 64 << 20,
+            flush_delay_ms: 0,
+            flush_bytes: 256 << 10,
             failpoints: Failpoints::default(),
         }
     }
@@ -85,6 +95,8 @@ pub struct Stats {
     pub spare_hits: u64,
     pub roll_stalls: u64,
     pub recycled: u64,
+    /// Spares zero-filled (by the preallocator or on a roll that found none).
+    pub spares_made: u64,
     pub cache_hits: u64,
     pub syncs: u64,
 }
@@ -493,9 +505,42 @@ struct Spares {
     rate: u64,
     dir: PathBuf,
     counter: AtomicU64,
+    made: AtomicU64,
+    /// Until when the log counts as recycling: `RECYCLING` after retention last recycled a
+    /// segment into the pool.
+    recycling_until: Mutex<Option<std::time::Instant>>,
 }
 
+/// A log that recycled a segment this recently is at its retention budget: each roll is followed
+/// by a recycle, so the preallocator waits up to `RECYCLE_WAIT` for one before zero-filling.
+const RECYCLING: std::time::Duration = std::time::Duration::from_secs(60);
+const RECYCLE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Spares {
+    /// Waits (pool lock held) while the pool is short but a recycle is due; true when the pool
+    /// filled up meanwhile.
+    fn wait_for_recycle<'a>(
+        &self,
+        mut pool: std::sync::MutexGuard<'a, Vec<PathBuf>>,
+    ) -> (std::sync::MutexGuard<'a, Vec<PathBuf>>, bool) {
+        let recycling = self.recycling_until.lock().unwrap().is_some_and(|u| {
+            u.checked_duration_since(std::time::Instant::now())
+                .is_some()
+        });
+        if !recycling {
+            return (pool, false);
+        }
+        let until = std::time::Instant::now() + RECYCLE_WAIT;
+        while pool.len() < self.target && !self.stop.load(Ordering::Acquire) {
+            let Some(left) = until.checked_duration_since(std::time::Instant::now()) else {
+                return (pool, false);
+            };
+            pool = self.cv.wait_timeout(pool, left).unwrap().0;
+        }
+        let filled = pool.len() >= self.target;
+        (pool, filled)
+    }
+
     /// Creates one zero-filled spare file, durably named; `paced`: at `rate`, synced every
     /// 4 MiB, so it never floods the disk the log fsyncs on.
     fn make(&self, paced: bool) -> std::io::Result<PathBuf> {
@@ -503,6 +548,7 @@ impl Spares {
         let tmp = self.dir.join(format!("spare-tmp-{n}"));
         let path = self.dir.join(format!("spare-{n:08}.log"));
         let mut f = File::create(&tmp)?;
+        self.made.fetch_add(1, Ordering::Relaxed);
         let zeros = vec![0u8; 4 << 20]; // paced, each chunk is synced
         let (start, mut done) = (std::time::Instant::now(), 0u64);
         while done < self.size {
@@ -538,9 +584,13 @@ impl Spares {
                 while pool.len() >= self.target && !self.stop.load(Ordering::Acquire) {
                     pool = self.cv.wait(pool).unwrap();
                 }
-            }
-            if self.stop.load(Ordering::Acquire) {
-                return;
+                let (_pool, filled) = self.wait_for_recycle(pool);
+                if self.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if filled {
+                    continue;
+                }
             }
             match self.make(true) {
                 Ok(p) => self.pool.lock().unwrap().push(p),
@@ -567,6 +617,9 @@ pub struct Log {
     prealloc: Option<std::thread::JoinHandle<()>>,
     stats: Stats,
     buf: Vec<u8>,
+    /// Bytes written to the active segment since its last fsync, and when the first of them was.
+    unsynced: u64,
+    unsynced_since: Option<std::time::Instant>,
 }
 
 struct Active {
@@ -685,6 +738,8 @@ impl Log {
             rate: cfg.prealloc_bytes_per_s,
             dir: dir.clone(),
             counter: AtomicU64::new(counter),
+            made: AtomicU64::new(0),
+            recycling_until: Mutex::new(None),
         });
         let mut log = Log {
             cfg,
@@ -696,6 +751,8 @@ impl Log {
             prealloc: None,
             stats: Stats::default(),
             buf: Vec::with_capacity(1 << 20),
+            unsynced: 0,
+            unsynced_since: None,
         };
 
         // Sealed segments: drop ones missing at the head (retention whose manifest write was lost),
@@ -921,6 +978,41 @@ impl Log {
         self.shared.first_lsn.load(Ordering::Acquire)
     }
 
+    /// When the deferred flush is due (`None`: nothing unsynced, or every group is synced).
+    pub fn flush_due(&self) -> Option<std::time::Instant> {
+        self.unsynced_since
+            .map(|t| t + std::time::Duration::from_millis(self.cfg.flush_delay_ms))
+    }
+
+    /// Fsyncs what was written since the last fsync (nothing to do: free).
+    pub fn flush(&mut self) -> Result<()> {
+        if let Some(f) = &self.failed {
+            return Err(Error::Fatal(f.clone()));
+        }
+        if self.unsynced_since.is_none() {
+            return Ok(());
+        }
+        if let Err(e) = self.sync_active() {
+            return self.fail(format!("deferred flush: {e}"));
+        }
+        Ok(())
+    }
+
+    fn sync_active(&mut self) -> std::io::Result<()> {
+        if let Some(n) = self.cfg.failpoints.fail_data_sync_after
+            && self.stats.syncs >= n
+        {
+            return Err(std::io::Error::other("failpoint: data sync"));
+        }
+        if let Some(a) = &self.active {
+            a.file.sync_data()?;
+        }
+        self.stats.syncs += 1;
+        self.unsynced = 0;
+        self.unsynced_since = None;
+        Ok(())
+    }
+
     /// A fatal error refused all further writes; reopen to recover.
     pub fn is_fenced(&self) -> bool {
         self.failed.is_some()
@@ -929,6 +1021,7 @@ impl Log {
     pub fn stats(&self) -> Stats {
         let mut s = self.stats.clone();
         s.cache_hits = self.shared.cache_hits.load(Ordering::Relaxed);
+        s.spares_made = self.spares.made.load(Ordering::Relaxed);
         s.segments = self.shared.segs.read().unwrap().len();
         s.log_bytes = self
             .manifest
@@ -1018,12 +1111,14 @@ impl Log {
             });
         }
         let res = a.file.write_all_at(&self.buf, group_start).and_then(|_| {
-            if let Some(n) = self.cfg.failpoints.fail_data_sync_after
-                && self.stats.syncs >= n
-            {
-                return Err(std::io::Error::other("failpoint: data sync"));
+            self.unsynced += self.buf.len() as u64;
+            self.unsynced_since
+                .get_or_insert_with(std::time::Instant::now);
+            if self.cfg.flush_delay_ms == 0 || self.unsynced >= self.cfg.flush_bytes {
+                self.sync_active()
+            } else {
+                Ok(())
             }
-            a.file.sync_data()
         });
         if let Err(e) = res {
             return self.fail(format!("write/sync of group at lsn {first}: {e}"));
@@ -1034,7 +1129,6 @@ impl Log {
             a.max_time = a.max_time.max(m.time_ms);
         }
         a.seg.entries.write().unwrap().extend(new);
-        self.stats.syncs += 1;
         self.stats.bytes += self.buf.len() as u64;
         {
             let mut c = self.shared.cache.lock().unwrap();
@@ -1089,6 +1183,12 @@ impl Log {
         let generation = self.manifest.next_generation;
         let base = self.next_lsn();
         let sealing = self.active.is_some();
+        // a sealed segment is never written again: its unsynced tail is synced now or never
+        if self.unsynced_since.is_some()
+            && let Err(e) = self.sync_active()
+        {
+            return self.fail(format!("sync of the segment being sealed: {e}"));
+        }
         let res: Result<()> = (|| {
             let spare = self.take_spare()?;
             let path = seg_path(&dir, id);
@@ -1160,7 +1260,12 @@ impl Log {
             let to = self.cfg.dir.join(format!("spare-{n:08}.log"));
             std::fs::rename(path, &to)?;
             sync_dir(&self.cfg.dir)?;
-            self.spares.pool.lock().unwrap().push(to);
+            *self.spares.recycling_until.lock().unwrap() =
+                Some(std::time::Instant::now() + RECYCLING);
+            let mut pool = self.spares.pool.lock().unwrap();
+            pool.push(to);
+            self.spares.cv.notify_all();
+            drop(pool);
             self.stats.recycled += 1;
         } else {
             std::fs::remove_file(path)?;

@@ -1444,6 +1444,132 @@ fn spares_are_filled_at_a_paced_rate_in_the_background() {
     assert_eq!(spares(), 1, "ready within a few seconds");
 }
 
+fn deferred(dir: &Path, segment_size: u64, bytes: u64) -> Config {
+    let mut c = cfg(dir, segment_size);
+    c.flush_delay_ms = 100;
+    c.flush_bytes = bytes;
+    c
+}
+
+#[test]
+fn deferred_flush_syncs_once_per_bytes_threshold_not_per_group() {
+    // Why: Redpanda's write caching (live-ingestion runs it) acks after replication and fsyncs on a
+    // 100 ms / 256 KiB cadence; matching it means a group is acknowledged once written, and the
+    // fsync cost is paid per threshold, not per group.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(deferred(d.path(), 1 << 20, 64 * KB)).unwrap();
+    fill(&mut log, 0, 10, 1, 1000); // ~10 KiB: under the threshold
+    assert_eq!(log.stats().syncs, 0, "no fsync before the threshold");
+    check_all(&log, 0, 10, 1000); // readable once written
+    assert!(
+        log.flush_due().is_some(),
+        "unsynced data has a flush deadline"
+    );
+    fill(&mut log, 10, 60, 1, 1000); // past 64 KiB
+    let syncs = log.stats().syncs;
+    assert!(
+        (1..=2).contains(&syncs),
+        "one fsync per threshold, got {syncs}"
+    );
+    log.flush().unwrap();
+    assert!(log.flush_due().is_none(), "nothing left to flush");
+    let s = log.stats().syncs;
+    log.flush().unwrap();
+    assert_eq!(log.stats().syncs, s, "flushing a synced log is free");
+}
+
+#[test]
+fn deferred_flush_keeps_written_groups_across_a_process_crash() {
+    // Why: an unsynced group is in the page cache; a process crash (not a power loss) loses nothing.
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = Log::open(deferred(d.path(), 1 << 20, 1 << 20)).unwrap();
+        fill(&mut log, 0, 20, 2, 300);
+        assert_eq!(log.stats().syncs, 0);
+    }
+    let log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+    assert_eq!(log.next_lsn(), 40);
+    check_all(&log, 0, 40, 300);
+}
+
+#[test]
+fn a_roll_syncs_the_segment_it_seals() {
+    // Why: a sealed segment is never written again, so nothing would ever flush its unsynced tail.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(deferred(d.path(), 64 * KB, 1 << 30)).unwrap();
+    fill(&mut log, 0, 200, 1, 1000); // ~3 segments
+    assert!(log.stats().segments >= 3);
+    assert!(
+        log.stats().syncs >= log.stats().segments as u64 - 1,
+        "each sealed segment synced"
+    );
+}
+
+#[test]
+fn a_failed_deferred_flush_fences_the_log() {
+    // Why: fsyncgate: after a failed fsync the page cache may have dropped the data; acking more on
+    // top of it would hide the loss.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = deferred(d.path(), 1 << 20, 1 << 20);
+    c.failpoints.fail_data_sync_after = Some(0);
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 2, 1, 100);
+    assert!(matches!(log.flush(), Err(Error::Fatal(_))));
+    assert!(log.is_fenced());
+    let m = meta(2);
+    assert!(log.append(&[(m, &payload(2, 100)[..])]).is_err());
+}
+
+#[test]
+fn at_its_retention_budget_the_log_reuses_recycled_segments_instead_of_zero_filling() {
+    // Why: once retention recycles a segment per roll, a zero-filled spare made meanwhile is
+    // deleted unused: the preallocator wrote a whole segment of zeros for nothing (11% of a
+    // broker's CPU at 100 MB/s). It must wait for the recycle instead.
+    let d = tempfile::tempdir().unwrap();
+    let seg = 64 * KB;
+    let mut c = cfg(d.path(), seg);
+    c.prealloc_bytes_per_s = 0;
+    let mut log = Log::open(c).unwrap();
+    let mut i = 0;
+    for _ in 0..10 {
+        i += fill(&mut log, i, 30, 2, 1000); // ~1 segment per round
+        log.retain(Some(3 * seg), None).unwrap();
+    }
+    assert!(log.stats().recycled > 0, "{:?}", log.stats());
+    let (made, stalls) = (log.stats().spares_made, log.stats().roll_stalls);
+    for _ in 0..20 {
+        i += fill(&mut log, i, 30, 2, 1000);
+        log.retain(Some(3 * seg), None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let s = log.stats();
+    assert_eq!(
+        s.spares_made, made,
+        "zero-filled spares at steady state: {s:?}"
+    );
+    assert_eq!(
+        s.roll_stalls, stalls,
+        "every roll found a recycled segment: {s:?}"
+    );
+}
+
+#[test]
+fn a_growing_log_keeps_a_zero_filled_spare_ready() {
+    // Why: before retention recycles anything, a roll without a spare fills one on the write path.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 64 * KB);
+    c.prealloc_bytes_per_s = 0;
+    let mut log = Log::open(c).unwrap();
+    for k in 0..5u64 {
+        fill(&mut log, k * 60, 30, 2, 1000);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let s = log.stats();
+    assert!(s.spares_made >= 4, "{s:?}");
+    // only the first segment, made at open before any spare exists
+    assert!(s.roll_stalls <= 1, "{s:?}");
+}
+
 #[test]
 fn a_spare_gone_since_the_directory_was_listed_is_skipped_but_other_errors_stop_the_open() {
     // A closing log's paced preallocator can rename or remove a spare while the next open lists
@@ -1507,6 +1633,60 @@ fn a_roll_that_finds_no_spare_fills_one_at_full_speed() {
     assert!(log.stats().segments >= 2, "{:?}", log.stats());
     assert!(
         t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn the_deferred_flush_is_due_its_delay_after_the_first_unsynced_write() {
+    // the ack-before-fsync window is bounded by flush_delay_ms: never longer, and not shorter
+    // (an earlier flush would pay the fsync per group that write caching exists to avoid)
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(deferred(d.path(), 1 << 20, 1 << 20)).unwrap();
+    let before = std::time::Instant::now();
+    fill(&mut log, 0, 1, 1, 100);
+    let after = std::time::Instant::now();
+    let due = log.flush_due().unwrap();
+    let delay = std::time::Duration::from_millis(100);
+    assert!(due >= before + delay && due <= after + delay);
+}
+
+#[test]
+fn at_its_retention_budget_the_preallocator_waits_out_recycles_and_still_stops_promptly() {
+    // Why: a zero-filled spare made while recycles keep the pool full is deleted unused, also
+    // once the preallocator's recycle wait (5 s) has run out; and a closing log must not sit out
+    // that wait.
+    let d = tempfile::tempdir().unwrap();
+    let seg = 64 * KB;
+    let mut c = cfg(d.path(), seg);
+    c.prealloc_bytes_per_s = 0;
+    let mut log = Log::open(c).unwrap();
+    let mut i = 0;
+    for _ in 0..10 {
+        i += fill(&mut log, i, 30, 2, 1000);
+        log.retain(Some(3 * seg), None).unwrap();
+    }
+    // rolls take every spare: the preallocator waits for a recycle
+    let drain = |log: &mut Log, i: &mut u64| {
+        while !spare_files(d.path()).is_empty() {
+            *i += fill(log, *i, 5, 1, 1000);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    drain(&mut log, &mut i);
+    let made = log.stats().spares_made;
+    // exactly one recycle fills the pool to its target
+    log.retain(Some(log.stats().log_bytes - seg / 2), None)
+        .unwrap();
+    assert_eq!(spare_files(d.path()).len(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(5_500));
+    assert_eq!(log.stats().spares_made, made, "{:?}", log.stats());
+    drain(&mut log, &mut i);
+    let t = std::time::Instant::now();
+    drop(log);
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
         "{:?}",
         t.elapsed()
     );

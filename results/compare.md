@@ -34,6 +34,43 @@ Precog at a fixed 100k records/s (the latency target's shape; franz-go's loadgen
 
 Dedup: both drop exactly the resent share (Redpanda 19.99%, Precog its `dedup_dropped_total`).
 
+## Write caching on both sides, at steady state (2026-11-18, later)
+
+live-ingestion runs Redpanda with `write_caching_default: true`: it acks once the batch is on a majority, and the fsync
+follows on a 100 ms / 256 KiB cadence. Precog now has the same mode (`flush_delay_ms: 100`, `flush_bytes: 256 KiB`):
+a batch is acked once written on 2 of 3 nodes, the fsync follows within the delay, and a failed fsync still fences the
+node. This makes the comparison like-for-like with what production runs. Same harness, `WARMUP=20` so that both
+systems are measured after Precog's log reaches its retention (with `WARMUP=5`, the window still included the
+log's first 600 MB, with segments zero-filled as it grew). Medians of 3 runs, alternating Precog and Redpanda:
+
+| | records/s | p50 ack | p99 ack | broker CPU per record |
+|---|---:|---:|---:|---:|
+| Precog, write caching (`FLUSH_MS=100`) | 650,700 | 2.85 ms | 6.2 ms | 1.12 us |
+| Redpanda, write caching (as live-ingestion runs it) | 135,000 | 11.1 ms | 45.6 ms | 3.39 us |
+| **Precog vs Redpanda** | **4.8x** | **3.9x** | **7.4x** | **3.0x** |
+
+Runs: Precog 655k/2.83/6.2/1.123, 651k/2.85/6.36/1.149, 644k/2.93/5.92/1.107; Redpanda 125k/13.3/27.6/3.234,
+147k/11.0/45.6/3.39, 135k/11.1/158.6/3.612. CPU is at 3.0x with no margin, and identical runs on this VM vary by up to
+~20%.
+
+Equal durability at steady state (2026-11-19): fsync before every ack on both sides (Precog `FLUSH_MS=0`, Redpanda
+`write_caching_default=false`), same harness and `WARMUP=20`, alternating, medians of 3 Precog and 5 Redpanda runs:
+
+| | records/s | p50 ack | p99 ack | broker CPU per record |
+|---|---:|---:|---:|---:|
+| Precog, fsync before every ack | 696,600 | 2.71 ms | 5.49 ms | 1.39 us |
+| Redpanda, fsync before every ack | 159,000 | 11.5 ms | 21.3 ms | 3.26 us |
+| **Precog vs Redpanda** | **4.4x** | **4.3x** | **3.9x** | **2.3x** |
+
+Runs: Precog 703k/2.67/5.49/1.337, 697k/2.71/5.48/1.386, 647k/2.93/6.05/1.551; Redpanda 150k/11.9/16.9/3.036,
+160k/11.5/19.2/3.576, 159k/11.5/25.1/3.789, 165k/11.3/21.3/3.256, 128k/13.3/23.6/2.713. CPU per record is under 3x
+here: Redpanda's fsync-per-ack cost is lower than the earlier non-steady-state run showed (4.46 us), and Precog's group
+commit does an fsync per batch where write caching batches them (1.39 against 1.12 us).
+
+A recycling log no longer zero-fills spares: with the log at its retention, a roll used to wake the preallocator, which
+wrote a whole segment of zeros (11% of a node's CPU at 100 MB/s) that the next retention pass then deleted, having
+recycled a segment anyway. The preallocator now waits up to 5 s for that recycle.
+
 ## How Precog got here (same harness, 250-record batches unless noted)
 
 | change | CPU/record |
@@ -56,3 +93,5 @@ Dedup: both drop exactly the resent share (Redpanda 19.99%, Precog its `dedup_dr
   ~0.9. Precog's remaining costs: scheduling (thread switches and wake-ups, ~25%), fsync (~17%
   of a replica), the dedup map on the accepting node (~13%), copies.
 - Not measured here: readers' load (archiver, brrrrr) on the brokers.
+- `run.sh` removed the Redpanda containers without their anonymous volumes (fixed: `docker rm -v`). Earlier runs left
+  them behind and filled the disk.
