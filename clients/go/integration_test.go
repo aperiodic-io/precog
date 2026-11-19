@@ -220,6 +220,31 @@ func TestReplicasPublishTheSameEventsAndAReaderSeesEachOnceInWriterOrder(t *test
 	}
 }
 
+// Replica b's copy of a's event is a batch dedup emptied; a reader in small steps reaches it,
+// and an empty poll there would read as caught up before b's next event.
+func TestAPollIsEmptyOnlyWhenCaughtUpEvenPastABatchDedupEmptied(t *testing.T) {
+	c := startCluster(t, 0, 1, 2)
+	ctx := context.Background()
+	cl := connect(t, c)
+	a, b := cl.Producer("s", "a"), cl.Producer("s", "b")
+	for _, s := range []struct {
+		p       *Producer
+		id, val string
+	}{{a, "id0", "t0"}, {b, "id0", "t0"}, {b, "id1", "t1"}} {
+		s.p.Send(1, []byte(s.id), []byte(s.val))
+		if err := s.p.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := cl.Consumer(ctx, "s", "g", Beginning())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := payloads(drain(t, ctx, r, 1)); fmt.Sprint(got) != "[t0 t1]" {
+		t.Fatalf("got %v", got)
+	}
+}
+
 func TestACommittedPositionResumesOnAnotherNode(t *testing.T) {
 	c := startCluster(t, 1, 2) // node 0 is down: every client fails over
 	ctx := context.Background()
