@@ -711,12 +711,13 @@ mod tests {
 
     #[test]
     fn a_live_feed_joins_each_log_after_its_run_below_the_start() {
-        // the feed's start LSN and each log's next sequence are one snapshot: a batch durable
-        // out of LSN order past the start is still due (the tail returns it), not counted
+        // the feed's start LSN and each log's next sequence are one snapshot: the log's run
+        // stops at its gap (seq 2), even though seq 3 is already durable below the start
         let mut t = store();
         let xs: Vec<Batch> = (0..4).map(|i| b("w", 1, i, &[(i, b"x")])).collect();
         let mut lsns = vec![];
-        for x in &xs {
+        for i in [0, 1, 3, 2] {
+            let x = &xs[i];
             t.s.reserve(x);
             let m = Meta {
                 key: encode_log_key(&x.id.log),
@@ -725,18 +726,26 @@ mod tests {
                 tag: batch_crc(&x.bytes),
                 time_ms: 0,
             };
-            lsns.push(t.log.append(&[(m, &x.bytes[..])]).unwrap());
+            lsns.push((i, t.log.append(&[(m, &x.bytes[..])]).unwrap()));
         }
-        for i in [0, 1, 3] {
-            t.s.mark_durable(&xs[i].id, lsns[i]); // lsn 2 is not durable yet
+        for &(i, lsn) in &lsns[..3] {
+            t.s.mark_durable(&xs[i].id, lsn); // seq 2 (lsn 3) is not durable yet
         }
         let (pos, next) = t.s.live_start(Some("s"));
-        assert_eq!(pos, 2);
+        assert_eq!(pos, 3);
         assert_eq!(next, HashMap::from([(xs[0].id.log.clone(), 2)]));
         assert!(t.s.live_start(Some("other")).1.is_empty());
         let log = &xs[0].id.log;
-        assert_eq!(t.s.durable_below(log, 1, pos), Some(2), "below the start");
-        assert_eq!(t.s.durable_below(log, 3, pos), None, "the tail returns it");
+        assert_eq!(
+            t.s.durable_below(log, 3, pos),
+            Some(4),
+            "above the gap, below the start"
+        );
+        assert_eq!(
+            t.s.durable_below(log, 3, 2),
+            None,
+            "the tail from 2 returns it"
+        );
         assert_eq!(t.s.durable_below(log, 2, pos), None, "not durable");
     }
 
