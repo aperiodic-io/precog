@@ -2,3 +2,4 @@
 
 pub mod dedup;
 pub mod proto;
+pub mod s2;
