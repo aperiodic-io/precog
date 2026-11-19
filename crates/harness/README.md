@@ -9,7 +9,7 @@ dedup ids `live-producer-<exchange>-<n>-<trade>`, resends of one of the 64 lates
 byte, 20k records/s, and ~256 KiB records every Nth where a scenario asks for them.
 
 ```bash
-cargo build --release -p precog-mesh --bin precog-node -p precog-harness
+cargo build --release -p precog-mesh --bin precog-node -p precog-harness --bin precog-harness
 sudo target/release/precog-harness list
 sudo target/release/precog-harness run                                  # every Precog scenario
 sudo target/release/precog-harness run --only kill-mid-append,disk-full

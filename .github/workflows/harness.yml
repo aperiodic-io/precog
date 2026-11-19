@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with: { save-if: "false" }
-      - run: cargo build --release --locked -p precog-mesh --bin precog-node -p precog-harness
+      - run: cargo build --release --locked -p precog-mesh --bin precog-node -p precog-harness --bin precog-harness
       # root: iptables (network cuts) and tmpfs mounts (the full disk)
       - env: { ONLY: "${{ inputs.only }}" }
         run: |
