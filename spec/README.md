@@ -29,8 +29,9 @@ if it stops failing).
 ### `SegmentLog.tla`: one active segment
 
 **Models.** `Log::append` (one write per group; without write caching an fsync per group before
-the ack, one group at a time; with write caching an ack once written and an fsync once
-`flush_bytes` are unsynced), `Log::flush`, the kernel writing dirty pages back in any order, a
+the ack, one group at a time; with write caching an ack once written, the deferred flush outside
+the log's lock while appends go on (`Log::begin_flush`, `Flush::sync`, `Log::end_flush`), and an
+inline sync once unsynced plus in-flight bytes reach twice `flush_bytes`), the kernel writing dirty pages back in any order, a
 power loss that keeps each unsynced record whole, torn or not at all, media damage to a
 persisted record, and the recovery scan of `scan()` step for step: the forward scan with its LSN
 and group checks, the search past the stop for a later group (fail closed) or the torn group's
@@ -58,19 +59,24 @@ or damaged record; the Kani proofs cover the decoder itself), and other segments
 | Config | Segment | Group | Crashes | Other | Distinct states |
 |---|---|---|---|---|---|
 | `MC_sync` | 5 records | ≤ 2 | 2 | media faults | 168,792 |
-| `MC_caching` | 6 | ≤ 2 | 2 | flush at 2, bound 4 | 224,200 |
+| `MC_caching` | 6 | ≤ 2 | 1 | flush at 2, bound 6 (`2 × flush + group`) | 579,793 |
 | `Nightly_sync` | 6 | ≤ 3 | 2 | media faults | 1,502,239 |
-| `Nightly_caching` | 7 | ≤ 2 | 2 | flush at 3, bound 5, media faults (`Prefix`) | 13,972,478 |
+| `Nightly_caching` | 6 | ≤ 2 | 2 | flush at 2, bound 6, media faults (`Prefix`) | 33,850,249 |
+| `MC_caching_onebound` (expect) | 6 | ≤ 2 | 1 | bound 4 (`flush + group`, before #16): `NoFalseAlarm` fails | |
 
 **Found.** Under write caching several groups are unsynced at once and the kernel writes them
 back in any order, so a power loss can keep a later group and lose an earlier one. The scan
 read that as damage followed by a later group and refused to open: a node of live-ingestion's
-configuration would not restart after a power loss (`MC_caching_unfixed`, 5 steps). Fixed: at
-most `flush_bytes` plus one group can be unsynced, so with write caching a hole followed only by
+configuration would not restart after a power loss (`MC_caching_unfixed`). Fixed: at most
+`Log::unsynced_bound` (twice `flush_bytes`, what an outstanding flush covers plus what landed
+meanwhile, plus one group) can be unsynced, so with write caching a hole followed only by
 records within that bound is the unsynced tail and is dropped as a whole (repair refills it from
 the replicas); a hole followed by more than that is still damage and fails closed. Tests:
 `a_power_loss_under_write_caching_drops_the_unsynced_tail_whatever_reached_disk` (failed first)
-and `under_write_caching_damage_before_more_than_the_unsynced_bound_still_fails_closed`.
+and `under_write_caching_damage_before_more_than_the_unsynced_bound_still_fails_closed`; the
+bound to the byte: `under_write_caching_the_unsynced_bound_is_exact_to_the_last_record_written`.
+In slots the worst case is one slot under the bound (the inline-sync check is strict); a bound
+one slot shorter still holds, two shorter fails.
 
 ### `SegmentRoll.tla`: a segment roll and the restart after it
 
