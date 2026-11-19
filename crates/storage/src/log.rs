@@ -203,9 +203,10 @@ impl DiskIdx {
         self.file.read_exact_at(&mut b, at)?;
         let keys = &self.keys;
         b.chunks_exact(IDX_ENTRY)
-            .map(|e| {
+            .zip(i..)
+            .map(|(e, at)| {
                 let k = u32_at(e, 12);
-                let key = if section == 0 { k } else { self.key_of(i) };
+                let key = if section == 0 { k } else { self.key_of(at) };
                 let key = keys
                     .get(key as usize)
                     .ok_or_else(|| Error::Corrupt(format!("index key {key} out of range")))?;
@@ -1912,6 +1913,11 @@ mod tests {
                 let x = &entries[*rel as usize];
                 assert_eq!((e.offset, e.len, &e.meta), (x.offset, x.len, &x.meta));
             }
+        }
+        // a read across runs gives each entry its own key
+        let all = idx.read(1, 0, 7).unwrap();
+        for (rel, e) in &all {
+            assert_eq!(e.meta.key, entries[*rel as usize].meta.key, "record {rel}");
         }
         assert!(idx.read(0, 6, 2).is_err(), "past the section");
         // another segment's identity, any flipped byte, or a cut: rejected
