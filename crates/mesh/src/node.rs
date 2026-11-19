@@ -676,14 +676,11 @@ impl Node {
                 .sum();
             let labels = format!("group=\"{group}\",stream=\"{stream}\"");
             out.push_str(&format!("precog_group_lag_events{{{labels}}} {lag}\n"));
-            if let Some(e) = self
-                .wal
-                .reader
-                .entries(lsn, 1)
-                .unwrap_or_default()
-                .first()
-                .filter(|e| e.lsn == lsn)
-            {
+            let at = self.wal.reader.entries(lsn, 1).unwrap_or_else(|e| {
+                tracing::error!("reading the log's index at lsn {lsn}: {e}");
+                vec![]
+            });
+            if let Some(e) = at.first().filter(|e| e.lsn == lsn) {
                 let age = now.saturating_sub(e.meta.time_ms) / 1000;
                 out.push_str(&format!(
                     "precog_group_commit_age_seconds{{{labels}}} {age}\n"
