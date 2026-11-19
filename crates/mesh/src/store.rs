@@ -3263,6 +3263,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_whose_totals_disagree_with_its_index_trims_what_it_can_and_stops() {
+        // Why: retention runs under the store's lock; totals that claim batches the segment's
+        // index does not hold (a bug, damage) must end the trim, not spin it forever.
+        let mut t = store_with(TINY);
+        for seq in 0..6 {
+            let x = on("s", "w", seq);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        assert_eq!(t.s.trim_stream("s", Some(0), None, 0), 6, "all forgotten");
+        {
+            let mut g = t.s.inner.lock();
+            let cs = g
+                .streams
+                .get_mut("s")
+                .unwrap()
+                .cold
+                .values_mut()
+                .next()
+                .unwrap();
+            cs.batches = 1; // claims one its index no longer holds
+            g.streams.get_mut("s").unwrap().bytes = 1 << 20;
+        }
+        assert_eq!(t.s.trim_stream("s", Some(0), None, 0), 0);
+    }
+
+    #[test]
     fn a_batch_retention_forgets_past_contiguous_does_not_hold_it_back() {
         // Why: a stream's own retention may forget a batch logged after one not marked durable
         // yet. Its LSN is in the log all the same: once the earlier one is marked, `contiguous`
