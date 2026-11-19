@@ -506,8 +506,9 @@ struct Spares {
     dir: PathBuf,
     counter: AtomicU64,
     made: AtomicU64,
-    /// When retention last recycled a segment into the pool.
-    last_recycle: Mutex<Option<std::time::Instant>>,
+    /// Until when the log counts as recycling: `RECYCLING` after retention last recycled a
+    /// segment into the pool.
+    recycling_until: Mutex<Option<std::time::Instant>>,
 }
 
 /// A log that recycled a segment this recently is at its retention budget: each roll is followed
@@ -522,11 +523,10 @@ impl Spares {
         &self,
         mut pool: std::sync::MutexGuard<'a, Vec<PathBuf>>,
     ) -> (std::sync::MutexGuard<'a, Vec<PathBuf>>, bool) {
-        let recycling = self
-            .last_recycle
-            .lock()
-            .unwrap()
-            .is_some_and(|t| t.elapsed() < RECYCLING);
+        let recycling = self.recycling_until.lock().unwrap().is_some_and(|u| {
+            u.checked_duration_since(std::time::Instant::now())
+                .is_some()
+        });
         if !recycling {
             return (pool, false);
         }
@@ -549,16 +549,14 @@ impl Spares {
         let path = self.dir.join(format!("spare-{n:08}.log"));
         let mut f = File::create(&tmp)?;
         self.made.fetch_add(1, Ordering::Relaxed);
-        let zeros = vec![0u8; 1 << 20];
+        let zeros = vec![0u8; 4 << 20]; // paced, each chunk is synced
         let (start, mut done) = (std::time::Instant::now(), 0u64);
         while done < self.size {
             let k = (self.size - done).min(zeros.len() as u64) as usize;
             f.write_all(&zeros[..k])?;
             done += k as u64;
             if paced && self.rate > 0 {
-                if done % (4 << 20) == 0 {
-                    f.sync_data()?;
-                }
+                f.sync_data()?;
                 let due = std::time::Duration::from_secs_f64(done as f64 / self.rate as f64);
                 if let Some(wait) = due.checked_sub(start.elapsed()) {
                     std::thread::sleep(wait);
@@ -741,7 +739,7 @@ impl Log {
             dir: dir.clone(),
             counter: AtomicU64::new(counter),
             made: AtomicU64::new(0),
-            last_recycle: Mutex::new(None),
+            recycling_until: Mutex::new(None),
         });
         let mut log = Log {
             cfg,
@@ -1262,7 +1260,8 @@ impl Log {
             let to = self.cfg.dir.join(format!("spare-{n:08}.log"));
             std::fs::rename(path, &to)?;
             sync_dir(&self.cfg.dir)?;
-            *self.spares.last_recycle.lock().unwrap() = Some(std::time::Instant::now());
+            *self.spares.recycling_until.lock().unwrap() =
+                Some(std::time::Instant::now() + RECYCLING);
             let mut pool = self.spares.pool.lock().unwrap();
             pool.push(to);
             self.spares.cv.notify_all();

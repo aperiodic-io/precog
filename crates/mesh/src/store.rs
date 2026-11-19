@@ -1269,4 +1269,43 @@ mod tests {
         );
         assert_eq!(s.trim_stream("a", None, Some(500), 1_501), 1, "older");
     }
+
+    #[test]
+    fn a_logs_batches_start_at_the_batch_holding_the_sequence() {
+        // repair asks from the first sequence it lacks: it gets the batch holding it (even from
+        // inside a batch), and not the batch before, which it has
+        let mut t = store();
+        let xs = [
+            b("w", 1, 0, &[(1, b"a"), (2, b"b")]),
+            b("w", 1, 2, &[(3, b"c"), (4, b"d")]),
+            b("w", 1, 4, &[(5, b"e"), (6, b"f")]),
+        ];
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        let firsts = |from| -> Vec<u64> {
+            t.s.log_batches(&xs[0].id.log, from, 1 << 20)
+                .into_iter()
+                .map(|b| Batch::parse(b).unwrap().id.first_seq)
+                .collect()
+        };
+        assert_eq!(firsts(2), [2, 4], "from a batch's start");
+        assert_eq!(firsts(3), [2, 4], "from inside a batch");
+        // a gap at 2: the batch ending at 2 is not resent
+        let ys = [
+            b("v", 1, 0, &[(1, b"a"), (2, b"b")]),
+            b("v", 1, 4, &[(5, b"e")]),
+        ];
+        for y in &ys {
+            t.s.reserve(y);
+            t.durable(y);
+        }
+        let got: Vec<u64> =
+            t.s.log_batches(&ys[0].id.log, 2, 1 << 20)
+                .into_iter()
+                .map(|b| Batch::parse(b).unwrap().id.first_seq)
+                .collect();
+        assert_eq!(got, [4]);
+    }
 }
