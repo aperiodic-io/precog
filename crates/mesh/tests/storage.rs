@@ -365,3 +365,18 @@ fn a_fence_the_node_sets_survives_the_wal_threads_deferred_flush() {
     std::thread::sleep(std::time::Duration::from_millis(20)); // past its publish
     assert!(wal.fatal.load(Ordering::Acquire), "the fence was lifted");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fence_the_node_sets_survives_retention() {
+    // Why: as for the deferred flush: retention runs on a timer, and lifting the node's own fence
+    // would let it ack again with dedup ids claimed that were never written.
+    use precog_mesh::wal::Wal;
+    use std::sync::atomic::Ordering;
+    let d = tempfile::tempdir().unwrap();
+    let mut c = precog_storage::Config::new(d.path());
+    c.segment_size = 1 << 20;
+    let (wal, _) = Wal::open(c).unwrap();
+    wal.fatal.store(true, Ordering::Release); // as node.rs does for a failed claimed batch
+    wal.retain(Some(1 << 30), None).await.unwrap();
+    assert!(wal.fatal.load(Ordering::Acquire), "the fence was lifted");
+}

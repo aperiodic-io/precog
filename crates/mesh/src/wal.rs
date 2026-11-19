@@ -274,10 +274,7 @@ fn writer(
                 let cutoff = max_age_ms.map(|a| now_ms().saturating_sub(a));
                 let mut log = log.lock();
                 let r = log.retain(max_bytes, cutoff).map_err(|e| e.to_string());
-                stats
-                    .segments
-                    .store(log.stats().segments as u64, Ordering::Relaxed);
-                fatal.store(log.is_fenced(), Ordering::Release);
+                publish(&log, &stats, &fatal);
                 let _ = done.send(r);
                 continue;
             }
