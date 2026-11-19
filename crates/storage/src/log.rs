@@ -1883,6 +1883,14 @@ mod tests {
             );
         }
         assert!(resealed(keys_at + 10, b"kc").is_none(), "keys out of order");
+        let mut trailing = b[..b.len() - 4].to_vec();
+        trailing.push(0);
+        let c = crc32c::crc32c(&trailing);
+        trailing.extend_from_slice(&c.to_le_bytes());
+        assert!(
+            decode_index(&trailing, 3, 4, 50).is_none(),
+            "a byte after the keys"
+        );
         assert!(
             resealed(keys_at, &0u32.to_le_bytes()).is_some(),
             "unchanged"
