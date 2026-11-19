@@ -166,12 +166,14 @@ impl Client {
         }
     }
 
-    /// Where `stream` ends: every acknowledged event is before this cursor. An acked batch is on 2
-    /// of 3 nodes, so one node's end can be short (a node just restarted, or repairing); the ends
-    /// of any 2 nodes, merged per writer log, cover every acked batch.
+    /// Where `stream` ends: every acknowledged event is before this cursor. An acked batch is on
+    /// `copies` (2) nodes, so one node's end can be short (a node just restarted, or repairing);
+    /// the ends of any nodes - copies + 1 nodes, merged per writer log, include one of its copies
+    /// (2 of 3 nodes, 3 of 4). A node that lost its disk can make the end short until repair:
+    /// a reader starting there then reads a few acked events again (spec/mesh, EndCoversAcked).
     pub async fn end(&self, stream: &str) -> Result<Cursor> {
         let n = self.mc.node_count();
-        let need = n.min(2);
+        let need = n - n.min(2) + 1; // the producers' copies: n.min(2)
         let q = Control::CursorAt {
             stream: stream.into(),
             time_ms: u64::MAX,

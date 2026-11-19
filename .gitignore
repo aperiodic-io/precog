@@ -1,3 +1,8 @@
 /target
 /run
 *.secret
+/results/harness*/
+/mutants.out*/
+# TLC run files
+states/
+*_TTrace_*

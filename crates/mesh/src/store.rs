@@ -21,7 +21,10 @@
 //! retention, `tail`'s chunk of at most 1024 entries) read under the lock: each reads a few
 //! segments' runs. Move them onto a view too if they measurably stall appends.
 
-use crate::proto::{Batch, BatchId, Event, Frontier, LogId, decode_log_key, encode_log_key};
+use crate::proto::{
+    Batch, BatchId, Event, Frontier, LogId, decode_log_key, decode_record_key, encode_log_key,
+    encode_replacing_key,
+};
 use parking_lot::Mutex;
 use precog_storage::{Lsn, Reader};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -106,8 +109,11 @@ struct Inner {
     cold_end: Lsn,
     /// `trim` forgot every batch below this.
     floor: Lsn,
-    /// Second copies of a batch logged twice (a repair raced a replicate): never served.
+    /// Second copies of a batch logged twice (a repair raced a replicate), and absorbed batches
+    /// a replacement took the place of: never served.
     dead: BTreeSet<Lsn>,
+    /// LSNs of replaced batches that were in RAM: durable, so `contiguous` steps over them.
+    superseded: BTreeSet<Lsn>,
     /// Index reads of absorbed segments (`Reader::by_key`) so far, made under the store's lock.
     reads: std::cell::Cell<u64>,
     batches: u64,
@@ -245,8 +251,10 @@ impl Inner {
         let l = &self.logs[ix as usize];
         let floor = self.floor.max(self.stream_of(ix).floor);
         self.reads.set(self.reads.get() + 1);
-        Ok(r.by_key(base, &encode_log_key(&l.id))?
-            .into_iter()
+        // a replacement is logged under the log's replacing key (its own run)
+        let mut v = r.by_key(base, &encode_log_key(&l.id))?;
+        v.extend(r.by_key(base, &encode_replacing_key(&l.id))?);
+        Ok(v.into_iter()
             .filter(|e| e.lsn >= floor && !self.dead.contains(&e.lsn))
             .map(|e| Rec {
                 lsn: e.lsn,
@@ -446,6 +454,44 @@ impl Inner {
         }
     }
 
+    /// Drops the log's durable batch at `first` (a replacement takes its place): its LSN is
+    /// never served again (its record stays in its segment's index file), and it leaves RAM.
+    fn unindex(&mut self, r: &Reader, ix: u32, first: u64) -> Res<()> {
+        let Some(e) = self.find(r, ix, first)?.filter(|e| e.durable()) else {
+            return Ok(());
+        };
+        self.dead.insert(e.lsn);
+        let l = &mut self.logs[ix as usize];
+        let s = self.streams.get_mut(&l.id.stream).unwrap();
+        if self.order.remove(&e.lsn).is_some() {
+            l.batches.remove(&first);
+            if s.order.remove(&e.lsn).is_some() {
+                s.bytes -= e.len as u64;
+            }
+            // ponytail: one stays behind per replacement below `contiguous` (rare: a reused
+            // identity)
+            self.superseded.insert(e.lsn);
+        } else {
+            s.bytes -= e.len as u64;
+            if let Some((_, cs)) = s.cold.range_mut(..=e.lsn).next_back() {
+                cs.batches -= 1;
+                cs.events -= e.count as u64;
+                cs.bytes -= e.len as u64;
+            }
+        }
+        self.batches -= 1;
+        self.events -= e.count as u64;
+        self.bytes -= e.len as u64;
+        Ok(())
+    }
+
+    fn advance_contiguous(&mut self) {
+        while self.order.contains_key(&self.contiguous) || self.superseded.remove(&self.contiguous)
+        {
+            self.contiguous += 1;
+        }
+    }
+
     /// Forgets the durable batch at `lsn` in RAM (retention): later copies of it are `Expired`.
     fn forget(&mut self, r: &Reader, lsn: Lsn) {
         let Some((ix, len, first)) = self.order.remove(&lsn) else {
@@ -623,7 +669,7 @@ impl Store {
                 for e in es {
                     from = e.lsn + 1;
                     each(&e);
-                    let log = decode_log_key(&e.meta.key)?;
+                    let (log, replaces) = decode_record_key(&e.meta.key)?;
                     let ix = inner.intern(&log);
                     let first = e.meta.first_seq;
                     let new = Entry {
@@ -637,12 +683,16 @@ impl Store {
                             inner.dead.insert(e.lsn); // logged twice (a repair raced a replicate): keep the first
                             continue;
                         }
-                        anyhow::bail!(
-                            "conflicting batches in the log at lsn {}: {:?} seq {}",
-                            e.lsn,
-                            log,
-                            first
-                        );
+                        if !(replaces && s0 == first && x.count == new.count) {
+                            anyhow::bail!(
+                                "conflicting batches in the log at lsn {}: {:?} seq {}",
+                                e.lsn,
+                                log,
+                                first
+                            );
+                        }
+                        // a node's bytes a majority did not hold, replaced with theirs
+                        inner.unindex(r, ix, first)?;
                     }
                     inner.logs[ix as usize].batches.insert(first, new);
                     inner.join(ix);
@@ -725,9 +775,39 @@ impl Store {
             tx.send_replace(State::Durable);
         }
         inner.index(&self.reader, lsn, ix, first, e, now_ms());
-        while inner.order.contains_key(&inner.contiguous) {
-            inner.contiguous += 1;
+        inner.advance_contiguous();
+        drop(g);
+        self.durable_notify.notify_waiters();
+    }
+
+    /// Whether `b` can replace what this node holds under its identity: a durable batch with
+    /// other bytes over exactly the same sequence range. ponytail: an overlap of another shape
+    /// stays a logged conflict; replace those too if writers ever reuse identities that way.
+    pub fn replaceable(&self, b: &Batch) -> bool {
+        let g = self.inner.lock();
+        self.durable_at(&g, &b.id.log, b.id.first_seq)
+            .is_some_and(|e| e.count == b.count && e.crc != b.ident)
+    }
+
+    /// `b`, logged at `lsn` with a replacing key, takes the place of the `replaceable` batch.
+    pub fn replace(&self, b: &Batch, lsn: Lsn) {
+        let mut g = self.inner.lock();
+        let inner = &mut *g;
+        let ix = inner.intern(&b.id.log);
+        let first = b.id.first_seq;
+        if let Err(e) = inner.unindex(&self.reader, ix, first) {
+            tracing::error!("reading the index of {:?}: {e}", b.id.log);
         }
+        let e = Entry {
+            lsn,
+            count: b.count,
+            crc: b.ident,
+            len: b.bytes.len() as u32,
+        };
+        inner.logs[ix as usize].batches.insert(first, e);
+        inner.join(ix);
+        inner.index(&self.reader, lsn, ix, first, e, now_ms());
+        inner.advance_contiguous();
         drop(g);
         self.durable_notify.notify_waiters();
     }
@@ -1565,6 +1645,137 @@ mod tests {
         let c = b("w", 1, 2, &[(1, b"x")]);
         t.log_only(&c, batch_crc(&c.bytes));
         assert_eq!(t.reload().unwrap().totals().0, 2);
+    }
+
+    #[test]
+    fn a_replacing_record_takes_a_conflicting_batchs_place_at_load() {
+        // Why: a node that held bytes a majority does not logs the majority's batch with a
+        // replacing key; a restart must keep the replacement, not refuse the log
+        let replacing = |t: &mut T, x: &Batch| {
+            let m = Meta {
+                key: crate::proto::encode_replacing_key(&x.id.log),
+                first_seq: x.id.first_seq,
+                count: x.count,
+                tag: x.ident,
+                time_ms: 0,
+            };
+            t.log.append(&[(m, &x.bytes[..])]).unwrap();
+        };
+        let y = b("w", 1, 0, &[(1, b"y"), (2, b"yy")]);
+        let x = b("w", 1, 0, &[(1, b"x"), (2, b"xx")]);
+        let mut t = store();
+        t.log_only(&y, y.ident);
+        replacing(&mut t, &x);
+        let s = t.reload().unwrap();
+        assert_eq!(s.get(&x.id).unwrap().bytes, x.bytes);
+        assert_eq!(s.totals(), (1, 2, x.bytes.len() as u64));
+        assert!(matches!(s.reserve(&x), Reserve::Duplicate(_)));
+        // a replacement over another range is still a conflict
+        let mut t = store();
+        t.log_only(&y, y.ident);
+        replacing(&mut t, &b("w", 1, 0, &[(1, b"x")]));
+        assert!(t.reload().is_err());
+        // one whose original retention already dropped is an ordinary batch
+        let mut t = store();
+        replacing(&mut t, &x);
+        assert_eq!(t.reload().unwrap().totals().0, 1);
+    }
+
+    #[test]
+    fn a_replacement_takes_the_batchs_place_and_the_feed_steps_over_it() {
+        let mut t = store();
+        // an earlier batch still on its way to disk holds the feed back
+        let p = b("v", 1, 0, &[(1, b"p")]);
+        assert!(matches!(t.s.reserve(&p), Reserve::New));
+        let p_lsn = t.log.append(&[(Meta::default(), &p.bytes[..])]).unwrap();
+        let y = b("w", 1, 0, &[(1, b"y")]);
+        t.s.reserve(&y);
+        t.durable(&y);
+        assert_eq!(t.s.durable_len(), 0);
+        let x = b("w", 1, 0, &[(1, b"x")]);
+        assert!(t.s.replaceable(&x));
+        assert!(!t.s.replaceable(&y), "the same bytes");
+        assert!(
+            !t.s.replaceable(&b("w", 1, 0, &[(1, b"x"), (2, b"z")])),
+            "another range"
+        );
+        assert!(
+            !t.s.replaceable(&b("v", 1, 0, &[(1, b"q")])),
+            "still pending"
+        );
+        assert!(
+            !t.s.replaceable(&b("u", 1, 0, &[(1, b"q")])),
+            "nothing there"
+        );
+        let lsn = t.log.append(&[(Meta::default(), &x.bytes[..])]).unwrap();
+        t.s.replace(&x, lsn);
+        assert_eq!(t.s.get(&x.id).unwrap().bytes, x.bytes);
+        assert_eq!(t.s.totals(), (1, 1, x.bytes.len() as u64));
+        t.s.mark_durable(&p, p_lsn);
+        assert_eq!(t.s.durable_len(), lsn + 1, "past the replaced batch's LSN");
+        let budget = (p.bytes.len() + x.bytes.len()) as u64;
+        assert_eq!(
+            t.s.trim_stream("s", Some(budget), None, 0),
+            0,
+            "the stream counts the replacement's bytes, not the old batch's"
+        );
+        let (fed, _) = t.s.tail(0, None, 1 << 20);
+        let fed: Vec<_> = fed.iter().map(|b| b.bytes.clone()).collect();
+        assert_eq!(fed, [p.bytes.clone(), x.bytes.clone()]);
+    }
+
+    #[test]
+    fn a_replacement_of_an_absorbed_batch_hides_it_on_disk_too() {
+        // Why: an absorbed batch is read from its segment's index file, where its record stays.
+        // Its replacement must hide it from every read and keep the totals exact, also after a
+        // restart and once the replacement is absorbed too
+        let mut t = store_with(TINY);
+        let xs: Vec<Batch> = (0..6).map(|i| b("w", 1, i, &[(1, b"y")])).collect();
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        t.s.absorb();
+        assert!(!t.s.inner.lock().order.contains_key(&0), "absorbed");
+        let before = t.s.totals();
+        let x = b("w", 1, 0, &[(1, b"x")]);
+        assert!(t.s.replaceable(&x));
+        let m = Meta {
+            key: crate::proto::encode_replacing_key(&x.id.log),
+            first_seq: 0,
+            count: 1,
+            tag: x.ident,
+            time_ms: now_ms(),
+        };
+        let lsn = t.log.append(&[(m, &x.bytes[..])]).unwrap();
+        t.s.replace(&x, lsn);
+        let check = |s: &Store, when: &str| {
+            assert_eq!(s.get(&x.id).unwrap().bytes, x.bytes, "{when}");
+            assert_eq!(s.totals(), before, "{when}");
+            assert_eq!(drain(s, "s", Cursor::new(), 1 << 20).0.len(), 6, "{when}");
+            let (first, _) = s.read_cursor("s", &Cursor::new(), 1 << 20);
+            assert_eq!(
+                first,
+                std::slice::from_ref(&x.bytes),
+                "{when}: seq 0 first, its replacement"
+            );
+            let (fed, _) = s.tail(0, None, 1 << 20);
+            assert_eq!(fed.len(), 6, "{when}");
+            assert!(fed.iter().all(|b| b.bytes != xs[0].bytes), "{when}");
+            assert_eq!(s.read("s", 0, 100).0.len(), 6, "{when}");
+            assert!(matches!(s.reserve(&x), Reserve::Duplicate(_)), "{when}");
+        };
+        check(&t.s, "replaced");
+        check(&t.reload().unwrap(), "after a restart");
+        for i in 6..12 {
+            let z = b("w", 1, i, &[(1, b"z")]);
+            t.s.reserve(&z);
+            t.durable(&z);
+        }
+        t.s.absorb();
+        assert_eq!(t.s.trim_stream("s", Some(t.s.totals().2), None, 0), 0);
+        assert_eq!(drain(&t.s, "s", Cursor::new(), 1 << 20).0.len(), 12);
+        assert!(t.s.get(&x.id).is_some_and(|b| b.bytes == x.bytes));
     }
 
     #[test]
@@ -2445,6 +2656,8 @@ mod tests {
             )*};
         }
         cold!(
+            a_replacing_record_takes_a_conflicting_batchs_place_at_load,
+            a_replacement_takes_the_batchs_place_and_the_feed_steps_over_it,
             a_batch_rewritten_before_its_write_counts_the_bytes_it_logged,
             trimming_past_a_gap_moves_the_frontier_over_what_follows,
             duplicate_and_conflict,
@@ -2474,5 +2687,126 @@ mod tests {
             a_batch_exactly_its_streams_age_limit_old_is_kept,
             a_logs_batches_start_at_the_batch_holding_the_sequence,
         );
+    }
+}
+
+/// Model-based test: random reserves (retries, overlaps, conflicting contents), durable marks
+/// and failures against a reference model of the per-node rules spec/mesh/Replication.tla
+/// assumes (identity, overlap = conflict, durable-only visibility) and of frontier arithmetic.
+#[cfg(test)]
+mod model {
+    use super::*;
+    use crate::proto::{batch_crc, encode_log_key};
+    use precog_storage::record::Meta;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// first_seq, count, content variant
+        Reserve(u64, u32, u8),
+        Durable(prop::sample::Index),
+        Fail(prop::sample::Index),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                3 => (0u64..8, 1u32..4, 0u8..2).prop_map(|(s, n, v)| Op::Reserve(s, n, v)),
+                2 => any::<prop::sample::Index>().prop_map(Op::Durable),
+                1 => any::<prop::sample::Index>().prop_map(Op::Fail),
+            ],
+            1..30,
+        )
+    }
+
+    /// The reference: first_seq -> (end, variant, count, durable).
+    type Ref = BTreeMap<u64, (u64, u8, u32, bool)>;
+
+    fn batch(seq: u64, n: u32, v: u8) -> Batch {
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let p = [v];
+        let evs: Vec<(u64, &[u8])> = (0..n).map(|_| (0, &p[..])).collect();
+        Batch::parse(Batch::encode(&log, seq, &evs).unwrap()).unwrap()
+    }
+
+    proptest! {
+        // each case opens a log: 64 cases of up to 30 operations
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn the_store_follows_the_identity_rules_and_frontier_arithmetic(ops in ops()) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = precog_storage::Config::new(dir.path());
+            c.segment_size = 1 << 20;
+            let mut log = precog_storage::Log::open(c).unwrap();
+            let s = Store::load(log.reader()).unwrap();
+            let mut r = Ref::new();
+            let mut pending: Vec<Batch> = vec![];
+            for op in ops {
+                match op {
+                    Op::Reserve(seq, n, v) => {
+                        let b = batch(seq, n, v);
+                        let end = seq + n as u64;
+                        let overlap = r.iter().find(|&(&f, &(e, ..))| f < end && seq < e);
+                        let want = match overlap {
+                            None => "new",
+                            Some((&f, &(_, rv, rn, _))) if f == seq && rv == v && rn == n => "dup",
+                            Some(_) => "conflict",
+                        };
+                        let got = match s.reserve(&b) {
+                            Reserve::New => "new",
+                            Reserve::Duplicate(_) => "dup",
+                            Reserve::Conflict(_) => "conflict",
+                            Reserve::Expired => "expired",
+                            Reserve::Error(_) => "error",
+                        };
+                        prop_assert_eq!(got, want, "reserve {}..{} variant {}", seq, end, v);
+                        if want == "new" {
+                            r.insert(seq, (end, v, n, false));
+                            pending.push(b);
+                        }
+                    }
+                    Op::Durable(i) if !pending.is_empty() => {
+                        let b = pending.remove(i.index(pending.len()));
+                        let m = Meta {
+                            key: encode_log_key(&b.id.log),
+                            first_seq: b.id.first_seq,
+                            count: b.count,
+                            tag: batch_crc(&b.bytes),
+                            time_ms: 0,
+                        };
+                        let lsn = log.append(&[(m, &b.bytes[..])]).unwrap();
+                        s.mark_durable(&b, lsn);
+                        r.get_mut(&b.id.first_seq).unwrap().3 = true;
+                    }
+                    Op::Fail(i) if !pending.is_empty() => {
+                        let b = pending.remove(i.index(pending.len()));
+                        s.mark_failed(&b.id);
+                        r.remove(&b.id.first_seq);
+                    }
+                    _ => {}
+                }
+                // frontiers: the durable prefix from 0, and one past the highest durable sequence
+                let mut contiguous = 0;
+                while let Some(&(e, .., true)) = r.get(&contiguous) {
+                    contiguous = e;
+                }
+                let high = r.values().filter(|x| x.3).map(|x| x.0).max().unwrap_or(0).max(contiguous);
+                let f = s.frontiers(None);
+                if high == 0 {
+                    prop_assert!(f.is_empty());
+                } else {
+                    prop_assert_eq!((f[0].contiguous, f[0].high), (contiguous, high));
+                }
+                // durable-only visibility: exactly the durable batches are served
+                let durable = r.values().filter(|x| x.3).count();
+                prop_assert_eq!(s.totals().0 as usize, durable);
+            }
+        }
     }
 }

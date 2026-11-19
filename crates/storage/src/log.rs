@@ -486,7 +486,8 @@ impl Manifest {
             return None;
         }
         let body = b.get(24..24usize.checked_add(u32_at(h, 16) as usize)?)?;
-        if crc32c::crc32c_append(crc32c::crc32c(&b[..20]), body) != u32_at(b, 20) {
+        if body.len() < 28 || crc32c::crc32c_append(crc32c::crc32c(&b[..20]), body) != u32_at(b, 20)
+        {
             return None;
         }
         let mut m = Manifest {
@@ -954,6 +955,7 @@ impl Log {
             inflight: 0,
         };
 
+        let unsynced = (log.cfg.flush_delay_ms > 0).then(|| Log::unsynced_bound(&log.cfg));
         // Sealed segments: drop ones missing at the head (retention whose manifest write was lost),
         // load their indexes (or rebuild them).
         let mut segs: Vec<Arc<Seg>> = vec![];
@@ -1012,7 +1014,7 @@ impl Log {
                         )
                     }
                     None => {
-                        let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset))?;
+                        let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset), None)?;
                         log.stats.index_rebuilds += 1;
                         log.stats.recovery_scanned_bytes += s.scanned;
                         if s.damaged {
@@ -1063,7 +1065,7 @@ impl Log {
             && !last.sealed
         {
             let seg = segs.pop().unwrap();
-            let s = scan(&seg.file, seg.generation, seg.base_lsn, None)?;
+            let s = scan(&seg.file, seg.generation, seg.base_lsn, None, unsynced)?;
             log.stats.recovery_scanned_bytes += s.scanned;
             next_lsn = seg.base_lsn + s.entries.len() as u64;
             active = Some((seg, s));
@@ -1081,7 +1083,7 @@ impl Log {
                         && b == next_lsn
                         && g >= manifest.next_generation.saturating_sub(1) =>
                 {
-                    let s = scan(&file, g, b, None)?;
+                    let s = scan(&file, g, b, None, unsynced)?;
                     log.stats.recovery_scanned_bytes += s.scanned;
                     if let Some((prev, ps)) = active.take() {
                         // Lost records would make the successor's base LSN mismatch (refused
@@ -1576,7 +1578,18 @@ impl Drop for Log {
 /// Scans a segment's records. For a sealed segment `end` bounds the scan and any invalid
 /// record before it is damage. For the active segment the scan stops at the first invalid
 /// record and decides between a torn tail (truncate) and interior damage (error).
-fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result<Scan> {
+///
+/// `unsynced`: with write caching, at most this many bytes at the end can have been unsynced at
+/// a crash (`Log::unsynced_bound`), and the kernel writes them back in any order. Damage
+/// followed only by records within that bound is that tail, partly lost: it is dropped as a
+/// whole (none of it was acknowledged on this node's fsync). Found by spec/storage.
+fn scan(
+    file: &File,
+    generation: u64,
+    base_lsn: Lsn,
+    end: Option<u64>,
+    unsynced: Option<u64>,
+) -> Result<Scan> {
     let len = file.metadata()?.len();
     let limit = end.unwrap_or(len).min(len);
     let mut s = Scan {
@@ -1663,15 +1676,26 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
         }
         pos += 8;
     }
+    // With write caching, a later group may be part of the unsynced tail: everything written
+    // past x must then lie within the bound. `dirty` ends at or before the end of the furthest
+    // record (a record is at least its header).
+    let lost_tail = match (later, unsynced) {
+        (Some(_), Some(u)) => {
+            dirty = dirty.max(written_end(&mut w, pos, window_end, generation)?);
+            dirty <= x.saturating_add(u)
+        }
+        _ => false,
+    };
     s.scanned = w.scanned;
-    if let Some(g) = later {
+    if let Some(g) = later.filter(|_| !lost_tail) {
         return Err(Error::Corrupt(format!(
             "damage at offset {x} of the active segment is followed by a later group at offset {g}"
         )));
     }
-    match torn {
+    match torn.or(later.map(|_| x)) {
         Some(g) => {
-            // drop the whole torn group: it was never acknowledged
+            // drop the whole torn group (it was never acknowledged), and with write caching
+            // the unsynced groups after it
             s.entries
                 .truncate(s.entries.iter().take_while(|e| e.offset < g).count());
             s.end = g;
@@ -1686,6 +1710,24 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
         s.dirty_end = dirty.max(x + record::HEADER as u64).min(len);
     }
     Ok(s)
+}
+
+/// The end of the header of the last record of this generation written in `[pos, end)`
+/// (`pos` if none), skipping over the records that decode.
+fn written_end(w: &mut Window<'_>, mut pos: u64, end: u64, generation: u64) -> Result<u64> {
+    let mut last = pos;
+    while pos < end {
+        let rel = w.cover_ahead(pos, end)?;
+        if w.written_at(rel, generation) {
+            last = pos + record::HEADER as u64;
+            if let Decoded::Record { next, .. } = record::decode(&w.buf, rel, generation) {
+                pos += (next - rel) as u64;
+                continue;
+            }
+        }
+        pos += 8;
+    }
+    Ok(last)
 }
 
 /// How far past a torn write recovery looks for later records: a torn group spans at most
@@ -1821,6 +1863,27 @@ mod tests {
             v[20..24].copy_from_slice(&c.to_le_bytes());
             assert!(Manifest::decode(&v).is_none(), "field at {at}");
         }
+    }
+
+    #[test]
+    fn a_manifest_body_too_short_for_its_fields_is_refused_not_a_panic() {
+        // Why: a slot is refused unless it decodes; a body shorter than its fixed fields under a
+        // valid checksum (a torn or foreign write that happens to check) must read as invalid,
+        // so the other slot is used. Found by the Kani proof `manifest_decode_never_panics`.
+        for n in 0..28usize {
+            let mut b = Vec::new();
+            b.extend_from_slice(&MF_MAGIC.to_le_bytes());
+            b.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&(n as u32).to_le_bytes());
+            let body = vec![0u8; n];
+            let c = crc32c::crc32c_append(crc32c::crc32c(&b), &body);
+            b.extend_from_slice(&c.to_le_bytes());
+            b.extend_from_slice(&body);
+            assert!(Manifest::decode(&b).is_none(), "body of {n} bytes");
+        }
+        // exactly the fixed fields: a manifest of no segments (a fresh log's first slots)
+        assert_eq!(Manifest::decode(&mf(0).encode().unwrap()), Some(mf(0)));
     }
 
     fn header_with(magic: u32, version: u32, id: u64, generation: u64, base: Lsn) -> Vec<u8> {
@@ -1977,5 +2040,46 @@ mod tests {
         let mut c = TailCache::default();
         c.push(rec(1, 10));
         assert!(c.get(1).is_none());
+    }
+}
+
+/// Bounded proofs (Kani): the decoders of the files recovery reads never panic, whatever the
+/// bytes. CRC-32C is stubbed with an unconstrained value, so every checksum may or may not
+/// match: the proofs cover torn or foreign writes that happen to check.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn crc(_b: &[u8]) -> u32 {
+        kani::any()
+    }
+    fn crc_append(_c: u32, _b: &[u8]) -> u32 {
+        kani::any()
+    }
+
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::stub(crc32c::crc32c_append, crc_append)]
+    #[kani::unwind(3)]
+    fn manifest_decode_never_panics() {
+        let b: [u8; 24 + 28 + 49] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= b.len());
+        let _ = Manifest::decode(&b[..n]);
+    }
+
+    /// An index file never panics the decoder, whatever its bytes and length (up to one entry
+    /// with an 8-byte key, or two with empty keys), and an accepted one has exactly the entries
+    /// it declares.
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::unwind(3)]
+    fn index_decode_never_panics() {
+        let b: [u8; 36 + 2 * 38 + 4] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= b.len());
+        if let Some(v) = decode_index(&b[..n], kani::any(), kani::any(), kani::any()) {
+            assert_eq!(v.len(), u32_at(&b, 32) as usize);
+        }
     }
 }

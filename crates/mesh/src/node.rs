@@ -217,11 +217,13 @@ pub struct Node {
     /// claimed them (the log commits in order and fences on any write error).
     dedup: parking_lot::Mutex<Option<Streams>>,
     dedup_dropped: AtomicU64,
-    /// Compacted streams: key -> (LSN, payload) of its newest event.
+    /// Compacted streams: key -> its newest event (see `Compacted`).
     compact: parking_lot::Mutex<HashMap<String, Compacted>>,
     /// This node's writer log for consumer-position commits (a new epoch per boot).
     pos_log: LogId,
     pos_seq: AtomicU64,
+    /// The event time (us) of this node's last position commit: it never goes back.
+    pos_time: AtomicU64,
 }
 
 /// The internal compacted stream of consumer positions, keyed by group and stream.
@@ -231,19 +233,33 @@ fn position_key(group: &str, stream: &str) -> Vec<u8> {
     [group.as_bytes(), b"\0", stream.as_bytes()].concat()
 }
 
-type Compacted = BTreeMap<Vec<u8>, (u64, Bytes)>;
+/// Where an event stands in read order: (event time, writer, epoch, seq).
+type Order = (u64, String, u64, u64);
 
-const SNAP_MAGIC: &[u8; 4] = b"PCS1";
+/// A compacted stream: key -> (its newest event's place in read order, LSN here, payload).
+/// The newest is the last in read order, not the last logged here: replication and repair bring
+/// batches to each node in its own order, and every node must pick the same value (spec/consumers).
+type Compacted = BTreeMap<Vec<u8>, (Order, u64, Bytes)>;
 
-/// A compacted stream's snapshot: magic, count, then (key len u16, key, lsn u64, payload len
-/// u32, payload) per key, then CRC-32C of everything before it.
+const SNAP_MAGIC: &[u8; 4] = b"PCS2";
+/// Format 1 (no read order: LSN only) still reads, its entries older than any event.
+const SNAP_MAGIC_V1: &[u8; 4] = b"PCS1";
+
+/// A compacted stream's snapshot: magic, count, then (key len u16, key, time u64, writer len
+/// u16, writer, epoch u64, seq u64, lsn u64, payload len u32, payload) per key, then CRC-32C of
+/// everything before it.
 fn encode_snapshot(m: &Compacted) -> Vec<u8> {
     let mut b = SNAP_MAGIC.to_vec();
     b.extend_from_slice(&(m.len() as u64).to_le_bytes());
-    for (k, (lsn, p)) in m {
+    for (k, ((time, writer, epoch, seq), lsn, p)) in m {
         b.extend_from_slice(&(k.len() as u16).to_le_bytes());
         b.extend_from_slice(k);
-        b.extend_from_slice(&lsn.to_le_bytes());
+        b.extend_from_slice(&time.to_le_bytes());
+        b.extend_from_slice(&(writer.len() as u16).to_le_bytes());
+        b.extend_from_slice(writer.as_bytes());
+        for v in [epoch, seq, lsn] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
         b.extend_from_slice(&(p.len() as u32).to_le_bytes());
         b.extend_from_slice(p);
     }
@@ -257,8 +273,9 @@ fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
     let (body, crc) = b
         .split_at_checked(b.len().checked_sub(4).ok_or_else(fail)?)
         .ok_or_else(fail)?;
+    let v1 = body.get(..4) == Some(&SNAP_MAGIC_V1[..]);
     if crc32c::crc32c(body) != u32::from_le_bytes(crc.try_into()?)
-        || body.get(..4) != Some(&SNAP_MAGIC[..])
+        || !(v1 || body.get(..4) == Some(&SNAP_MAGIC[..]))
     {
         return Err(fail());
     }
@@ -273,9 +290,19 @@ fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
     for _ in 0..n {
         let kl = u16::from_le_bytes(take(2)?.try_into()?) as usize;
         let k = take(kl)?.to_vec();
+        let order = if v1 {
+            (0, String::new(), 0, 0)
+        } else {
+            let time = u64::from_le_bytes(take(8)?.try_into()?);
+            let wl = u16::from_le_bytes(take(2)?.try_into()?) as usize;
+            let writer = String::from_utf8(take(wl)?.to_vec()).map_err(|_| fail())?;
+            let epoch = u64::from_le_bytes(take(8)?.try_into()?);
+            let seq = u64::from_le_bytes(take(8)?.try_into()?);
+            (time, writer, epoch, seq)
+        };
         let lsn = u64::from_le_bytes(take(8)?.try_into()?);
         let pl = u32::from_le_bytes(take(4)?.try_into()?) as usize;
-        m.insert(k, (lsn, Bytes::copy_from_slice(take(pl)?)));
+        m.insert(k, (order, lsn, Bytes::copy_from_slice(take(pl)?)));
     }
     if !c.is_empty() {
         return Err(fail());
@@ -298,7 +325,7 @@ fn digests(batch: &Batch) -> Vec<(usize, u64)> {
         .collect()
 }
 
-/// Applies a durable batch at `lsn` to a compacted stream's newest values.
+/// Applies a durable batch at `lsn` to a compacted stream's newest values (by read order).
 fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
     let kvs = match batch.keyed() {
         Ok(kvs) => kvs,
@@ -312,9 +339,11 @@ fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
             return;
         }
     };
-    for (k, p) in kvs {
-        if m.get(&k).is_none_or(|(l, _)| *l <= lsn) {
-            m.insert(k, (lsn, p));
+    let log = &batch.id.log;
+    for (seq, time, k, p) in kvs {
+        let order = (time, log.writer.clone(), log.epoch, seq);
+        if m.get(&k).is_none_or(|(o, ..)| *o <= order) {
+            m.insert(k, (order, lsn, p));
         }
     }
 }
@@ -430,6 +459,7 @@ impl Node {
                     .as_nanos() as u64,
             },
             pos_seq: AtomicU64::new(0),
+            pos_time: AtomicU64::new(0),
         });
         Ok(node)
     }
@@ -516,10 +546,16 @@ impl Node {
             .collect();
         let payload = serde_json::to_vec(&entries)?;
         let seq = self.pos_seq.fetch_add(1, Ordering::Relaxed);
+        // the commit time orders commits across nodes (the newest wins everywhere); on this node
+        // it never goes back (equal times fall to the sequence). ponytail: commits through two
+        // nodes closer together than their clock skew may keep the earlier one; an order from
+        // the reader if that matters.
+        let now = crate::store::now_ms() * 1000;
+        let time = self.pos_time.fetch_max(now, Ordering::Relaxed).max(now);
         let b = Batch::encode_keyed(
             &self.pos_log,
             seq,
-            &[(0, &position_key(group, stream), &payload)],
+            &[(time, &position_key(group, stream), &payload)],
         )?;
         let copies = (1 + self.targets().len()).min(2) as u8;
         let ack = self.append(copies, b).await;
@@ -533,7 +569,7 @@ impl Node {
     /// A reader group's committed position in a stream, if it has one.
     pub fn position(&self, group: &str, stream: &str) -> Option<Cursor> {
         let g = self.compact.lock();
-        let (_, p) = g.get(POSITIONS)?.get(&position_key(group, stream))?;
+        let (_, _, p) = g.get(POSITIONS)?.get(&position_key(group, stream))?;
         let entries: Vec<(String, u64, u64)> = serde_json::from_slice(p).ok()?;
         Some(
             entries
@@ -555,7 +591,9 @@ impl Node {
     /// A compacted stream's newest value of every key, by key.
     pub fn latest(&self, stream: &str) -> Vec<(Vec<u8>, Bytes)> {
         self.compact.lock().get(stream).map_or(vec![], |m| {
-            m.iter().map(|(k, (_, p))| (k.clone(), p.clone())).collect()
+            m.iter()
+                .map(|(k, (_, _, p))| (k.clone(), p.clone()))
+                .collect()
         })
     }
 
@@ -643,7 +681,7 @@ impl Node {
         let positions: Vec<(Vec<u8>, u64, Bytes)> =
             self.compact.lock().get(POSITIONS).map_or(vec![], |m| {
                 m.iter()
-                    .map(|(k, (lsn, p))| (k.clone(), *lsn, p.clone()))
+                    .map(|(k, (_, lsn, p))| (k.clone(), *lsn, p.clone()))
                     .collect()
             });
         out.push_str(
@@ -876,8 +914,9 @@ impl Node {
         }
     }
 
-    /// A live feed's batches in log order: `b` and whatever it releases, or nothing while its
-    /// predecessor is missing. A batch already below the feed's start was never due.
+    /// A live feed's batches in log order: `b` and whatever it releases (held batches, and ones
+    /// durable before the feed began that follow it), or nothing while its predecessor is
+    /// missing. A batch below where the feed joined its log was never due.
     fn in_log_order(
         &self,
         start: precog_storage::Lsn,
@@ -900,6 +939,14 @@ impl Node {
         let h = held.entry(log.clone()).or_default();
         loop {
             if let Some(end) = self.store.durable_below(&log, *n, start) {
+                // durable before the feed began, but past the gap the feed joined the log at:
+                // the client takes the log in sequence from the first batch it saw, so it is
+                // due (skipping it stalled the log on the client for good: spec/livefeed)
+                let id = BatchId {
+                    log: log.clone(),
+                    first_seq: *n,
+                };
+                out.extend(self.store.get(&id));
                 *n = end;
             } else if let Some(b) = h.remove(n) {
                 *n = b.end_seq();
@@ -1286,6 +1333,8 @@ impl Node {
             let mut domains = HashSet::new();
             let mut nodes = 0u32;
             let mut tx = Some(tx);
+            // a peer holds other bytes under the batch's identity
+            let mut peer_conflict = false;
             while let Some(r) = futs.next().await {
                 match r {
                     R::Local(Ok(Local::Stored | Local::Duplicate)) => {
@@ -1311,6 +1360,7 @@ impl Node {
                         nodes |= 1 << pid;
                     }
                     R::Remote(pid, _, Ok(a)) => {
+                        peer_conflict |= a.status == AckStatus::Conflict;
                         tracing::debug!("peer {pid} did not confirm: {a:?}")
                     }
                     R::Remote(pid, _, Err(e)) => {
@@ -1339,6 +1389,9 @@ impl Node {
                     nodes,
                     crc,
                 });
+            }
+            if peer_conflict && let Err(e) = node.yield_to_majority(&batch).await {
+                tracing::warn!("conflict at {:?} unresolved: {e}", batch.id);
             }
         });
         rx.await.unwrap_or(Ack {
@@ -1412,6 +1465,45 @@ impl Node {
     async fn peer_control(&self, p: &Peer, c: &Control) -> Result<Frame> {
         self.peer_call(p, Kind::Control, Bytes::from(serde_json::to_vec(c)?))
             .await
+    }
+
+    /// A peer holds other bytes than `ours` under its identity (this node was down while they
+    /// were acknowledged, then a writer reused the identity here). Repair cannot
+    /// see this: the frontiers agree. If a strict majority of the nodes hold one other batch
+    /// there, that batch is logged as a replacement and takes ours' place.
+    /// ponytail: a majority of nodes, so an ack at `copies` > n/2 always wins (2 of 3); a crash
+    /// before this runs leaves the conflict, which a per-log content digest in repair would find.
+    async fn yield_to_majority(&self, ours: &Batch) -> Result<()> {
+        let ask = Control::Fetch {
+            ids: vec![ours.id.clone()],
+        };
+        let mut held: Vec<Batch> = vec![];
+        for p in &self.peers {
+            if let Ok(f) = self.peer_control(p, &ask).await
+                && f.kind == Kind::Batches
+                && !f.body.is_empty()
+            {
+                held.push(Batch::parse(f.body.slice(4..))?);
+            }
+        }
+        let n = self.peers.len() + 1;
+        let Some(theirs) = held
+            .iter()
+            .find(|b| 2 * held.iter().filter(|x| x.ident == b.ident).count() > n)
+        else {
+            bail!("no batch is held by a majority of {n} nodes");
+        };
+        anyhow::ensure!(
+            self.store.replaceable(theirs),
+            "the majority's batch has another range"
+        );
+        let lsn = self.wal.append_replacing(theirs.clone()).await?;
+        self.store.replace(theirs, lsn);
+        tracing::warn!(
+            "{:?}: replaced bytes a majority does not hold with theirs",
+            ours.id
+        );
+        Ok(())
     }
 
     /// Anti-entropy: pull every batch a peer made durable since our cursor that
@@ -1489,4 +1581,75 @@ pub fn parse_frame_ack(f: &Frame) -> Result<Ack> {
         return Err(anyhow!("expected ack, got {:?}", f.kind));
     }
     Ack::decode(f.body.clone())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn a_format_1_snapshot_still_reads_and_any_newer_event_replaces_its_values() {
+        // Why: every node has a __positions snapshot written before read-order compaction; a
+        // node must start from it (formats read or are refused loudly, never silently).
+        let mut b = SNAP_MAGIC_V1.to_vec();
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(b"k");
+        b.extend_from_slice(&42u64.to_le_bytes()); // lsn
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(b"old");
+        let c = crc32c::crc32c(&b);
+        b.extend_from_slice(&c.to_le_bytes());
+        let mut m = decode_snapshot(&b).unwrap();
+        assert_eq!(
+            m[&b"k"[..]],
+            ((0, String::new(), 0, 0), 42, Bytes::from("old"))
+        );
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let batch = Batch::parse(Batch::encode_keyed(&log, 0, &[(0, b"k", b"new")]).unwrap());
+        apply_compacted(&mut m, &batch.unwrap(), 1);
+        assert_eq!(m[&b"k"[..]].2, Bytes::from("new"));
+        let mut bad = b.clone();
+        bad[0] = b'X';
+        assert!(
+            decode_snapshot(&bad).is_err(),
+            "an unknown format is refused"
+        );
+    }
+}
+
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A compacted-stream snapshot (read at every start) round-trips, and any bytes under a
+        /// matching checksum decode or are refused, never a panic.
+        #[test]
+        fn snapshots_round_trip_and_damaged_ones_are_refused(
+            m in prop::collection::btree_map(
+                prop::collection::vec(any::<u8>(), 0..4),
+                ((any::<u64>(), "[a-z0-9-]{0,6}", any::<u64>(), any::<u64>()), any::<u64>(),
+                 prop::collection::vec(any::<u8>(), 0..4)),
+                0..4,
+            ),
+            at in any::<prop::sample::Index>(), v: u8, cut in any::<prop::sample::Index>(),
+        ) {
+            let m: Compacted = m.into_iter().map(|(k, (o, l, p))| (k, (o, l, Bytes::from(p)))).collect();
+            let b = encode_snapshot(&m);
+            prop_assert_eq!(decode_snapshot(&b).unwrap(), m);
+            let mut body = b[..b.len() - 4].to_vec();
+            let i = at.index(body.len());
+            body[i] = v;
+            body.truncate(cut.index(body.len() + 1));
+            let c = crc32c::crc32c(&body);
+            body.extend_from_slice(&c.to_le_bytes());
+            let _ = decode_snapshot(&body);
+        }
+    }
 }

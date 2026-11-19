@@ -1946,3 +1946,111 @@ fn a_record_stays_readable_while_its_segment_is_sealed() {
         t.join().unwrap();
     }
 }
+
+/// Appends `groups` groups of `per` records without asking for a sync; returns the offset of
+/// the first record.
+fn unsynced_groups(log: &mut Log, start: u64, groups: u64, per: u64, size: usize) -> u64 {
+    fill(log, start, groups, per, size);
+    log.reader().entries(start, 1).unwrap()[0].offset
+}
+
+#[test]
+fn a_power_loss_under_write_caching_drops_the_unsynced_tail_whatever_reached_disk() {
+    // Why: with write caching (live-ingestion's setting) several groups are unsynced at once and
+    // the kernel writes their pages back in any order, so a power loss can keep a later group and
+    // lose an earlier one. None of them was relied on locally (acks rested on the replicas), so
+    // the node must come back with its synced prefix and repair the rest, not refuse to start.
+    // Found by spec/storage (MC_caching_unfixed.cfg).
+    let d = tempfile::tempdir().unwrap();
+    let c = || deferred(d.path(), 1 << 20, 1 << 20);
+    let lost;
+    {
+        let mut log = Log::open(c()).unwrap();
+        fill(&mut log, 0, 4, 2, 300);
+        log.flush().unwrap();
+        lost = unsynced_groups(&mut log, 8, 3, 2, 300);
+        assert_eq!(log.stats().syncs, 1, "groups 8.. are unsynced");
+    }
+    // the first unsynced group never reached disk; the two after it did
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, lost, &[0u8; 64]);
+    let mut log = Log::open(c()).unwrap();
+    assert_eq!(
+        log.next_lsn(),
+        8,
+        "the synced prefix, nothing after the hole"
+    );
+    check_all(&log, 0, 8, 300);
+    // the dropped groups' records were zeroed: a shorter write cannot be followed by them
+    fill(&mut log, 8, 1, 1, 10);
+    log.flush().unwrap();
+    drop(log);
+    assert_eq!(Log::open(c()).unwrap().next_lsn(), 9);
+}
+
+#[test]
+fn under_write_caching_damage_before_more_than_the_unsynced_bound_still_fails_closed() {
+    // Why: at most flush_bytes plus one group (MAX_GROUP) can be unsynced, so a hole followed by
+    // more than that was synced: damage, not a lost tail. Dropping it would discard data the
+    // log had made durable.
+    let d = tempfile::tempdir().unwrap();
+    let c = || deferred(d.path(), 64 << 20, 64 * KB);
+    let early;
+    {
+        let mut log = Log::open(c()).unwrap();
+        fill(&mut log, 0, 4, 1, 300);
+        early = log.reader().entries(1, 1).unwrap()[0].offset;
+        // past MAX_GROUP + flush_bytes of synced groups after the damage
+        let big = (record::MAX_RECORD - 4096) as u64;
+        let n = (precog_storage::log::MAX_GROUP as u64 + 64 * KB) / big + 2;
+        for i in 0..n {
+            let m = meta(4 + i);
+            log.append(&[(m, &vec![7u8; big as usize][..])]).unwrap();
+        }
+        log.flush().unwrap();
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, early + record::HEADER as u64 + 3, &[0x5A]);
+    match Log::open(c()) {
+        Err(Error::Corrupt(msg)) => assert!(msg.contains("later"), "{msg}"),
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("opened a log with interior damage"),
+    }
+}
+
+#[test]
+fn under_write_caching_the_unsynced_bound_is_exact_to_the_last_record_written() {
+    // Why: the bound decides between dropping an unsynced tail and failing closed on damage; a
+    // record that ends past x + Log::unsynced_bound was written after an fsync covered x.
+    // Two later records: the second, found by stepping over the first, decides.
+    for (past, opens) in [(0u64, true), (8, false)] {
+        let d = tempfile::tempdir().unwrap();
+        let c = || deferred(d.path(), 64 << 20, 4096);
+        {
+            let mut log = Log::open(c()).unwrap();
+            fill(&mut log, 0, 2, 1, 100);
+            log.flush().unwrap();
+        }
+        let (active, generation, lsn, x) = active_end(d.path());
+        let mut torn = vec![];
+        record::encode(&mut torn, generation, x, lsn, &meta(lsn), &[1; 100]);
+        torn[80] ^= 0xff;
+        patch(&active, x, &torn);
+        let bound = Log::unsynced_bound(&c());
+        let first = x + 1024;
+        let second = x + bound - record::HEADER as u64 + past;
+        for (at, l) in [(first, lsn + 1), (second, lsn + 2)] {
+            let mut r = vec![];
+            record::encode(&mut r, generation, at, l, &meta(l), &[2; 100]);
+            patch(&active, at, &r);
+        }
+        match Log::open(c()) {
+            Ok(log) => {
+                assert!(opens, "{past} bytes past the bound must fail closed");
+                assert_eq!(log.next_lsn(), 2, "the unsynced tail is dropped");
+            }
+            Err(Error::Corrupt(msg)) => assert!(!opens, "within the bound: {msg}"),
+            Err(e) => panic!("wrong error: {e}"),
+        }
+    }
+}

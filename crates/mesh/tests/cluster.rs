@@ -669,3 +669,113 @@ fn an_address_prints_as_configured() {
     let a: Addr = "tcp://127.0.0.1:7001".parse().unwrap();
     assert_eq!(a.to_string(), "tcp://127.0.0.1:7001");
 }
+
+/// A live feed that joins a log behind a gap (a node made its batches durable out of order, as
+/// pipelined appends and repair do) must carry the batches past the gap once it fills: the
+/// client joins the log at the first batch it sees and waits for each next one in sequence.
+/// The feed used to skip batches durable before it started, so the client held everything
+/// after them for good. Found by spec/livefeed (MC_livefeed_skip).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_feed_that_joins_behind_a_gap_delivers_everything_after_it() {
+    let c = cluster(1, &["a"]);
+    let node = start(&c, 0).await;
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let b = |seq: u64| Batch::encode(&log, seq, &[(seq, b"x")]).unwrap();
+    for seq in [0, 1, 3] {
+        assert!(node.append(1, b(seq)).await.is_success());
+    }
+    let mut sub = mc.subscribe(0, Some("s"), false).await.unwrap();
+    for seq in [2, 4] {
+        assert!(node.append(1, b(seq)).await.is_success());
+    }
+    let mut got = vec![];
+    while got.len() < 3 {
+        let next = tokio::time::timeout(Duration::from_secs(2), sub.next()).await;
+        let Ok(Some(Ok(batch))) = next else {
+            panic!("the feed stalled after {got:?}");
+        };
+        got.push(batch.id.first_seq);
+    }
+    assert_eq!(got, vec![2, 3, 4]);
+}
+
+/// The bytes node `n` holds at batch identity `id`, if any.
+async fn held(mc: &MeshClient, n: usize, id: &BatchId) -> Option<Bytes> {
+    let c = Control::Fetch {
+        ids: vec![id.clone()],
+    };
+    let f = mc
+        .call(
+            n,
+            Kind::Control,
+            Bytes::from(serde_json::to_vec(&c).unwrap()),
+        )
+        .await
+        .unwrap();
+    (f.body.len() > 4).then(|| f.body.slice(4..))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_missed_a_batch_gives_up_other_bytes_under_its_identity() {
+    // Why: node 2 was down while X was acknowledged on nodes 0 and 1. A writer that reuses X's
+    // identity with other bytes Y at node 2 is refused, but node 2 kept Y: repair compares
+    // frontiers, which agree, so node 2 never served the acknowledged X, not even after repair.
+    let c = cluster(3, &["a", "b", "c"]);
+    let (_n0, _n1) = (start(&c, 0).await, start(&c, 1).await);
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 3,
+    };
+    let x = Batch::encode(&log, 0, &[(1, b"acknowledged")]).unwrap();
+    let id = Batch::parse(x.clone()).unwrap().id;
+    assert!(mc.append(0, &x, 2).await.unwrap().ack.is_success());
+    let n2 = start(&c, 2).await;
+    let y = Batch::encode(&log, 0, &[(1, b"other bytes")]).unwrap();
+    let e = mc.append(2, &y, 2).await.unwrap_err().to_string();
+    assert!(e.contains("Conflict"), "{e}");
+    let mut ok = false;
+    for _ in 0..50 {
+        if held(&mc, 2, &id).await.as_ref() == Some(&x) {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok, "node 2 holds {:?}", held(&mc, 2, &id).await);
+    assert_eq!(status(&mc, 2).await.events, 1, "the other bytes are gone");
+    // and it stays that way across a restart (recovery keeps the replacement)
+    drop(n2);
+    tokio::time::sleep(Duration::from_millis(300)).await; // WAL thread releases its lock
+    let n2 = Node::open(c.cfgs[2].clone()).await.unwrap();
+    assert_eq!(n2.store.get(&id).map(|b| b.bytes), Some(x));
+    assert_eq!(n2.store.totals().1, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_without_a_majority_changes_nothing() {
+    // Why: one node against one is no majority; neither may give up its bytes for the other's
+    let c = cluster(2, &["a", "b"]);
+    let _n0 = start(&c, 0).await;
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 4,
+    };
+    let x = Batch::encode(&log, 0, &[(1, b"first")]).unwrap();
+    let id = Batch::parse(x.clone()).unwrap().id;
+    assert!(mc.append(0, &x, 1).await.unwrap().ack.is_success());
+    let _n1 = start(&c, 1).await;
+    let y = Batch::encode(&log, 0, &[(1, b"second")]).unwrap();
+    assert!(mc.append(1, &y, 2).await.is_err());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(held(&mc, 0, &id).await, Some(x));
+    assert_eq!(held(&mc, 1, &id).await, Some(y));
+}
