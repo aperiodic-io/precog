@@ -521,12 +521,10 @@ impl Node {
                 replay.push(e.lsn);
             }
         })?;
-        let p = cfg.data_dir.join("floors");
-        match std::fs::read(&p) {
-            Ok(b) => store
-                .restore_floors(&decode_floors(&b).with_context(|| format!("{}", p.display()))?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        let p = cfg.data_dir.join("floors"); // none until a pass dropped segments
+        if p.exists() {
+            let floors = decode_floors(&std::fs::read(&p)?);
+            store.restore_floors(&floors.with_context(|| format!("{}", p.display()))?);
         }
         let n = store.totals().0;
         for lsn in replay {
@@ -792,11 +790,11 @@ impl Node {
         self.fit(&mut keep, budget);
         // what streams forgot stays forgotten across a restart, though copies of it outlive the
         // segments about to be dropped
-        let floors = encode_floors(&self.store.floors());
-        write_durably(
-            &self.cfg.data_dir,
-            vec![(self.cfg.data_dir.join("floors"), floors)],
-        )?;
+        let floors = (
+            self.cfg.data_dir.join("floors"),
+            encode_floors(&self.store.floors()),
+        );
+        write_durably(&self.cfg.data_dir, vec![floors])?;
         self.copy_forward(keep).await?;
         self.store.vacate(&bases);
         let floor = self.wal.drop_until(end).await?;
@@ -831,9 +829,8 @@ impl Node {
                 .collect();
             most.sort_unstable_by(|a, b| b.cmp(a));
             let next = most.get(1).map_or(0, |x| x.0);
-            let Some((_, stream)) = most.into_iter().next() else {
-                break;
-            };
+            // cost counts only what `keep` holds, so while it does not fit something is kept
+            let (_, stream) = most.swap_remove(0);
             let mut kept: HashMap<u64, Kept> = keep[&stream].iter().map(|k| (k.lsn, *k)).collect();
             let cut = self.store.cut(&stream, |bytes, lsn| {
                 if fits(cost, limit, budget) || bytes < next {
@@ -876,29 +873,28 @@ impl Node {
                 // replacements out from here to `moved`)
                 .filter(|r| self.store.retains(r.lsn, &r.meta))
                 .collect();
-            if recs.is_empty() {
-                continue;
-            }
-            let first = self
-                .wal
-                .copy(
+            if !recs.is_empty() {
+                let first = self
+                    .wal
+                    .copy(
+                        recs.iter()
+                            .map(|r| (r.meta.clone(), r.payload.clone()))
+                            .collect(),
+                    )
+                    .await?;
+                self.store.moved(
                     recs.iter()
-                        .map(|r| (r.meta.clone(), r.payload.clone()))
-                        .collect(),
-                )
-                .await?;
-            self.store.moved(
-                recs.iter()
-                    .zip(first..)
-                    .map(|(r, lsn)| (r.lsn, lsn, &r.meta, r.payload.len() as u32)),
-            );
-            let bytes: usize = recs
-                .iter()
-                .map(|r| precog_storage::record::encoded_len(r.meta.key.len(), r.payload.len()))
-                .sum();
-            self.copied_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
-            self.copied_batches
-                .fetch_add(recs.len() as u64, Ordering::Relaxed);
+                        .zip(first..)
+                        .map(|(r, lsn)| (r.lsn, lsn, &r.meta, r.payload.len() as u32)),
+                );
+                let bytes: usize = recs
+                    .iter()
+                    .map(|r| precog_storage::record::encoded_len(r.meta.key.len(), r.payload.len()))
+                    .sum();
+                self.copied_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                self.copied_batches
+                    .fetch_add(recs.len() as u64, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -2288,7 +2284,9 @@ mod props_cleaner {
         #[test]
         fn the_cap_holds_whatever_damage_sealed_segments_take(ops in prop::collection::vec(
             prop_oneof![
-                4 => (0usize..3, 1usize..40).prop_map(|(s, n)| Hurt::Write(s, n)),
+                // mostly streams the cleaner copies: damage then hits what it reads
+                3 => (0usize..2, 1usize..40).prop_map(|(s, n)| Hurt::Write(s, n)),
+                1 => (1usize..40).prop_map(|n| Hurt::Write(2, n)),
                 2 => (any::<bool>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
                     .prop_map(|(i, f, a)| Hurt::Damage(i, f, a)),
                 3 => Just(Hurt::Retain),
@@ -2580,6 +2578,11 @@ mod props {
             let b = encode_floors(&m);
             prop_assert_eq!(decode_floors(&b).unwrap(), m);
             prop_assert!(decode_floors(&b[..b.len() - 1]).is_err(), "a short file");
+            let mut more = b[..b.len() - 4].to_vec();
+            more.push(0);
+            let c = crc32c::crc32c(&more);
+            more.extend_from_slice(&c.to_le_bytes());
+            prop_assert!(decode_floors(&more).is_err(), "bytes past its entries");
             let mut body = b[..b.len() - 4].to_vec();
             let i = at.index(body.len());
             body[i] = v;

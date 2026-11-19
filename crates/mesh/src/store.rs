@@ -682,8 +682,9 @@ impl Inner {
         stream: &str,
         mut over: impl FnMut(u64, &Rec) -> bool,
     ) -> usize {
-        let mut n = 0;
-        loop {
+        // a part that yields nothing (its totals disagree with its index) ends it: no spinning
+        let (mut n, mut went) = (0, true);
+        while went {
             let Some(s) = self.streams.get(stream) else {
                 return n;
             };
@@ -754,10 +755,9 @@ impl Inner {
                 }
                 n += 1;
             }
-            if n == before && !raised {
-                return n; // its totals disagree with its index: do not spin
-            }
+            went = n > before || raised;
         }
+        n
     }
 }
 
@@ -1364,6 +1364,7 @@ impl Store {
             Ok(start)
         };
         let (mut size, mut out, mut blocked) = (0usize, vec![], BTreeSet::new());
+        let mut walk = Ok(());
         let read = self.visit_stream(stream, hot, start, (true, 0), |g, x| {
             if size >= max_bytes {
                 return false;
@@ -1387,9 +1388,7 @@ impl Store {
                     }
                     due
                 });
-                if let Err(e) = walked {
-                    tracing::error!("reading the index of {:?}: {e}", l.id);
-                }
+                walk = std::mem::replace(&mut walk, Ok(())).and(walked); // logged with the read's
                 if at > c {
                     next.insert(l.id.clone(), at);
                 }
@@ -1401,6 +1400,7 @@ impl Store {
             out.push(x.lsn);
             true
         });
+        let read = read.and(walk);
         if let Err(e) = read {
             tracing::error!("reading the index of stream {stream}: {e}");
         }
