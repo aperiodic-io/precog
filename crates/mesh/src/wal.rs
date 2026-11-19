@@ -8,7 +8,7 @@
 //! (`precog_storage::Error::Fatal`) sets `fatal`: every later append fails, and the node
 //! must restart and recover.
 
-use crate::proto::{Batch, encode_log_key};
+use crate::proto::{Batch, encode_log_key, encode_replacing_key};
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
 use precog_storage::record::Meta;
@@ -28,10 +28,14 @@ pub struct WalStats {
     pub recovery_scanned_bytes: AtomicU64,
 }
 
+type Done = oneshot::Sender<Result<Lsn, String>>;
+
 enum Req {
     Append {
         batch: Batch,
-        done: oneshot::Sender<Result<Lsn, String>>,
+        /// It replaces a conflicting batch under its identity (`encode_replacing_key`).
+        replaces: bool,
+        done: Done,
     },
     Retain {
         max_bytes: Option<u64>,
@@ -104,26 +108,43 @@ impl Wal {
 
     /// Queues the batch: batches reach the log in the order they are submitted.
     pub fn submit(&self, batch: Batch) -> Result<oneshot::Receiver<Result<Lsn, String>>> {
+        self.submit_as(batch, false)
+    }
+
+    /// Logs `batch` in place of the conflicting batch this node holds under its identity.
+    pub async fn append_replacing(&self, batch: Batch) -> Result<Lsn> {
+        Self::durable(self.submit_as(batch, true)?).await
+    }
+
+    fn submit_as(
+        &self,
+        batch: Batch,
+        replaces: bool,
+    ) -> Result<oneshot::Receiver<Result<Lsn, String>>> {
         if self.fatal.load(Ordering::Acquire) {
             bail!("storage is fenced after a fatal error");
         }
         let (done, rx) = oneshot::channel();
         if self.caching {
-            let _ = done.send(self.write(&batch));
+            let _ = done.send(self.write(&batch, replaces));
             return Ok(rx);
         }
         self.tx
-            .send(Req::Append { batch, done })
+            .send(Req::Append {
+                batch,
+                replaces,
+                done,
+            })
             .map_err(|_| anyhow::anyhow!("wal writer stopped"))?;
         Ok(rx)
     }
 
     /// Write caching: appends the batch on the calling thread, and wakes the WAL thread only when
     /// the flush deadline moves (the first unsynced write, or `flush_bytes` crossed).
-    fn write(&self, batch: &Batch) -> Result<Lsn, String> {
+    fn write(&self, batch: &Batch, replaces: bool) -> Result<Lsn, String> {
         let mut log = self.log.lock();
         let due = log.flush_due();
-        let r = log.append(&[(meta(batch, now_ms()), &batch.bytes[..])]);
+        let r = log.append(&[(meta(batch, replaces, now_ms()), &batch.bytes[..])]);
         publish(&log, &self.stats, &self.fatal);
         let wake = log.flush_due() != due;
         drop(log);
@@ -163,9 +184,13 @@ impl Wal {
     }
 }
 
-fn meta(b: &Batch, time_ms: u64) -> Meta {
+fn meta(b: &Batch, replaces: bool, time_ms: u64) -> Meta {
     Meta {
-        key: encode_log_key(&b.id.log),
+        key: if replaces {
+            encode_replacing_key(&b.id.log)
+        } else {
+            encode_log_key(&b.id.log)
+        },
         first_seq: b.id.first_seq,
         count: b.count,
         tag: b.ident,
@@ -207,7 +232,7 @@ fn writer(
     stats: Arc<WalStats>,
     fatal: Arc<AtomicBool>,
 ) {
-    let mut group: Vec<(Batch, oneshot::Sender<Result<Lsn, String>>)> = Vec::with_capacity(256);
+    let mut group: Vec<(Batch, bool, Done)> = Vec::with_capacity(256);
     let mut pending: Option<Req> = None;
     loop {
         let first = match pending.take() {
@@ -249,15 +274,23 @@ fn writer(
                 let _ = done.send(r);
                 continue;
             }
-            Req::Append { batch, done } => group.push((batch, done)),
+            Req::Append {
+                batch,
+                replaces,
+                done,
+            } => group.push((batch, replaces, done)),
             Req::Wake => continue,
         }
         let mut size = group[0].0.bytes.len();
         while size < MAX_GROUP_BYTES {
             match rx.try_recv() {
-                Ok(Req::Append { batch, done }) => {
+                Ok(Req::Append {
+                    batch,
+                    replaces,
+                    done,
+                }) => {
                     size += batch.bytes.len();
-                    group.push((batch, done));
+                    group.push((batch, replaces, done));
                 }
                 Ok(r @ Req::Retain { .. }) => {
                     pending = Some(r);
@@ -269,7 +302,7 @@ fn writer(
         let t = now_ms();
         let items: Vec<(Meta, &[u8])> = group
             .iter()
-            .map(|(b, _)| (meta(b, t), &b.bytes[..]))
+            .map(|(b, replaces, _)| (meta(b, *replaces, t), &b.bytes[..]))
             .collect();
         let r = {
             let mut log = log.lock();
@@ -279,17 +312,54 @@ fn writer(
         };
         match r {
             Ok(first) => {
-                for (i, (_, done)) in group.drain(..).enumerate() {
+                for (i, (_, _, done)) in group.drain(..).enumerate() {
                     let _ = done.send(Ok(first + i as u64));
                 }
             }
             Err(e) => {
                 tracing::error!("storage append failed: {e}");
                 let msg = e.to_string();
-                for (_, done) in group.drain(..) {
+                for (_, _, done) in group.drain(..) {
                     let _ = done.send(Err(msg.clone()));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{LogId, decode_record_key};
+
+    #[tokio::test]
+    async fn only_a_replacement_is_logged_with_a_replacing_key() {
+        // through the WAL thread (fsync per ack) and on the caller (write caching)
+        for flush_delay_ms in [0, 100] {
+            replacing_key(flush_delay_ms).await;
+        }
+    }
+
+    async fn replacing_key(flush_delay_ms: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Config::new(dir.path());
+        c.segment_size = 1 << 20;
+        c.flush_delay_ms = flush_delay_ms;
+        let (wal, _) = Wal::open(c).unwrap();
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let at = |seq| Batch::parse(Batch::encode(&log, seq, &[(1, b"e")]).unwrap()).unwrap();
+        wal.append(at(0)).await.unwrap();
+        wal.append_replacing(at(1)).await.unwrap();
+        let flags: Vec<bool> = wal
+            .reader
+            .entries(0, 10)
+            .iter()
+            .map(|e| decode_record_key(&e.meta.key).unwrap().1)
+            .collect();
+        assert_eq!(flags, [false, true], "flush_delay_ms {flush_delay_ms}");
     }
 }
