@@ -131,7 +131,7 @@ pub const ALL: &[Scenario] = &[
     s(
         "retention-under-load",
         false,
-        "a 48 MiB retention budget under ~25 MB/s: disk stays bounded, the newest data stays readable",
+        "a 48 MiB retention budget under ~25 MB/s: disk stays bounded (budget + 6 segments), the newest data stays readable",
     ),
     s(
         "compaction-under-load",
@@ -1250,9 +1250,11 @@ async fn retention(ctx: &mut Ctx, o: &mut Outcome) -> Result<()> {
     let max = sampler.await?;
     o.metric("load", sent.metrics());
     o.metric("disk_max_bytes", max);
-    let limit = budget + 4 * seg;
+    // the budget counts sealed segments; beyond it: the active segment, the preallocated spare,
+    // what arrives between retention passes (~1.5 segments at this rate), indexes
+    let limit = budget + 6 * seg;
     o.check(
-        "disk stays within the budget plus four segments",
+        "disk stays within the budget plus six segments",
         max.iter().all(|&m| m <= limit),
         json!({"max": max, "limit": limit}),
     );

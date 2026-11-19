@@ -279,36 +279,46 @@ pub async fn converge(
     streams: &[&str],
     limit: Duration,
 ) -> Result<Vec<Vec<Vec<Rec>>>> {
+    // repair until every node reports the same frontiers for these streams (cheap), then read
     let t = Instant::now();
-    loop {
+    let frontiers = |s: &Status| {
+        let mut f: Vec<_> = s
+            .logs
+            .iter()
+            .filter(|f| streams.contains(&f.log.stream.as_str()))
+            .map(|f| (f.log.clone(), f.contiguous, f.high))
+            .collect();
+        f.sort();
+        f
+    };
+    let mut last = None;
+    while t.elapsed() < limit {
         for i in 0..3 {
             let _ = mc.control(i, &Control::Repair).await;
         }
-        let mut per_stream = vec![];
-        for s in streams {
-            let mut per_node = vec![];
-            for i in 0..3 {
-                let mut r = read_node(mc, i, s).await?;
-                r.sort();
-                per_node.push(r);
+        let mut per_node = vec![];
+        for i in 0..3 {
+            if let Ok(s) = status(mc, i).await {
+                per_node.push(frontiers(&s));
             }
-            per_stream.push(per_node);
         }
-        let same = per_stream.iter().all(|n| n[0] == n[1] && n[1] == n[2]);
-        if same || t.elapsed() > limit {
-            // read order (not sorted) for the order check
-            let mut out = vec![];
-            for s in streams {
-                let mut per_node = vec![];
-                for i in 0..3 {
-                    per_node.push(read_node(mc, i, s).await?);
-                }
-                out.push(per_node);
-            }
-            return Ok(out);
+        let same = per_node.len() == 3 && per_node[0] == per_node[1] && per_node[1] == per_node[2];
+        // equal twice in a row: nothing was still in flight
+        if same && last.as_ref() == Some(&per_node[0]) {
+            break;
         }
+        last = same.then(|| per_node.swap_remove(0));
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let mut out = vec![];
+    for s in streams {
+        let mut per_node = vec![];
+        for i in 0..3 {
+            per_node.push(read_node(mc, i, s).await?);
+        }
+        out.push(per_node);
+    }
+    Ok(out)
 }
 
 pub async fn dedup_dropped(mc: &MeshClient) -> u64 {
