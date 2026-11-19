@@ -1,0 +1,54 @@
+name: harness
+# The broker harness (crates/harness): a 3-node Docker cluster, faults (SIGKILL, SIGSTOP, network
+# cuts, a full disk, clock skew), invariants checked after every scenario. Optional, never a
+# required gate: run it from the Actions tab (workflow_dispatch), by adding the `harness` label
+# to a pull request, or nightly (Precog and the Redpanda dedup fork).
+on:
+  workflow_dispatch:
+    inputs:
+      system:
+        description: precog, redpanda or both
+        type: choice
+        options: [precog, redpanda, both]
+        default: precog
+      only:
+        description: comma-separated scenarios (empty runs all; `precog-harness list` names them)
+        default: ""
+  pull_request:
+    types: [labeled, synchronize]
+  schedule:
+    - cron: "41 4 * * *"
+permissions: { contents: read }
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  harness:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'harness')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        system: ${{ fromJSON((github.event_name == 'schedule' || inputs.system == 'both') && '["precog","redpanda"]' || format('["{0}"]', inputs.system || 'precog')) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "false" }
+      - run: cargo build --release --locked -p precog-mesh --bin precog-node -p precog-harness
+      # root: iptables (network cuts) and tmpfs mounts (the full disk)
+      - env: { ONLY: "${{ inputs.only }}" }
+        run: |
+          only=()
+          if [ -n "$ONLY" ]; then only=(--only "$ONLY"); fi
+          sudo target/release/precog-harness run --system ${{ matrix.system }} "${only[@]}" \
+            --out results/harness-${{ matrix.system }}
+      - if: always()
+        run: cat results/harness-${{ matrix.system }}/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-${{ matrix.system }}
+          path: |
+            results/harness-${{ matrix.system }}/results.json
+            results/harness-${{ matrix.system }}/summary.md
+            results/harness-${{ matrix.system }}/logs
