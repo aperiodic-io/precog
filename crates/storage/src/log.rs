@@ -608,12 +608,7 @@ fn encode_index(id: u64, generation: u64, base_lsn: Lsn, ents: &[IdxEntry]) -> V
 }
 
 /// Checks an index file and returns its record count and key table.
-fn decode_index(
-    b: &[u8],
-    id: u64,
-    generation: u64,
-    base_lsn: Lsn,
-) -> Option<(u32, Keys)> {
+fn decode_index(b: &[u8], id: u64, generation: u64, base_lsn: Lsn) -> Option<(u32, Keys)> {
     let (body, crc) = b.split_at_checked(b.len().checked_sub(4)?)?;
     if crc32c::crc32c(body) != u32_at(crc, 0) {
         return None;

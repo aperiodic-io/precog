@@ -36,8 +36,9 @@ fn live() -> isize {
 
 const BATCHES: usize = 200_000;
 /// Bytes of heap per retained batch, the store's index and the segment log's together (requested
-/// sizes: malloc's own rounding and headers come on top). Today: 151 B (store 147 B).
-const BUDGET: f64 = 200.0;
+/// sizes: malloc's own rounding and headers come on top). Today: 6 B (store 3 B) once absorbed;
+/// the active segment's batches cost ~150 B each, bounded by the segment size, not retention.
+const BUDGET: f64 = 32.0;
 
 #[test]
 fn ram_per_retained_batch_stays_within_budget() {
@@ -66,7 +67,7 @@ fn ram_per_retained_batch_stays_within_budget() {
     cfg.spares = 0;
     cfg.tail_cache_bytes = 0;
     let mut log = precog_storage::Log::open(cfg).unwrap();
-    let store = Store::load(log.reader(), vec![]).unwrap();
+    let store = Store::load(log.reader()).unwrap();
 
     let base = live();
     // (store, segment log): the group's own Vec and keys are freed before the next count
@@ -98,6 +99,10 @@ fn ram_per_retained_batch_stays_within_budget() {
         store_bytes += live() - t2 + (t1 - t0);
         log_bytes += t2 - t1;
     }
+    // what retention does every few seconds: sealed segments' batches leave RAM
+    let t3 = live();
+    store.absorb();
+    store_bytes += live() - t3;
     assert_eq!(store.totals().0, BATCHES as u64);
     let per = |x: isize| x as f64 / BATCHES as f64;
     let total = per(live() - base);

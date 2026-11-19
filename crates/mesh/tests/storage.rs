@@ -64,6 +64,76 @@ async fn batches_are_served_from_disk_after_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_retaining_many_small_batches_restarts_and_serves_them_from_disk() {
+    // Why: a node keeps only the active segment's batches in RAM; the rest are read from the
+    // segments' index files. After a restart, every retained batch must still be served: by id,
+    // to a cursor reading the stream from its start, and to repair from any sequence.
+    let d = tempfile::tempdir().unwrap();
+    let writers = ["w1", "w2", "w3"];
+    let mut written = vec![];
+    {
+        let node = Node::open(config(d.path())).await.unwrap();
+        for seq in 0..500 {
+            for w in writers {
+                let b = batch(w, seq, 60);
+                assert!(node.append(1, b.clone()).await.is_success());
+                written.push(b);
+            }
+        }
+        node.apply_retention().await.unwrap(); // moves sealed segments' batches out of RAM
+        assert_eq!(node.store.totals().0, 1500);
+    }
+    let node = Node::open(config(d.path())).await.unwrap();
+    assert_eq!(node.store.totals().0, 1500);
+    for b in &written {
+        let b = Batch::parse(b.clone()).unwrap();
+        let got = node.store.get(&b.id).expect("served after restart");
+        assert_eq!(got.bytes, b.bytes);
+    }
+    // a consumer reading from the start gets every batch once, each writer's in order
+    let mut cursor = precog_mesh::store::Cursor::new();
+    let mut got = vec![];
+    loop {
+        let (bs, next) = node.store.read_cursor("s", &cursor, 16 << 10);
+        if bs.is_empty() {
+            break;
+        }
+        got.extend(bs.into_iter().map(|b| Batch::parse(b).unwrap().id));
+        cursor = next;
+    }
+    assert_eq!(got.len(), 1500);
+    for w in writers {
+        let seqs: Vec<u64> = got
+            .iter()
+            .filter(|id| id.log.writer == w)
+            .map(|id| id.first_seq)
+            .collect();
+        assert_eq!(seqs, (0..500).collect::<Vec<_>>(), "{w}");
+    }
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w2".into(),
+        epoch: 1,
+    };
+    let repair: Vec<u64> = node
+        .store
+        .log_batches(&log, 123, 1 << 20)
+        .into_iter()
+        .map(|b| Batch::parse(b).unwrap().id.first_seq)
+        .collect();
+    assert_eq!(repair, (123..500).collect::<Vec<_>>());
+    let f = node.store.frontiers(None);
+    assert!(
+        f.iter().all(|f| (f.contiguous, f.high) == (500, 500)),
+        "{f:?}"
+    );
+    // an old retry is still a duplicate, not a new batch
+    let ack = node.append(1, written[7].clone()).await;
+    assert_eq!(ack.status, AckStatus::Ok);
+    assert_eq!(node.store.totals().0, 1500);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_trims_the_log_and_the_metadata() {
     let d = tempfile::tempdir().unwrap();
     let mut c = config(d.path());

@@ -348,26 +348,15 @@ impl Node {
         anyhow::ensure!(cfg.id < 32, "node id must be < 32");
         anyhow::ensure!(cfg.peers.len() <= 31, "too many peers");
         std::fs::create_dir_all(&cfg.data_dir)?;
-        let (wal, entries) = Wal::open(cfg.storage())?;
-        let n = entries.len();
+        let wal = Wal::open(cfg.storage())?;
         let mut dedup = cfg
             .dedup_window_ms
             .map(|w| Streams::new(w.div_ceil(1000).max(1), 3, cfg.dedup_max_entries));
-        // the last window of the log rebuilds the index (bounded: the window, not the log)
-        let recent: Vec<_> = match cfg.dedup_window_ms {
-            Some(w) => {
-                let since = (now_s() * 1000).saturating_sub(w);
-                entries
-                    .iter()
-                    .filter(|e| e.meta.time_ms >= since)
-                    .map(|e| e.lsn)
-                    .collect()
-            }
-            None => vec![],
-        };
+        let since = cfg
+            .dedup_window_ms
+            .map(|w| (now_s() * 1000).saturating_sub(w));
         // compacted streams: their snapshots, then whatever the log holds that is newer
         let mut compact: HashMap<String, Compacted> = HashMap::new();
-        let mut replay = vec![];
         let compacted = cfg
             .streams
             .iter()
@@ -382,12 +371,27 @@ impl Node {
             };
             compact.insert(name.to_string(), m);
         }
-        for e in &entries {
-            if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
-                replay.push(e.lsn);
+        // one pass over the log's index, a chunk at a time: the dedup window's batches rebuild
+        // its index, the compacted streams' replay (bounded: those, not the log)
+        let (mut recent, mut replay) = (vec![], vec![]);
+        let mut from = wal.reader.first_lsn();
+        loop {
+            let es = wal.reader.entries(from, 1 << 16)?;
+            let Some(last) = es.last() else {
+                break;
+            };
+            from = last.lsn + 1;
+            for e in &es {
+                if since.is_some_and(|s| e.meta.time_ms >= s) {
+                    recent.push(e.lsn);
+                }
+                if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
+                    replay.push(e.lsn);
+                }
             }
         }
-        let store = Store::load(wal.reader.clone(), entries)?;
+        let store = Store::load(wal.reader.clone())?;
+        let n = store.totals().0;
         for lsn in replay {
             if let Some(r) = wal.reader.read(lsn)? {
                 let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
@@ -600,6 +604,8 @@ impl Node {
     }
 
     pub async fn apply_retention(&self) -> Result<()> {
+        // sealed segments' batches leave RAM (their index is on disk)
+        self.store.absorb();
         self.write_snapshots()?;
         let now = crate::store::now_ms();
         for (name, s) in &self.cfg.streams {

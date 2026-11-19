@@ -41,7 +41,7 @@ on arrival play no part in read order.
 |---|---|
 | `proto.rs` | Batch codec (zero re-encoding: client bytes go unchanged to WALs and peers), RPC framing, acks, control messages |
 | `wal.rs` | One WAL per node with **cross-writer group commit**: a dedicated thread drains every queued append into one `write` + one `fdatasync`. Exclusive file lock. Recovery truncates a torn tail and fails closed on interior corruption. An I/O error fences the WAL. |
-| `store.rs` | In-memory index: per-log `BTreeMap<first_seq, batch>`, reservation of pending ranges (concurrent duplicates coalesce), durable-only visibility, frontiers (`contiguous` prefix + `high`), event-time snapshot read |
+| `store.rs` | Index over the segment log: per-log `BTreeMap<first_seq, batch>` for the active segment, sealed segments' batches read from their index files (see below), reservation of pending ranges (concurrent duplicates coalesce), durable-only visibility, frontiers (`contiguous` prefix + `high`), event-time snapshot read |
 | `node.rs` | Append = local WAL ‖ replicate to one peer per other domain. **Early completion** at `copies`. Replicate is accepted only from authenticated peers and does not fan out further. Anti-entropy repair pulls each peer's durable inventory incrementally (cursor over the peer's WAL order). |
 | `rpc.rs` | Multiplexed request/response over one byte stream. The writer task coalesces frames. |
 | `transport.rs` | TCP. QUIC/Iroh was removed: TCP measured 1.4–1.6x faster. |
@@ -49,6 +49,33 @@ on arrival play no part in read order.
 
 Tests are in `crates/mesh/src/*` (unit) and `crates/mesh/tests/cluster.rs`
 (multi-node over real TCP sockets). Run them with `cargo test`.
+
+## What a node keeps in RAM
+
+A node retains tens of millions of small batches (live-ingestion keeps ~74 GiB per node, and its
+producers flush one batch per writer log every 100 ms), so RAM per retained batch decides
+whether it fits its pod. `crates/mesh/tests/memory.rs` measures it and fails past a budget.
+
+| Kept in RAM | Why |
+|---|---|
+| Per writer log: its id (once, interned), `trimmed`, `contiguous`, `high`, and per sealed segment holding its batches their sequence range | Frontiers, repair and `Expired` answer from these alone; the ranges say which segment indexes a lookup must read |
+| Per stream: its logs, its own retention floor, and per sealed segment its bytes, batches, events and newest append time | Per-stream retention (bytes and age) and the totals without reading the log |
+| Batches of the active segment, pending batches and their waiters | Appends, duplicate checks of recent retries and live subscribers touch only these |
+| The segment log's index of the active segment | Appends and the tail |
+
+Everything else is on disk. A sealed segment's index file (`seg-<id>.idx`, version 2) holds a
+fixed-size entry per record in LSN order and the same entries grouped by key, each key's by
+`first_seq`. Once a segment is sealed and every batch in it durable, `Store::absorb` (run with
+retention) drops its batches from RAM. A lookup of an older batch (a late retry, `has`/`get`,
+repair's `FetchLog`, a cursor reading old data, retention by stream) reads, per segment whose
+range covers it, that log's run from the segment's index: one read. Recovery streams the index
+a chunk at a time and absorbs each sealed segment as it goes, so it never holds the whole
+index either.
+
+Measured (`tests/memory.rs`, 200k batches, heap per retained batch): 1092 B before this
+layout, 338 B with interned logs and waiters only while pending, 6 B with sealed segments on
+disk. The active segment's batches still cost ~340 B each: with 1 GiB segments and 2 KiB
+batches that is ~170 MB, independent of retention.
 
 ## Guarantees (and what is traded away)
 
