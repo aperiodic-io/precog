@@ -1668,7 +1668,7 @@ fn at_its_retention_budget_the_preallocator_waits_out_recycles_and_still_stops_p
         log.retain(Some(3 * seg), None).unwrap();
     }
     // rolls take every spare: the preallocator waits for a recycle
-    let mut drain = |log: &mut Log, i: &mut u64| {
+    let drain = |log: &mut Log, i: &mut u64| {
         while !spare_files(d.path()).is_empty() {
             *i += fill(log, *i, 5, 1, 1000);
         }
