@@ -503,16 +503,14 @@ impl Spares {
         let tmp = self.dir.join(format!("spare-tmp-{n}"));
         let path = self.dir.join(format!("spare-{n:08}.log"));
         let mut f = File::create(&tmp)?;
-        let zeros = vec![0u8; 1 << 20];
+        let zeros = vec![0u8; 4 << 20]; // paced, each chunk is synced
         let (start, mut done) = (std::time::Instant::now(), 0u64);
         while done < self.size {
             let k = (self.size - done).min(zeros.len() as u64) as usize;
             f.write_all(&zeros[..k])?;
             done += k as u64;
             if paced && self.rate > 0 {
-                if done % (4 << 20) == 0 {
-                    f.sync_data()?;
-                }
+                f.sync_data()?;
                 let due = std::time::Duration::from_secs_f64(done as f64 / self.rate as f64);
                 if let Some(wait) = due.checked_sub(start.elapsed()) {
                     std::thread::sleep(wait);
