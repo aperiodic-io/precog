@@ -3,7 +3,8 @@ Feature: A node's log keeps every acknowledged batch through crashes, damage and
   An append is acknowledged only after its batch is on stable storage. A crash at any moment
   loses nothing acknowledged. A torn final write is truncated on restart; damage followed by
   later data stops the node instead of silently losing records. Retention bounds the log by
-  dropping its oldest sealed segments, and restarting scans only the active segment.
+  dropping its oldest sealed segments, after copying forward what streams still retain in them
+  under their own retention, and restarting scans only the active segment.
 
   Scenario: Acknowledged appends survive repeated SIGKILL
     Given a 1-node cluster with 4 MiB segments
@@ -25,6 +26,14 @@ Feature: A node's log keeps every acknowledged batch through crashes, damage and
     Then node 0 keeps at most 6 segments
     And the newest 500 batches are readable from node 0
     And the oldest batch is gone from node 0
+
+  Scenario: A low-volume stream keeps its own retention on every node while the node cap turns over
+    Given a 3-node cluster with 1 MiB segments and 4 MiB retention, where stream "low" retains 2 MiB
+    When a writer appends 300 batches of 2000 bytes to stream "low" with 3 copies
+    And a writer appends 8000 batches of 2000 bytes to stream "high" with 2 copies
+    And retention has run on every node
+    Then the oldest batch of stream "high" is gone from every node
+    And a cursor reads every batch of stream "low" from every node
 
   Scenario: A torn final write is truncated and the node carries on
     Given a 1-node cluster with 4 MiB segments

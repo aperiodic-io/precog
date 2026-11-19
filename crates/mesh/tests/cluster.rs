@@ -779,3 +779,119 @@ async fn a_conflict_without_a_majority_changes_nothing() {
     assert_eq!(held(&mc, 0, &id).await, Some(x));
     assert_eq!(held(&mc, 1, &id).await, Some(y));
 }
+
+/// The cleaner copies what streams retain forward before the node cap drops old segments. A
+/// copy keeps its batch's identity and bytes: a live feed must not push it again, a replay
+/// delivers each batch once in order, and repair finds nothing missing or conflicting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_copied_forward_is_not_new_to_feeds_or_peers() {
+    let mut c = cluster(2, &["a", "b"]);
+    for cfg in &mut c.cfgs {
+        cfg.segment_size = 64 << 10;
+        cfg.retention_bytes = Some(4 * (64 << 10));
+        cfg.streams.insert(
+            "low".into(),
+            precog_mesh::node::StreamConfig {
+                retention_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+        );
+    }
+    let n0 = start(&c, 0).await;
+    let n1 = start(&c, 1).await;
+    let mc = client(&c).await;
+    let mut low = Writer::new(mc.clone(), "low", "w", 1, 0, 2);
+    for i in 0..20u64 {
+        low.append(&[(i, &[1u8; 900][..])]).await.unwrap();
+    }
+    // a raw live feed on node 0: every push it gets, as the node sends it
+    let t = Duration::from_secs(2);
+    let conn = precog_mesh::transport::connect(&c.addrs[0], t)
+        .await
+        .unwrap();
+    let hello = Hello {
+        token: "secret-token".into(),
+        node_id: None,
+    };
+    conn.call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
+        .await
+        .unwrap();
+    let sub = Subscribe {
+        stream: Some("low".into()),
+        from_start: false,
+    };
+    let mut raw = conn
+        .subscribe(
+            Kind::Subscribe,
+            serde_json::to_vec(&sub).unwrap().into(),
+            1024,
+        )
+        .await
+        .unwrap();
+    assert!(
+        raw.recv().await.unwrap().body.is_empty(),
+        "the start marker"
+    );
+    let mut high = Writer::new(mc.clone(), "high", "w", 1, 0, 2);
+    for round in 0..10u64 {
+        for i in 0..100u64 {
+            high.append(&[(round * 100 + i, &[2u8; 900][..])])
+                .await
+                .unwrap();
+        }
+        for n in [&n0, &n1] {
+            n.apply_retention().await.unwrap();
+        }
+    }
+    let copied = n0
+        .metrics()
+        .lines()
+        .find_map(|l| l.strip_prefix("precog_retention_copied_batches_total "))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap();
+    assert!(
+        copied >= 40,
+        "low was copied forward, again and again: {copied}"
+    );
+    low.append(&[(20, b"new")]).await.unwrap();
+    let f = tokio::time::timeout(t, raw.recv()).await.unwrap().unwrap();
+    let b = Batch::parse(f.body).unwrap();
+    assert_eq!(
+        b.id.first_seq, 20,
+        "the first push is the new batch, no copy"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), raw.recv())
+            .await
+            .is_err(),
+        "and nothing else"
+    );
+    // a replay gets each batch once, in order
+    let mut replay = mc.subscribe(0, Some("low"), true).await.unwrap();
+    for seq in 0..21 {
+        let b = tokio::time::timeout(t, replay.next())
+            .await
+            .expect("replay stalled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.id.first_seq, seq);
+    }
+    // repair: the same identities and bytes on both nodes, nothing to fetch
+    for n in [&n0, &n1] {
+        assert_eq!(n.repair_pass().await, (0, vec![]));
+    }
+    let log = LogId {
+        stream: "low".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    assert_eq!(
+        n0.store.log_batches(&log, 0, 1 << 20),
+        n1.store.log_batches(&log, 0, 1 << 20)
+    );
+    assert_eq!(n0.store.log_batches(&log, 0, 1 << 20).len(), 21);
+    assert_eq!(
+        n0.store.frontiers(Some("low")),
+        n1.store.frontiers(Some("low"))
+    );
+}

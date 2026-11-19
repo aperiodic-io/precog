@@ -4,7 +4,8 @@
 //! `fdatasync` runs joins the next group, so syncs per second are bounded by the disk, not
 //! by the request rate. With write caching (`Config::flush_delay_ms`) the caller writes its batch
 //! under the log's lock and has its LSN at once; the thread only runs the deferred fsync when it
-//! falls due (idle or not), without the lock. Retention runs on the same thread. A storage fault
+//! falls due (idle or not), without the lock. Retention (the cleaner's copies and the drop of
+//! old segments) runs on the same thread. A storage fault
 //! (`precog_storage::Error::Fatal`) sets `fatal`: every later append fails, and the node
 //! must restart and recover.
 
@@ -12,7 +13,7 @@ use crate::proto::{Batch, encode_log_key, encode_replacing_key};
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
 use precog_storage::record::Meta;
-use precog_storage::{Config, Lsn, Reader};
+use precog_storage::{Config, Lsn, Reader, Sealed};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::oneshot;
@@ -26,6 +27,8 @@ pub struct WalStats {
     pub syncs: AtomicU64,
     pub segments: AtomicU64,
     pub recovery_scanned_bytes: AtomicU64,
+    /// Bytes of records in the log now (what the node cap bounds).
+    pub log_bytes: AtomicU64,
 }
 
 type Done = oneshot::Sender<Result<Lsn, String>>;
@@ -37,11 +40,14 @@ enum Req {
         replaces: bool,
         done: Done,
     },
-    Retain {
-        max_bytes: Option<u64>,
-        max_age_ms: Option<u64>,
-        done: oneshot::Sender<Result<Lsn, String>>,
+    /// Records copied forward as they are (one group), synced as appends are.
+    Copy {
+        records: Vec<(Meta, Arc<[u8]>)>,
+        done: Done,
     },
+    /// Syncs what is unsynced (write caching: the copies), then drops the sealed segments that
+    /// end at or below `end`.
+    Drop { end: Lsn, done: Done },
     /// Write caching: the flush deadline moved (`Log::flush_due`).
     Wake,
 }
@@ -73,6 +79,7 @@ impl Wal {
         let stats = Arc::new(WalStats::default());
         let s = log.stats();
         stats.segments.store(s.segments as u64, Ordering::Relaxed);
+        stats.log_bytes.store(s.log_bytes, Ordering::Relaxed);
         stats
             .recovery_scanned_bytes
             .store(s.recovery_scanned_bytes, Ordering::Relaxed);
@@ -161,21 +168,36 @@ impl Wal {
         }
     }
 
-    /// Applies retention; returns the new first LSN.
-    pub async fn retain(&self, max_bytes: Option<u64>, max_age_ms: Option<u64>) -> Result<Lsn> {
+    /// The sealed segments, oldest first, how many of them these bounds drop (`max_age_ms`
+    /// before now), and the log's bytes.
+    pub fn retirable(
+        &self,
+        max_bytes: Option<u64>,
+        max_age_ms: Option<u64>,
+    ) -> (Vec<Sealed>, usize, u64) {
+        let cutoff = max_age_ms.map(|a| now_ms().saturating_sub(a));
+        let log = self.log.lock();
+        let (segs, total) = log.segments();
+        (segs, log.retirable(max_bytes, cutoff), total)
+    }
+
+    /// Logs `records` again, unchanged, as one group; resolves with the first one's new LSN.
+    pub async fn copy(&self, records: Vec<(Meta, Arc<[u8]>)>) -> Result<Lsn> {
+        self.request(|done| Req::Copy { records, done }).await
+    }
+
+    /// Makes everything written durable, then drops the sealed segments that end at or below
+    /// `end`; returns the new first LSN.
+    pub async fn drop_until(&self, end: Lsn) -> Result<Lsn> {
+        self.request(|done| Req::Drop { end, done }).await
+    }
+
+    async fn request(&self, req: impl FnOnce(Done) -> Req) -> Result<Lsn> {
         let (done, rx) = oneshot::channel();
         self.tx
-            .send(Req::Retain {
-                max_bytes,
-                max_age_ms,
-                done,
-            })
+            .send(req(done))
             .map_err(|_| anyhow::anyhow!("wal writer stopped"))?;
-        match rx.await {
-            Ok(Ok(lsn)) => Ok(lsn),
-            Ok(Err(e)) => bail!("storage: {e}"),
-            Err(_) => bail!("wal writer dropped request"),
-        }
+        Self::durable(rx).await
     }
 }
 
@@ -200,6 +222,7 @@ fn publish(log: &precog_storage::Log, stats: &WalStats, fatal: &AtomicBool) {
     stats.syncs.store(s.syncs, Ordering::Relaxed);
     stats.bytes.store(s.bytes, Ordering::Relaxed);
     stats.segments.store(s.segments as u64, Ordering::Relaxed);
+    stats.log_bytes.store(s.log_bytes, Ordering::Relaxed);
 }
 
 /// Runs the due deferred fsync without holding the log, so writers go on meanwhile.
@@ -254,19 +277,20 @@ fn writer(
             }
         };
         match first {
-            Req::Retain {
-                max_bytes,
-                max_age_ms,
-                done,
-            } => {
-                let cutoff = max_age_ms.map(|a| now_ms().saturating_sub(a));
+            Req::Copy { records, done } => {
+                let items: Vec<(Meta, &[u8])> =
+                    records.iter().map(|(m, p)| (m.clone(), &p[..])).collect();
                 let mut log = log.lock();
-                let r = log.retain(max_bytes, cutoff).map_err(|e| e.to_string());
-                stats
-                    .segments
-                    .store(log.stats().segments as u64, Ordering::Relaxed);
-                fatal.store(log.is_fenced(), Ordering::Release);
+                let r = log.append(&items).map_err(|e| e.to_string());
+                publish(&log, &stats, &fatal);
                 let _ = done.send(r);
+                continue;
+            }
+            Req::Drop { end, done } => {
+                let mut log = log.lock();
+                let r = log.flush().and_then(|_| log.drop_until(end));
+                publish(&log, &stats, &fatal);
+                let _ = done.send(r.map_err(|e| e.to_string()));
                 continue;
             }
             Req::Append {
@@ -287,7 +311,7 @@ fn writer(
                     size += batch.bytes.len();
                     group.push((batch, replaces, done));
                 }
-                Ok(r @ Req::Retain { .. }) => {
+                Ok(r @ (Req::Copy { .. } | Req::Drop { .. })) => {
                     pending = Some(r);
                     break;
                 }

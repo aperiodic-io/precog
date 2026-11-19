@@ -10,7 +10,7 @@
 use crate::dedup::{self, Streams};
 use crate::proto::*;
 use crate::rpc::{BoxRead, BoxWrite, RpcClient, read_frame, write_loop};
-use crate::store::{Cursor, Reserve, State, Store};
+use crate::store::{Cursor, Kept, Reserve, State, Store};
 use crate::transport::Addr;
 use crate::wal::Wal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -224,6 +224,46 @@ pub struct Node {
     pos_seq: AtomicU64,
     /// The event time (us) of this node's last position commit: it never goes back.
     pos_time: AtomicU64,
+    /// Held while the cleaner copies batches forward and while a replacement takes a batch's
+    /// place, so a copy never carries bytes a replacement superseded.
+    clean: tokio::sync::Mutex<()>,
+    copied_bytes: AtomicU64,
+    copied_batches: AtomicU64,
+    /// Batches the node cap cut from streams that still retained them, by stream.
+    forced: parking_lot::Mutex<BTreeMap<String, u64>>,
+}
+
+/// Most bytes the cleaner copies forward in one group (one write to the log, as a client group).
+const COPY_CHUNK: u64 = 4 << 20;
+
+/// What copying `cost` bytes of records in groups of at most `limit` adds to the log at most: a
+/// new segment's header for each group (`groups`: any two groups in a row hold more than
+/// `limit`).
+fn copy_bytes(cost: u64, limit: u64) -> u64 {
+    if cost == 0 {
+        return 0;
+    }
+    cost + precog_storage::SEG_HEADER * (2 * cost / limit + 1)
+}
+
+/// Whether copying `cost` bytes in groups of at most `limit` fits in `room` bytes.
+fn fits(cost: u64, limit: u64, room: u64) -> bool {
+    copy_bytes(cost, limit) <= room
+}
+
+/// The kept batches, in order, in groups of at most `limit` bytes (a larger one alone).
+fn groups(kept: &[Kept], limit: u64) -> Vec<Vec<u64>> {
+    let mut out: Vec<(u64, Vec<u64>)> = vec![];
+    for k in kept {
+        match out.last_mut() {
+            Some((size, g)) if *size + k.cost <= limit => {
+                *size += k.cost;
+                g.push(k.lsn);
+            }
+            _ => out.push((k.cost, vec![k.lsn])),
+        }
+    }
+    out.into_iter().map(|g| g.1).collect()
 }
 
 /// The internal compacted stream of consumer positions, keyed by group and stream.
@@ -460,6 +500,10 @@ impl Node {
             },
             pos_seq: AtomicU64::new(0),
             pos_time: AtomicU64::new(0),
+            clean: Default::default(),
+            copied_bytes: AtomicU64::new(0),
+            copied_batches: AtomicU64::new(0),
+            forced: Default::default(),
         });
         Ok(node)
     }
@@ -632,6 +676,9 @@ impl Node {
         Ok(())
     }
 
+    /// Applies each stream's own retention, then the node's bounds. Before the node drops its
+    /// oldest segments, the cleaner copies forward the batches in them that streams still retain
+    /// under their own retention (docs/ARCHITECTURE.md, "The segment cleaner").
     pub async fn apply_retention(&self) -> Result<()> {
         // sealed segments' batches leave RAM (their index is on disk)
         self.store.absorb();
@@ -644,18 +691,141 @@ impl Node {
         if self.cfg.retention_bytes.is_none() && self.cfg.retention_ms.is_none() {
             return Ok(());
         }
-        let floor = self
+        let (segs, want, total) = self
             .wal
-            .retain(self.cfg.retention_bytes, self.cfg.retention_ms)
-            .await?;
+            .retirable(self.cfg.retention_bytes, self.cfg.retention_ms);
+        // absorbed ones only: a segment with a batch not marked durable yet waits for a pass
+        let absorbed = self.store.absorbed_end();
+        let segs: Vec<_> = segs.into_iter().take_while(|s| s.end <= absorbed).collect();
+        // the node's age limit is a ceiling: nothing older than it is copied
+        let min_time = self.cfg.retention_ms.map_or(0, |a| now.saturating_sub(a));
+        let cap = self.cfg.retention_bytes.unwrap_or(u64::MAX);
+        let limit = self.copy_limit();
+        // the segments the bounds drop, and as many more as the copies of what streams retain in
+        // them need room for
+        let (mut n, mut left, mut keep) = (0, total, HashMap::<String, Vec<Kept>>::new());
+        let mut cost = 0;
+        while let Some(s) = segs.get(n)
+            && (n < want || !fits(cost, limit, cap.saturating_sub(left)))
+        {
+            for (stream, v) in self
+                .store
+                .retained(&[s.base], |s| self.retains(s), min_time)
+            {
+                cost += v.iter().map(|k| k.cost).sum::<u64>();
+                keep.entry(stream).or_default().extend(v);
+            }
+            left -= s.bytes;
+            n += 1;
+        }
+        let Some(end) = segs[..n].last().map(|s| s.end) else {
+            return Ok(());
+        };
+        let bases: Vec<u64> = segs[..n].iter().map(|s| s.base).collect();
+        let budget = cap.saturating_sub(left);
+        self.fit(&mut keep, budget);
+        self.copy_forward(keep).await?;
+        self.store.vacate(&bases);
+        let floor = self.wal.drop_until(end).await?;
         self.store.trim(floor);
+        Ok(())
+    }
+
+    /// The stream has a retention of its own, kept through the node cap (a compacted stream
+    /// keeps its newest values in its snapshot instead).
+    fn retains(&self, stream: &str) -> bool {
+        self.cfg.streams.get(stream).is_some_and(|c| {
+            !c.compacted && (c.retention_bytes.is_some() || c.retention_ms.is_some())
+        })
+    }
+
+    fn copy_limit(&self) -> u64 {
+        COPY_CHUNK.min(self.cfg.segment_size - precog_storage::SEG_HEADER)
+    }
+
+    /// The node cap wins over what streams retain: while copying `keep` would take the log past
+    /// `budget` bytes, cuts the oldest batches of the stream furthest over its share of the cap.
+    /// Every stream with a retention of its own has an equal share, so that is the one
+    /// retaining the most bytes; cut it down to the next one, then both, and so on. Counts them.
+    fn fit(&self, keep: &mut HashMap<String, Vec<Kept>>, budget: u64) {
+        let limit = self.copy_limit();
+        let mut cost: u64 = keep.values().flatten().map(|k| k.cost).sum();
+        while !fits(cost, limit, budget) {
+            let mut most: Vec<(u64, String)> = keep
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(s, _)| (self.store.stream_bytes(s), s.clone()))
+                .collect();
+            most.sort_unstable_by(|a, b| b.cmp(a));
+            let next = most.get(1).map_or(0, |x| x.0);
+            let Some((_, stream)) = most.into_iter().next() else {
+                break;
+            };
+            let mut kept: HashMap<u64, Kept> = keep[&stream].iter().map(|k| (k.lsn, *k)).collect();
+            let cut = self.store.cut(&stream, |bytes, lsn| {
+                if fits(cost, limit, budget) || bytes < next {
+                    return false;
+                }
+                if let Some(k) = kept.remove(&lsn) {
+                    cost -= k.cost;
+                }
+                true
+            });
+            keep.insert(stream.clone(), kept.into_values().collect());
+            if cut == 0 {
+                tracing::error!("retention: stream {stream} could not be cut");
+                break;
+            }
+            *self.forced.lock().entry(stream).or_default() += cut as u64;
+        }
+    }
+
+    /// Logs the kept batches again, oldest first, in groups of at most `copy_limit` bytes, each
+    /// its own write to the log (appends go on between them) and each taking its batches'
+    /// place in the store once written.
+    async fn copy_forward(&self, keep: HashMap<String, Vec<Kept>>) -> Result<()> {
+        let mut all: Vec<Kept> = keep.into_values().flatten().collect();
+        all.sort_unstable_by_key(|k| (k.time, k.lsn));
+        for lsns in groups(&all, self.copy_limit()) {
+            let _g = self.clean.lock().await;
+            let recs = lsns
+                .iter()
+                .map(|&l| {
+                    self.wal
+                        .reader
+                        .read(l)?
+                        .ok_or_else(|| anyhow!("lsn {l} is gone"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let first = self
+                .wal
+                .copy(
+                    recs.iter()
+                        .map(|r| (r.meta.clone(), r.payload.clone()))
+                        .collect(),
+                )
+                .await?;
+            self.store.moved(
+                recs.iter()
+                    .zip(first..)
+                    .map(|(r, lsn)| (r.lsn, lsn, &r.meta, r.payload.len() as u32)),
+            );
+            let bytes: usize = recs
+                .iter()
+                .map(|r| precog_storage::record::encoded_len(r.meta.key.len(), r.payload.len()))
+                .sum();
+            self.copied_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            self.copied_batches
+                .fetch_add(recs.len() as u64, Ordering::Relaxed);
+        }
         Ok(())
     }
 
     /// Prometheus text exposition of `status()`.
     pub fn metrics(&self) -> String {
         let s = self.status();
-        let rows: [(&str, &str, u64); 11] = [
+        let w = &self.wal.stats;
+        let rows: [(&str, &str, u64); 14] = [
             ("precog_batches", "gauge", s.batches),
             ("precog_events", "gauge", s.events),
             ("precog_bytes", "gauge", s.bytes),
@@ -671,10 +841,31 @@ impl Node {
             ("precog_dedup_entries", "gauge", s.dedup_entries),
             ("precog_dedup_window_seconds", "gauge", s.dedup_window_s),
             ("precog_fatal", "gauge", self.is_fatal() as u64),
+            (
+                "precog_log_bytes",
+                "gauge",
+                w.log_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "precog_retention_copied_bytes_total",
+                "counter",
+                self.copied_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "precog_retention_copied_batches_total",
+                "counter",
+                self.copied_batches.load(Ordering::Relaxed),
+            ),
         ];
         let mut out = String::new();
         for (name, kind, v) in rows {
             out.push_str(&format!("# TYPE {name} {kind}\n{name} {v}\n"));
+        }
+        out.push_str("# TYPE precog_retention_forced_total counter\n");
+        for (stream, n) in self.forced.lock().iter() {
+            out.push_str(&format!(
+                "precog_retention_forced_total{{stream=\"{stream}\"}} {n}\n"
+            ));
         }
         // per reader group and stream: events not yet covered by its committed position, and how
         // long ago it committed (what kafka-exporter gives live-ingestion's alerts)
@@ -1493,6 +1684,7 @@ impl Node {
         else {
             bail!("no batch is held by a majority of {n} nodes");
         };
+        let _g = self.clean.lock().await;
         anyhow::ensure!(
             self.store.replaceable(theirs),
             "the majority's batch has another range"
@@ -1581,6 +1773,53 @@ pub fn parse_frame_ack(f: &Frame) -> Result<Ack> {
         return Err(anyhow!("expected ack, got {:?}", f.kind));
     }
     Ack::decode(f.body.clone())
+}
+
+#[cfg(test)]
+mod cleaner_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Why: the node never exceeds its cap because of copying, so what it reserves for a
+        /// copy must cover what the copy adds: its records and a segment header for each group
+        /// (each may roll the log). Records of just over half a group are the worst case.
+        #[test]
+        fn what_a_copy_reserves_covers_its_records_and_a_header_per_group(
+            costs in prop::collection::vec(1u64..3000, 0..40), limit in 1000u64..4000,
+        ) {
+            let kept: Vec<Kept> = costs.iter().zip(0..).map(|(&cost, lsn)| Kept { lsn, time: 0, cost }).collect();
+            let gs = groups(&kept, limit);
+            prop_assert_eq!(gs.concat(), (0..kept.len() as u64).collect::<Vec<_>>(), "all, in order");
+            for g in &gs {
+                let size: u64 = g.iter().map(|&l| costs[l as usize]).sum();
+                prop_assert!(g.len() == 1 || size <= limit, "a group holds at most `limit`");
+            }
+            let cost: u64 = costs.iter().sum();
+            prop_assert!(copy_bytes(cost, limit) >= cost + precog_storage::SEG_HEADER * gs.len() as u64);
+        }
+    }
+
+    #[test]
+    fn copies_of_just_over_half_a_group_each_take_a_group_and_the_reserve_holds() {
+        let kept: Vec<Kept> = (0..10)
+            .map(|lsn| Kept {
+                lsn,
+                time: 0,
+                cost: 501,
+            })
+            .collect();
+        assert_eq!(groups(&kept, 1000).len(), 10);
+        assert_eq!(
+            copy_bytes(5010, 1000),
+            5010 + precog_storage::SEG_HEADER * 11
+        );
+        assert_eq!(copy_bytes(0, 1000), 0, "nothing to copy reserves nothing");
+        assert_eq!(copy_bytes(1, 1000), 1 + precog_storage::SEG_HEADER);
+        // a copy fits exactly when the room is what it reserves
+        assert!(fits(1, 1000, 1 + precog_storage::SEG_HEADER));
+        assert!(!fits(1, 1000, precog_storage::SEG_HEADER));
+    }
 }
 
 #[cfg(test)]

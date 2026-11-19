@@ -411,3 +411,325 @@ fn without_write_caching_batches_queued_during_an_fsync_share_the_next_one() {
     let syncs = wal.stats.syncs.load(std::sync::atomic::Ordering::Relaxed);
     assert!(syncs < 100, "{syncs} fsyncs for 200 batches");
 }
+
+fn on(stream: &str, seq: u64, size: usize) -> Bytes {
+    let log = LogId {
+        stream: stream.into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let p = vec![(seq % 251) as u8; size];
+    Batch::encode(&log, seq, &[(seq, &p[..])]).unwrap()
+}
+
+fn id(stream: &str, seq: u64) -> BatchId {
+    BatchId {
+        log: LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        },
+        first_seq: seq,
+    }
+}
+
+/// A counter or gauge of `node.metrics()` (summed over its labels).
+fn metric(node: &Node, name: &str) -> u64 {
+    node.metrics()
+        .lines()
+        .filter(|l| l.split([' ', '{']).next() == Some(name))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// Every batch of the stream a cursor from its start reads, by sequence.
+fn cursor_seqs(node: &Node, stream: &str) -> Vec<u64> {
+    let mut c = precog_mesh::store::Cursor::new();
+    let mut seqs = vec![];
+    loop {
+        let (bs, next) = node.store.read_cursor(stream, &c, 1 << 20);
+        if bs.is_empty() {
+            return seqs;
+        }
+        seqs.extend(
+            bs.into_iter()
+                .map(|b| Batch::parse(b).unwrap().id.first_seq),
+        );
+        c = next;
+    }
+}
+
+fn stream_cfg(retention_bytes: u64) -> precog_mesh::node::StreamConfig {
+    precog_mesh::node::StreamConfig {
+        retention_bytes: Some(retention_bytes),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_low_volume_stream_keeps_its_own_retention_while_the_node_cap_turns_over() {
+    // Why: every stream shares one segment log, and the node cap drops its oldest segments. A
+    // stream far below its own budget keeps its history, as a Redpanda topic keeps its own
+    // retention; it must not lose it at the node's time horizon (cap / ingest rate).
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    let cap = 4 * 64 * 1024;
+    c.retention_bytes = Some(cap);
+    let one = on("low", 0, 1000).len() as u64;
+    c.streams.insert("low".into(), stream_cfg(30 * one));
+    // declared without a retention of its own, or compacted (its snapshot keeps it): not copied
+    c.streams.insert("bare".into(), Default::default());
+    c.streams.insert(
+        "kv".into(),
+        precog_mesh::node::StreamConfig {
+            retention_bytes: Some(1 << 30),
+            compacted: true,
+            ..Default::default()
+        },
+    );
+    let node = Node::open(c.clone()).await.unwrap();
+    assert!(node.append(1, on("bare", 0, 1000)).await.is_success());
+    let kv = LogId {
+        stream: "kv".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let b = Batch::encode_keyed(&kv, 0, &[(0, b"k", b"v")]).unwrap();
+    assert!(node.append(1, b).await.is_success());
+    let mut low = vec![];
+    for seq in 0..20 {
+        let b = on("low", seq, 1000);
+        assert!(node.append(1, b.clone()).await.is_success());
+        low.push(b);
+    }
+    // the high-volume stream has no retention of its own: the node cap bounds it
+    for round in 0..20u64 {
+        for i in 0..100 {
+            let seq = round * 100 + i;
+            assert!(node.append(1, on("high", seq, 1000)).await.is_success());
+        }
+        node.apply_retention().await.unwrap();
+        let bytes = metric(&node, "precog_log_bytes");
+        assert!(
+            bytes > 0 && bytes <= cap,
+            "round {round}: the cap holds with the copies ({bytes})"
+        );
+    }
+    assert!(node.store.get(&id("high", 0)).is_none(), "high turned over");
+    assert!(
+        node.store.get(&id("bare", 0)).is_none(),
+        "no retention of its own: not kept"
+    );
+    assert!(
+        node.store.read("kv", 0, 10).0.is_empty(),
+        "compacted: not copied"
+    );
+    assert_eq!(
+        node.latest("kv"),
+        vec![(b"k".to_vec(), Bytes::from("v"))],
+        "its snapshot keeps it"
+    );
+    assert!(node.store.get(&id("high", 1999)).is_some());
+    let check = |node: &Node, when: &str| {
+        for (seq, b) in low.iter().enumerate() {
+            let got = node.store.get(&id("low", seq as u64));
+            assert_eq!(got.map(|x| x.bytes), Some(b.clone()), "{when}: low {seq}");
+        }
+        assert_eq!(
+            cursor_seqs(node, "low"),
+            (0..20).collect::<Vec<_>>(),
+            "{when}"
+        );
+        assert_eq!(
+            node.store.read("low", 0, 1000).0.len(),
+            20,
+            "{when}: once each"
+        );
+    };
+    check(&node, "after the turnover");
+    let copied = metric(&node, "precog_retention_copied_batches_total");
+    assert!(
+        copied >= 20 * 4,
+        "low was copied on every reclaim: {copied}"
+    );
+    assert!(metric(&node, "precog_retention_copied_bytes_total") >= copied * one);
+    assert_eq!(metric(&node, "precog_retention_forced_total"), 0);
+    drop(node);
+    let node = Node::open(c).await.unwrap();
+    check(&node, "after a restart");
+    node.apply_retention().await.unwrap();
+    check(&node, "after a restart and retention");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn when_streams_retain_more_than_the_cap_the_one_furthest_over_its_share_is_cut() {
+    // Why: the node cap protects the disk, so it wins over what streams retain. The cut takes
+    // the oldest batches of the stream holding most beyond its share (here half the cap each),
+    // never from a stream within its share, and the metric names whom it cut.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    let cap = 4 * 64 * 1024;
+    c.retention_bytes = Some(cap);
+    for s in ["big", "small"] {
+        c.streams.insert(s.into(), stream_cfg(1 << 30));
+    }
+    let node = Node::open(c).await.unwrap();
+    for seq in 0..20 {
+        assert!(node.append(1, on("small", seq, 1000)).await.is_success());
+    }
+    for seq in 0..400 {
+        assert!(node.append(1, on("big", seq, 1000)).await.is_success());
+        if seq % 50 == 49 {
+            node.apply_retention().await.unwrap();
+            let bytes = metric(&node, "precog_log_bytes");
+            assert!(bytes > 0 && bytes <= cap, "at big {seq}: {bytes}");
+        }
+    }
+    assert_eq!(cursor_seqs(&node, "small"), (0..20).collect::<Vec<_>>());
+    let big = cursor_seqs(&node, "big");
+    let kept = big[0]..400;
+    assert!(big[0] > 0, "its oldest went");
+    assert!(
+        big.len() > 150,
+        "no more than the cap needs: kept {}",
+        big.len()
+    );
+    assert_eq!(big, kept.collect::<Vec<_>>(), "only its oldest: no hole");
+    let m = node.metrics();
+    let forced = |s: &str| {
+        m.lines()
+            .find(|l| l.starts_with(&format!("precog_retention_forced_total{{stream=\"{s}\"}}")))
+            .and_then(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    assert!(forced("big") >= big[0], "{m}");
+    assert_eq!(forced("small"), 0, "{m}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once() {
+    // Why: the cleaner writes the copies, makes them durable, then deletes the old segment. A
+    // crash at any point must leave the old copy or the new one, never neither, and recovery
+    // must keep each batch exactly once by its identity.
+    let cases: [(&str, u64, precog_storage::Failpoints); 4] = [
+        (
+            "the copy's fsync fails",
+            0,
+            precog_storage::Failpoints {
+                fail_data_sync_after: Some(0),
+                fail_at: None,
+            },
+        ),
+        (
+            "write caching: the fsync before the delete fails",
+            60_000,
+            precog_storage::Failpoints {
+                fail_data_sync_after: Some(0),
+                fail_at: None,
+            },
+        ),
+        (
+            "copied, not deleted",
+            0,
+            precog_storage::Failpoints {
+                fail_data_sync_after: None,
+                fail_at: Some("retain:before_manifest"),
+            },
+        ),
+        (
+            "deleted, files left",
+            0,
+            precog_storage::Failpoints {
+                fail_data_sync_after: None,
+                fail_at: Some("retain:after_manifest"),
+            },
+        ),
+    ];
+    for (when, flush_delay_ms, fp) in cases {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = config(d.path());
+        c.retention_bytes = Some(4 * 64 * 1024);
+        c.streams.insert("low".into(), stream_cfg(1 << 20));
+        c.flush_delay_ms = flush_delay_ms;
+        c.flush_bytes = 1 << 30;
+        {
+            let node = Node::open(c.clone()).await.unwrap();
+            for seq in 0..40 {
+                assert!(node.append(1, on("low", seq, 1000)).await.is_success());
+            }
+            for seq in 0..300 {
+                assert!(node.append(1, on("high", seq, 1000)).await.is_success());
+            }
+        }
+        // reopen with the fault armed: the first fsync of this process is the cleaner's
+        let mut armed = c.clone();
+        armed.storage_failpoints = fp;
+        {
+            let node = Node::open(armed).await.unwrap();
+            assert!(
+                node.apply_retention().await.is_err(),
+                "{when}: the fault fired"
+            );
+            assert!(node.is_fatal(), "{when}");
+        }
+        for pass in ["after the crash", "after the next retention"] {
+            let node = Node::open(c.clone()).await.unwrap();
+            if pass != "after the crash" {
+                node.apply_retention().await.unwrap();
+            }
+            assert_eq!(
+                cursor_seqs(&node, "low"),
+                (0..40).collect::<Vec<_>>(),
+                "{when} {pass}"
+            );
+            assert_eq!(
+                node.store.read("low", 0, 1000).0.len(),
+                40,
+                "{when} {pass}: once each"
+            );
+            for seq in 0..40 {
+                assert!(
+                    node.store.get(&id("low", seq)).is_some(),
+                    "{when} {pass}: {seq}"
+                );
+            }
+            let s = node.status();
+            let f = s.logs.iter().find(|f| f.log.stream == "low").unwrap();
+            assert_eq!((f.contiguous, f.high), (40, 40), "{when} {pass}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_over_the_cap_alike_are_cut_alike() {
+    // Why: with equal shares, the cut takes from whichever retains most, down to the next
+    // one, then from both: two streams written alike keep alike, each its newest.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    let cap = 4 * 64 * 1024;
+    c.retention_bytes = Some(cap);
+    for s in ["a", "b"] {
+        c.streams.insert(s.into(), stream_cfg(1 << 30));
+    }
+    let node = Node::open(c).await.unwrap();
+    for seq in 0..300 {
+        for s in ["a", "b"] {
+            assert!(node.append(1, on(s, seq, 1000)).await.is_success());
+        }
+        if seq % 50 == 49 {
+            node.apply_retention().await.unwrap();
+            let bytes = metric(&node, "precog_log_bytes");
+            assert!(bytes > 0 && bytes <= cap, "at {seq}: {bytes}");
+        }
+    }
+    let (a, b) = (cursor_seqs(&node, "a"), cursor_seqs(&node, "b"));
+    assert!(a.len().abs_diff(b.len()) <= 2, "{} vs {}", a.len(), b.len());
+    for v in [&a, &b] {
+        assert!(v[0] > 0 && v.len() > 50);
+        assert_eq!(*v, (v[0]..300).collect::<Vec<_>>());
+    }
+    assert_eq!(
+        metric(&node, "precog_retention_forced_total") as usize,
+        600 - a.len() - b.len()
+    );
+}
