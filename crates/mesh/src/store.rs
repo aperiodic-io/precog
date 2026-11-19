@@ -9,7 +9,7 @@
 //! ponytail: ~150 bytes of RAM per retained batch; move the per-log index to disk (redb or the
 //! segment index files) if retention keeps more than ~10M batches per node.
 
-use crate::proto::{Batch, BatchId, Event, Frontier, LogId, decode_log_key};
+use crate::proto::{Batch, BatchId, Event, Frontier, LogId, decode_record_key};
 use parking_lot::Mutex;
 use precog_storage::{Lsn, Reader};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -78,6 +78,9 @@ struct Inner {
     /// Per writer log: every sequence below this is durable here or trimmed (kept as batches
     /// arrive, so frontiers, and with them repair, cost O(logs) instead of O(batches)).
     contig: HashMap<LogId, u64>,
+    /// LSNs of replaced batches: no longer in `order`, but durable, so `contiguous` steps over
+    /// them.
+    superseded: BTreeSet<Lsn>,
 }
 
 #[derive(Default)]
@@ -142,6 +145,36 @@ impl Inner {
         self.contig.insert(log.clone(), c);
     }
 
+    /// Drops the durable batch at `log`'s `first_seq` from the index (a replacement takes it).
+    fn unindex(&mut self, log: &LogId, first_seq: u64) {
+        let Some(lsn) = self
+            .logs
+            .get_mut(log)
+            .and_then(|m| m.remove(&first_seq))
+            .and_then(|e| e.lsn)
+        else {
+            return;
+        };
+        if let Some((_, count, _, len)) = self.order.remove(&lsn) {
+            self.events -= count as u64;
+            self.bytes -= len as u64;
+        }
+        if let Some(s) = self.by_stream.get_mut(&log.stream)
+            && let Some((_, _, len)) = s.order.remove(&lsn)
+        {
+            s.bytes -= len as u64;
+        }
+        // ponytail: one stays behind per replacement below `contiguous` (rare: a reused identity)
+        self.superseded.insert(lsn);
+    }
+
+    fn advance_contiguous(&mut self) {
+        while self.order.contains_key(&self.contiguous) || self.superseded.remove(&self.contiguous)
+        {
+            self.contiguous += 1;
+        }
+    }
+
     /// Forgets the durable batch at `lsn` (retention): later copies of it are `Expired`.
     fn forget(&mut self, lsn: Lsn) {
         let Some((id, count, _, len)) = self.order.remove(&lsn) else {
@@ -187,7 +220,7 @@ impl Store {
             let inner = &mut *g;
             inner.contiguous = s.reader.next_lsn(); // everything recovered is durable
             for e in entries {
-                let log = decode_log_key(&e.meta.key)?;
+                let (log, replaces) = decode_record_key(&e.meta.key)?;
                 let id = BatchId {
                     log: log.clone(),
                     first_seq: e.meta.first_seq,
@@ -207,6 +240,28 @@ impl Store {
                         && x.shape.count == shape.count
                     {
                         continue; // logged twice (a repair raced a replicate): keep the first
+                    }
+                    if replaces && s0 == id.first_seq && x.shape.end == shape.end {
+                        inner.unindex(&log, id.first_seq);
+                        let map = inner.logs.entry(log.clone()).or_default();
+                        let (tx, _) = watch::channel(State::Durable);
+                        map.insert(
+                            id.first_seq,
+                            Entry {
+                                shape,
+                                lsn: Some(e.lsn),
+                                state: tx,
+                            },
+                        );
+                        inner.index(
+                            e.lsn,
+                            &id,
+                            shape.count,
+                            shape.crc,
+                            shape.len,
+                            e.meta.time_ms,
+                        );
+                        continue;
                     }
                     anyhow::bail!(
                         "conflicting batches in the log at lsn {}: {:?} seq {}",
@@ -303,9 +358,40 @@ impl Store {
         e.state.send_replace(State::Durable);
         let sh = e.shape;
         inner.index(lsn, id, sh.count, sh.crc, sh.len, now_ms());
-        while inner.order.contains_key(&inner.contiguous) {
-            inner.contiguous += 1;
-        }
+        inner.advance_contiguous();
+        drop(g);
+        self.durable_notify.notify_waiters();
+    }
+
+    /// Whether `b` can replace what this node holds under its identity: a durable batch with
+    /// other bytes over exactly the same sequence range. ponytail: an overlap of another shape
+    /// stays a logged conflict; replace those too if writers ever reuse identities that way.
+    pub fn replaceable(&self, b: &Batch) -> bool {
+        let g = self.inner.lock();
+        g.logs
+            .get(&b.id.log)
+            .and_then(|m| m.get(&b.id.first_seq))
+            .is_some_and(|e| {
+                e.lsn.is_some() && e.shape.end == b.end_seq() && e.shape.crc != b.ident
+            })
+    }
+
+    /// `b`, logged at `lsn` with a replacing key, takes the place of the `replaceable` batch.
+    pub fn replace(&self, b: &Batch, lsn: Lsn) {
+        let mut g = self.inner.lock();
+        let inner = &mut *g;
+        inner.unindex(&b.id.log, b.id.first_seq);
+        let (tx, _) = watch::channel(State::Durable);
+        inner.logs.entry(b.id.log.clone()).or_default().insert(
+            b.id.first_seq,
+            Entry {
+                shape: Shape::of(b),
+                lsn: Some(lsn),
+                state: tx,
+            },
+        );
+        inner.index(lsn, &b.id, b.count, b.ident, b.bytes.len() as u32, now_ms());
+        inner.advance_contiguous();
         drop(g);
         self.durable_notify.notify_waiters();
     }
@@ -963,6 +1049,77 @@ mod tests {
         let c = b("w", 1, 2, &[(1, b"x")]);
         t.log_only(&c, batch_crc(&c.bytes));
         assert_eq!(t.reload().unwrap().totals().0, 2);
+    }
+
+    #[test]
+    fn a_replacing_record_takes_a_conflicting_batchs_place_at_load() {
+        // Why: a node that held bytes a majority does not logs the majority's batch with a
+        // replacing key; a restart must keep the replacement, not refuse the log
+        let replacing = |t: &mut T, x: &Batch| {
+            let m = Meta {
+                key: crate::proto::encode_replacing_key(&x.id.log),
+                first_seq: x.id.first_seq,
+                count: x.count,
+                tag: x.ident,
+                time_ms: 0,
+            };
+            t.log.append(&[(m, &x.bytes[..])]).unwrap();
+        };
+        let y = b("w", 1, 0, &[(1, b"y"), (2, b"yy")]);
+        let x = b("w", 1, 0, &[(1, b"x"), (2, b"xx")]);
+        let mut t = store();
+        t.log_only(&y, y.ident);
+        replacing(&mut t, &x);
+        let s = t.reload().unwrap();
+        assert_eq!(s.get(&x.id).unwrap().bytes, x.bytes);
+        assert_eq!(s.totals(), (1, 2, x.bytes.len() as u64));
+        assert!(matches!(s.reserve(&x), Reserve::Duplicate(_)));
+        // a replacement over another range is still a conflict
+        let mut t = store();
+        t.log_only(&y, y.ident);
+        replacing(&mut t, &b("w", 1, 0, &[(1, b"x")]));
+        assert!(t.reload().is_err());
+        // one whose original retention already dropped is an ordinary batch
+        let mut t = store();
+        replacing(&mut t, &x);
+        assert_eq!(t.reload().unwrap().totals().0, 1);
+    }
+
+    #[test]
+    fn a_replacement_takes_the_batchs_place_and_the_feed_steps_over_it() {
+        let mut t = store();
+        // an earlier batch still on its way to disk holds the feed back
+        let p = b("v", 1, 0, &[(1, b"p")]);
+        assert!(matches!(t.s.reserve(&p), Reserve::New));
+        let p_lsn = t.log.append(&[(Meta::default(), &p.bytes[..])]).unwrap();
+        let y = b("w", 1, 0, &[(1, b"y")]);
+        t.s.reserve(&y);
+        t.durable(&y);
+        assert_eq!(t.s.durable_len(), 0);
+        let x = b("w", 1, 0, &[(1, b"x")]);
+        assert!(t.s.replaceable(&x));
+        assert!(!t.s.replaceable(&y), "the same bytes");
+        assert!(
+            !t.s.replaceable(&b("w", 1, 0, &[(1, b"x"), (2, b"z")])),
+            "another range"
+        );
+        assert!(
+            !t.s.replaceable(&b("v", 1, 0, &[(1, b"q")])),
+            "still pending"
+        );
+        assert!(
+            !t.s.replaceable(&b("u", 1, 0, &[(1, b"q")])),
+            "nothing there"
+        );
+        let lsn = t.log.append(&[(Meta::default(), &x.bytes[..])]).unwrap();
+        t.s.replace(&x, lsn);
+        assert_eq!(t.s.get(&x.id).unwrap().bytes, x.bytes);
+        assert_eq!(t.s.totals(), (1, 1, x.bytes.len() as u64));
+        t.s.mark_durable(&p.id, p_lsn);
+        assert_eq!(t.s.durable_len(), lsn + 1, "past the replaced batch's LSN");
+        let (fed, _) = t.s.tail(0, None, 1 << 20);
+        let fed: Vec<_> = fed.iter().map(|b| b.bytes.clone()).collect();
+        assert_eq!(fed, [p.bytes.clone(), x.bytes.clone()]);
     }
 
     #[test]
