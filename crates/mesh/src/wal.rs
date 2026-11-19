@@ -29,6 +29,8 @@ pub struct WalStats {
     pub recovery_scanned_bytes: AtomicU64,
     /// Bytes of records in the log now (what the node cap bounds).
     pub log_bytes: AtomicU64,
+    /// The newest append time given (ms): no record is stamped before it.
+    pub newest_ms: AtomicU64,
 }
 
 type Done = oneshot::Sender<Result<Lsn, String>>;
@@ -69,6 +71,13 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The append time for a new record: now, but never before one already given (the wall clock
+/// can step back), so a stream's trim order (append time, LSN) is the log's order for new records.
+fn stamp(stats: &WalStats) -> u64 {
+    let t = now_ms();
+    stats.newest_ms.fetch_max(t, Ordering::Relaxed).max(t)
+}
+
 impl Wal {
     /// Opens (and recovers) the segment log and starts the writer thread.
     pub fn open(cfg: Config) -> Result<Wal> {
@@ -80,6 +89,7 @@ impl Wal {
         let s = log.stats();
         stats.segments.store(s.segments as u64, Ordering::Relaxed);
         stats.log_bytes.store(s.log_bytes, Ordering::Relaxed);
+        stats.newest_ms.store(log.max_time(), Ordering::Relaxed);
         stats
             .recovery_scanned_bytes
             .store(s.recovery_scanned_bytes, Ordering::Relaxed);
@@ -146,7 +156,7 @@ impl Wal {
     fn write(&self, batch: &Batch, replaces: bool) -> Result<Lsn, String> {
         let mut log = self.log.lock();
         let due = log.flush_due();
-        let r = log.append(&[(meta(batch, replaces, now_ms()), &batch.bytes[..])]);
+        let r = log.append(&[(meta(batch, replaces, stamp(&self.stats)), &batch.bytes[..])]);
         publish(&log, &self.stats, &self.fatal);
         let wake = log.flush_due() != due;
         drop(log);
@@ -318,7 +328,7 @@ fn writer(
                 Ok(Req::Wake) | Err(_) => break,
             }
         }
-        let t = now_ms();
+        let t = stamp(&stats);
         let items: Vec<(Meta, &[u8])> = group
             .iter()
             .map(|(b, replaces, _)| (meta(b, *replaces, t), &b.bytes[..]))
@@ -356,6 +366,36 @@ mod tests {
         // through the WAL thread (fsync per ack) and on the caller (write caching)
         for flush_delay_ms in [0, 100] {
             replacing_key(flush_delay_ms).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn append_times_never_go_back_when_the_clock_does() {
+        // Why: a stream trims oldest first by (append time, LSN) and forgets everything below
+        // the last batch it trimmed in that order. A batch stamped earlier than one already in
+        // the log (the wall clock stepped back, here an hour, across a restart) would sort below
+        // that floor: hidden from readers as soon as it is written.
+        for flush_delay_ms in [0, 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = Config::new(dir.path());
+            c.flush_delay_ms = flush_delay_ms;
+            let log = LogId {
+                stream: "s".into(),
+                writer: "w".into(),
+                epoch: 1,
+            };
+            let at = |seq| Batch::parse(Batch::encode(&log, seq, &[(1, b"e")]).unwrap()).unwrap();
+            let ahead = now_ms() + 3_600_000;
+            {
+                let mut l = precog_storage::Log::open(c.clone()).unwrap();
+                let b = at(0);
+                l.append(&[(meta(&b, false, ahead), &b.bytes[..])]).unwrap();
+                l.flush().unwrap();
+            }
+            let wal = Wal::open(c).unwrap();
+            let lsn = wal.append(at(1)).await.unwrap();
+            let t = wal.reader.time_ms(lsn).unwrap().unwrap();
+            assert!(t >= ahead, "flush_delay_ms {flush_delay_ms}: {t} < {ahead}");
         }
     }
 

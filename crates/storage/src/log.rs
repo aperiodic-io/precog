@@ -1201,6 +1201,15 @@ impl Log {
         self.shared.next_lsn.load(Ordering::Acquire)
     }
 
+    /// The newest append time of a record in the log (0: none).
+    pub fn max_time(&self) -> u64 {
+        let sealed = self.manifest.segs.iter().map(|s| s.max_time);
+        sealed
+            .chain(self.active.as_ref().map(|a| a.max_time))
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn first_lsn(&self) -> Lsn {
         self.shared.first_lsn.load(Ordering::Acquire)
     }
