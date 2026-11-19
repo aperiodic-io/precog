@@ -227,7 +227,7 @@ reads each sequence once, in order, none skipped).
 |---|---|---|
 | `MC_positions` | 3 nodes, 3 commits | 33,900 |
 | `MC_cursor` | 3 nodes, sequences 0..4 | 144,495 |
-| `Nightly_positions` | 3 nodes, 4 commits and sequences 0..2 together | nightly |
+| `Nightly_positions` | 3 nodes, 4 commits and sequences 0..1 together | 15,173,327 |
 | `MC_positions_lsn` (expect) | newest by LSN: `ServesNewestHeld` fails | |
 
 **Found and fixed.** A compacted stream kept, per key, the value logged last on the node. Each
