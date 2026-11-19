@@ -1036,12 +1036,13 @@ impl Store {
             })
     }
 
-    /// Each stream's own retention floor, where it has one: below it the stream forgot every
-    /// batch. Kept on disk by the node so that a restart does not bring those back.
+    /// Each stream's own retention floor: below it the stream forgot every batch. Kept on disk by the node so that a restart does not bring those back.
     pub fn floors(&self) -> BTreeMap<String, Age> {
         let g = self.inner.lock();
-        let set = g.streams.iter().filter(|(_, s)| s.floor > Age::default());
-        set.map(|(n, s)| (n.clone(), s.floor)).collect()
+        g.streams
+            .iter()
+            .map(|(n, s)| (n.clone(), s.floor))
+            .collect()
     }
 
     /// After a restart: forgets again what each stream's own retention had forgotten (copies of
@@ -3288,6 +3289,29 @@ mod tests {
             g.streams.get_mut("s").unwrap().bytes = 1 << 20;
         }
         assert_eq!(t.s.trim_stream("s", Some(0), None, 0), 0);
+    }
+
+    #[test]
+    fn restored_floors_forget_again_what_a_stream_forgot_and_nothing_at_the_floor() {
+        // Why: a restart reloads every record still on disk. What the stream's retention forgot
+        // must be forgotten again (also in RAM: the active segment, which no floor filters), and
+        // the batch of another log at the very next LSN with the same time and sequence, the
+        // floor itself, must stay.
+        let mut t = store();
+        let (a, b) = (on("s", "A", 0), on("s", "B", 0));
+        for x in [&a, &b] {
+            t.s.reserve(x);
+            t.durable_at(x, 1_000);
+        }
+        let one = a.bytes.len() as u64;
+        assert_eq!(t.s.trim_stream("s", Some(one), None, 0), 1, "A goes");
+        let floors = t.s.floors();
+        let back = Store::load(t.log.reader()).unwrap();
+        assert!(back.get(&a.id).is_some(), "a restart brings it back");
+        back.restore_floors(&floors);
+        assert!(back.get(&a.id).is_none(), "forgotten again");
+        assert!(back.get(&b.id).is_some(), "the batch at the floor stays");
+        assert_eq!(back.totals().0, 1);
     }
 
     #[test]
