@@ -66,6 +66,9 @@ numbers and caveats are in [results/compare.md](results/compare.md).
 
 At these caps the load generator saturates before the brokers, which run at 25–50% of a core.
 
+The write-caching row predates appends on the worker thread (#16): in an A/B on a smaller-segment setup, that change cut
+broker CPU per record by 6.9% under write caching and left fsync-per-ack unchanged (`results/compare.md`).
+
 With every broker capped at 0.5 CPU, so the brokers are the bottleneck:
 - Precog does 3.1x the throughput and 8x lower p99.
 - It uses 2.4–2.6x less CPU per record.
