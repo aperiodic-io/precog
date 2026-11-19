@@ -18,6 +18,7 @@ property or model test runs (below).
 | The segment log's read APIs through appends, rolls, retention, lost index files and reopens | proptest, model-based | The code against a list of records, after every step | `model` in `crates/storage/tests/log.rs` |
 | The store's identity and frontier rules | proptest, model-based | | `store::model` |
 | The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
+| The segment cleaner: each stream's own retention under the node cap, through slow batches and restarts | proptest | After every pass: the log within the cap, every log the newest suffix of what was written to it (no hole, once, byte for byte), a stream within its own retention (and within one batch of it unless the cap cut it) | `node::props_cleaner` |
 | The dedup window and its cap | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
 
@@ -262,6 +263,7 @@ structural checks, never panics `parse`, and a batch `parse` accepts is walked b
 (`keys`, `try_events`, `keyed`, `without`, each `expect`ing what `parse` validated) without a
 panic; arbitrary bytes under a matching CRC behind each magic never panic; acks, append and
 replicate bodies and log keys round-trip and any bytes decode or are refused.
+`node::props`: the streams' retention floors (PCF1) round-trip and damaged ones are refused.
 `node::props`: compacted-stream snapshots round-trip and damaged ones (CRC recomputed) are
 refused. No bug found.
 

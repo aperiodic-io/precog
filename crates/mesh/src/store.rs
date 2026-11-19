@@ -157,7 +157,7 @@ struct ColdStream {
 /// The order a stream trims in, oldest first: (append time, first sequence, LSN). A copy forward
 /// keeps its time and sequence; append times tie (milliseconds), and the sequence then keeps a
 /// log's batches in order where the copy's later LSN would not. The LSN only orders other logs.
-type Age = (u64, u64, Lsn);
+pub type Age = (u64, u64, Lsn);
 
 /// A batch the cleaner may copy forward (`Store::retained`): where it is, its append time and
 /// at most the bytes it adds to the log.
@@ -1030,6 +1030,28 @@ impl Store {
                 max_bytes.is_some_and(|m| bytes > m)
                     || max_age_ms.is_some_and(|a| now_ms.saturating_sub(x.time) > a)
             })
+    }
+
+    /// Each stream's own retention floor, where it has one: below it the stream forgot every
+    /// batch. Kept on disk by the node so that a restart does not bring those back.
+    pub fn floors(&self) -> BTreeMap<String, Age> {
+        let g = self.inner.lock();
+        let set = g.streams.iter().filter(|(_, s)| s.floor > Age::default());
+        set.map(|(n, s)| (n.clone(), s.floor)).collect()
+    }
+
+    /// After a restart: forgets again what each stream's own retention had forgotten (copies of
+    /// it may still be on disk, in segments newer than its next batches).
+    pub fn restore_floors(&self, floors: &BTreeMap<String, Age>) {
+        let mut g = self.inner.lock();
+        for (stream, &floor) in floors {
+            g.trim_while(&self.reader, stream, |_, x| {
+                (x.time, x.first, x.lsn) < floor
+            });
+            if let Some(s) = g.streams.get_mut(stream) {
+                s.floor = s.floor.max(floor);
+            }
+        }
     }
 
     /// The end of the absorbed segments: the cleaner works only on those.

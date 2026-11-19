@@ -89,7 +89,7 @@ retention whatever the others write. So before the node drops segments, it copie
 streams still retain in them (`Node::apply_retention`):
 
 1. Each stream's own retention runs first: it forgets the stream's oldest batches, oldest first
-   by (append time, LSN), logically (`Store::trim_stream`).
+   by (append time, sequence, LSN), logically (`Store::trim_stream`).
 2. The node takes the segments its cap (and age limit) drops, absorbed ones only, and as many
    more as the copies need room for: after the copy and the drop the log is within the cap.
 3. What a stream with a retention of its own still retains in those segments is copied: read
@@ -122,7 +122,11 @@ through the log like any group (fsynced, or under write caching synced before th
 segment is dropped only after that. A crash before the sync leaves the old record (and maybe the
 copy); one after the manifest names the drop leaves the copy. Recovery keeps the first of two
 records of one identity with the same checksum, so a batch logged twice is kept once, and the
-next pass copies it again and drops the old segment. Tests: `a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`
+next pass copies it again and drops the old segment. What a stream's own retention forgot stays
+forgotten across a restart: a copy of it can outlive the segments of its next batches, so each
+stream's floor (append time, sequence, LSN) is written to `<data_dir>/floors` (format `PCF1`,
+CRC-32C; a temporary file, fsynced, renamed, then the directory) before a pass drops segments,
+and restored when the node opens (`a_restart_does_not_bring_back_what_a_stream_s_retention_forgot`). Tests: `a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`
 (storage failpoints at the copy's fsync, the sync before the drop, before and after the manifest
 write).
 
