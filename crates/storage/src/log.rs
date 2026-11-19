@@ -1710,3 +1710,44 @@ mod tests {
         assert!(c.get(1).is_none());
     }
 }
+
+/// Bounded proofs (Kani): the decoders of the files recovery reads never panic, whatever the
+/// bytes. CRC-32C is stubbed with an unconstrained value, so every checksum may or may not
+/// match: the proofs cover torn or foreign writes that happen to check.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn crc(_b: &[u8]) -> u32 {
+        kani::any()
+    }
+    fn crc_append(_c: u32, _b: &[u8]) -> u32 {
+        kani::any()
+    }
+
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::stub(crc32c::crc32c_append, crc_append)]
+    #[kani::unwind(3)]
+    fn manifest_decode_never_panics() {
+        let b: [u8; 24 + 28 + 49] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= b.len());
+        let _ = Manifest::decode(&b[..n]);
+    }
+
+    /// An index file never panics the decoder, whatever its bytes and length (up to one entry
+    /// with an 8-byte key, or two with empty keys), and an accepted one has exactly the entries
+    /// it declares.
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::unwind(3)]
+    fn index_decode_never_panics() {
+        let b: [u8; 36 + 2 * 38 + 4] = kani::any();
+        let n: usize = kani::any();
+        kani::assume(n <= b.len());
+        if let Some(v) = decode_index(&b[..n], kani::any(), kani::any(), kani::any()) {
+            assert_eq!(v.len(), u32_at(&b, 32) as usize);
+        }
+    }
+}

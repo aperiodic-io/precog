@@ -1,3 +1,7 @@
 /target
 /run
 *.secret
+# TLC and cargo-mutants run files
+states/
+*_TTrace_*
+mutants.out*/

@@ -26,4 +26,8 @@ exclude_re = [
     "wal\\.rs:\\d+:\\d+: replace << with >>$",
     # closes a race with concurrent retention; not reachable deterministically from a test
     "replace match guard self.trimmed\\(lsn\\) with false in Reader::read",
+    # Kani proof harnesses (`#[cfg(kani)] mod proofs`): not compiled into tests; the kani job
+    # checks them
+    "in proofs::",
+    "replace proofs::",
 ]

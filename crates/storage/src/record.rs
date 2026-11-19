@@ -280,3 +280,94 @@ mod tests {
         assert_eq!(decode(&buf[..10], 0, 7), Decoded::Short);
     }
 }
+
+/// Bounded proofs (Kani). `decode` sees every byte pattern of a buffer a little larger than a
+/// header, at every offset, with CRC-32C stubbed: unconstrained (any record may check) or a
+/// deterministic fold (so an encoded record checks).
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    fn crc_any(_b: &[u8]) -> u32 {
+        kani::any()
+    }
+    fn crc_zero(_b: &[u8]) -> u32 {
+        0
+    }
+
+    /// Never panics; an accepted record lies inside the buffer, its key and payload exactly
+    /// fill its length, and it carries the generation asked for.
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc_any)]
+    #[kani::unwind(76)]
+    fn decode_is_total_and_bounded() {
+        let buf: [u8; HEADER + 8] = kani::any();
+        let off: usize = kani::any();
+        kani::assume(off <= 9);
+        let generation = kani::any();
+        if let Decoded::Record {
+            header,
+            key,
+            payload,
+            next,
+        } = decode(&buf, off, generation)
+        {
+            let len = header.len as usize;
+            assert!(off + len <= buf.len());
+            assert_eq!(HEADER + key.len() + payload.len(), len);
+            assert_eq!(key.len(), header.key_len as usize);
+            assert_eq!(header.generation, generation);
+            assert!(next >= off + len && next < off + len + 8 && next % 8 == off % 8);
+        }
+    }
+
+    /// What `encode` writes, `decode` returns field for field, padded to 8 bytes; under any
+    /// other generation it is not a record. Fixed sizes (symbolic sizes blow up the solver):
+    /// a key and a payload that need padding.
+    fn roundtrip<const K: usize, const P: usize>() {
+        let key: [u8; K] = kani::any();
+        let payload: [u8; P] = kani::any();
+        let meta = Meta {
+            key: key.to_vec(),
+            first_seq: kani::any(),
+            count: kani::any(),
+            tag: kani::any(),
+            time_ms: kani::any(),
+        };
+        let (generation, group_start, lsn) = (kani::any(), kani::any(), kani::any());
+        let mut buf = vec![];
+        encode(&mut buf, generation, group_start, lsn, &meta, &payload);
+        assert_eq!(buf.len(), encoded_len(K, P));
+        match decode(&buf, 0, generation) {
+            Decoded::Record {
+                header,
+                key: k,
+                payload: p,
+                next,
+            } => {
+                assert_eq!(next, buf.len());
+                assert_eq!(k, &key[..]);
+                assert_eq!(p, &payload[..]);
+                assert_eq!(
+                    (header.group_start, header.lsn, header.first_seq),
+                    (group_start, lsn, meta.first_seq)
+                );
+                assert_eq!(
+                    (header.count, header.tag, header.time_ms),
+                    (meta.count, meta.tag, meta.time_ms)
+                );
+            }
+            _ => panic!("an encoded record must decode"),
+        }
+        let other: u64 = kani::any();
+        kani::assume(other != generation);
+        assert_eq!(decode(&buf, 0, other), Decoded::Invalid);
+    }
+
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc_zero)]
+    #[kani::unwind(80)]
+    fn padded_record_roundtrips() {
+        roundtrip::<2, 3>();
+    }
+}
