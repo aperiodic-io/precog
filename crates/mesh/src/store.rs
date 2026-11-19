@@ -256,12 +256,11 @@ impl Inner {
         mut f: impl FnMut(u64, Entry) -> bool,
     ) -> Res<()> {
         let l = &self.logs[ix as usize];
-        // the RAM part from the batch holding `from`
+        // the RAM part from the batch before `from` (it may hold it)
         let start = l
             .batches
             .range(..=from)
             .next_back()
-            .filter(|(s, e)| **s + e.count as u64 > from)
             .map_or(from, |(&s, _)| s);
         let hot: Vec<(u64, Entry)> = l.batches.range(start..).map(|(&s, &e)| (s, e)).collect();
         // by first sequence: the absorbed segments whose range reaches past `from`, and RAM
