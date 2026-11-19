@@ -625,6 +625,57 @@ impl Node {
         for (name, kind, v) in rows {
             out.push_str(&format!("# TYPE {name} {kind}\n{name} {v}\n"));
         }
+        // per reader group and stream: events not yet covered by its committed position, and how
+        // long ago it committed (what kafka-exporter gives live-ingestion's alerts)
+        let positions: Vec<(Vec<u8>, u64, Bytes)> =
+            self.compact.lock().get(POSITIONS).map_or(vec![], |m| {
+                m.iter()
+                    .map(|(k, (lsn, p))| (k.clone(), *lsn, p.clone()))
+                    .collect()
+            });
+        out.push_str(
+            "# TYPE precog_group_lag_events gauge\n# TYPE precog_group_commit_age_seconds gauge\n",
+        );
+        let now = crate::store::now_ms();
+        for (key, lsn, payload) in positions {
+            let Some((group, stream)) = std::str::from_utf8(&key)
+                .ok()
+                .and_then(|k| k.split_once('\0'))
+            else {
+                continue;
+            };
+            let Ok(entries) = serde_json::from_slice::<Vec<(String, u64, u64)>>(&payload) else {
+                continue;
+            };
+            let at: HashMap<(String, u64), u64> =
+                entries.into_iter().map(|(w, e, s)| ((w, e), s)).collect();
+            let lag: u64 = self
+                .store
+                .frontiers(Some(stream))
+                .iter()
+                .map(|f| {
+                    f.high.saturating_sub(
+                        at.get(&(f.log.writer.clone(), f.log.epoch))
+                            .copied()
+                            .unwrap_or(0),
+                    )
+                })
+                .sum();
+            let labels = format!("group=\"{group}\",stream=\"{stream}\"");
+            out.push_str(&format!("precog_group_lag_events{{{labels}}} {lag}\n"));
+            if let Some(e) = self
+                .wal
+                .reader
+                .entries(lsn, 1)
+                .first()
+                .filter(|e| e.lsn == lsn)
+            {
+                let age = now.saturating_sub(e.meta.time_ms) / 1000;
+                out.push_str(&format!(
+                    "precog_group_commit_age_seconds{{{labels}}} {age}\n"
+                ));
+            }
+        }
         out
     }
 
