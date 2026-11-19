@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2a06735824c80d2a8d1532b1d1e1a28030ba3e55d5e2ede3b8bfb6fd4fed0c34 # shrinks to fail_after = Some(2), ops = [Burst([(2019, true)]), Burst([(2341, true), (2555, false)]), Burst([(2040, true), (145, false), (2558, false), (1667, false)]), Burst([(517, true)]), Burst([(271, false), (2863, true), (9, false), (564, false)]), Retain(73728), Burst([(2643, false), (849, false)]), Burst([(2049, false), (2449, true)]), Burst([(920, false), (2894, true), (284, false), (2341, true), (879, true)]), Burst([(1920, true)]), Burst([(2638, false), (1158, false)]), Burst([(1785, false), (1870, true), (259, true), (865, true)]), Burst([(2206, false), (1939, false), (975, false), (212, false), (1426, false)]), Burst([(978, false), (2662, true), (1743, true)])]
+cc c098844a8f4361da50a27e87ba3f04992688b9cf84086956eeb1bc703c22ad63 # shrinks to fail_after = Some(4), ops = [Burst([(484, true), (2173, true), (931, false), (223, true), (1212, true)]), Burst([(562, true), (907, true), (2203, true)]), Burst([(1433, false), (299, false), (2595, true), (1994, true), (83, false)]), Burst([(1379, true)]), Retain(51200), Retain(104448), Burst([(1594, true), (889, false), (2355, false)]), Burst([(2292, false)]), Burst([(2139, false), (1640, false)])]

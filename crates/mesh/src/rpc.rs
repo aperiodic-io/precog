@@ -206,3 +206,87 @@ impl RpcClient {
         }
     }
 }
+
+/// The frame reader faces the network: any byte stream, cut into any reads, yields the frames
+/// written to it in order and then a clean end, or an error, never a panic.
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// Hands out the stream in the given read sizes.
+    struct Chunks(Vec<u8>, Vec<usize>, usize);
+
+    impl AsyncRead for Chunks {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            out: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let Chunks(b, sizes, at) = &mut *self;
+            let n = sizes.get(*at).copied().unwrap_or(usize::MAX);
+            *at += 1;
+            let n = n.max(1).min(out.remaining()).min(b.len());
+            out.put_slice(&b[..n]);
+            b.drain(..n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn read_all(bytes: Vec<u8>, sizes: Vec<usize>) -> (Vec<Frame>, Result<()>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut r = Chunks(bytes, sizes, 0);
+            let mut buf = BytesMut::new();
+            let mut got = vec![];
+            loop {
+                match read_frame(&mut r, &mut buf).await {
+                    Ok(Some(f)) => got.push(f),
+                    Ok(None) => return (got, Ok(())),
+                    Err(e) => return (got, Err(e)),
+                }
+            }
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn frames_read_back_in_order_however_the_stream_is_cut(
+            frames in prop::collection::vec(
+                (1u8..=10, any::<u64>(), prop::collection::vec(any::<u8>(), 0..64)), 0..8),
+            sizes in prop::collection::vec(1usize..40, 0..64),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let mut b = BytesMut::new();
+            for (k, id, body) in &frames {
+                Frame::new(Kind::from_u8(*k).unwrap(), *id, body.clone().into()).encode_into(&mut b);
+            }
+            let (got, end) = read_all(b.to_vec(), sizes.clone());
+            prop_assert!(end.is_ok());
+            prop_assert_eq!(got.len(), frames.len());
+            for (f, (k, id, body)) in got.iter().zip(&frames) {
+                prop_assert_eq!((f.kind as u8, f.req_id, &f.body[..]), (*k, *id, &body[..]));
+            }
+            // a stream cut inside a frame is an error after the frames before the cut
+            let c = cut.index(b.len() + 1);
+            let whole = frames.iter().scan(0, |at, f| { *at += 13 + f.2.len(); Some(*at) })
+                .filter(|&e| e <= c).count();
+            let (got, end) = read_all(b[..c].to_vec(), sizes);
+            prop_assert_eq!(got.len(), whole);
+            let boundary = c == 0 || frames.iter().scan(0, |at, f| { *at += 13 + f.2.len(); Some(*at) }).any(|e| e == c);
+            prop_assert_eq!(end.is_ok(), boundary);
+        }
+
+        #[test]
+        fn any_bytes_read_as_frames_or_an_error(
+            bytes in prop::collection::vec(any::<u8>(), 0..256),
+            sizes in prop::collection::vec(1usize..40, 0..16),
+        ) {
+            let _ = read_all(bytes, sizes);
+        }
+    }
+}
