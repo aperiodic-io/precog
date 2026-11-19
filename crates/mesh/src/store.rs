@@ -1117,6 +1117,12 @@ mod tests {
         assert_eq!(t.s.totals(), (1, 1, x.bytes.len() as u64));
         t.s.mark_durable(&p.id, p_lsn);
         assert_eq!(t.s.durable_len(), lsn + 1, "past the replaced batch's LSN");
+        let budget = (p.bytes.len() + x.bytes.len()) as u64;
+        assert_eq!(
+            t.s.trim_stream("s", Some(budget), None, 0),
+            0,
+            "the stream counts the replacement's bytes, not the old batch's"
+        );
         let (fed, _) = t.s.tail(0, None, 1 << 20);
         let fed: Vec<_> = fed.iter().map(|b| b.bytes.clone()).collect();
         assert_eq!(fed, [p.bytes.clone(), x.bytes.clone()]);
