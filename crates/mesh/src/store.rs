@@ -684,9 +684,9 @@ impl Inner {
     ) -> usize {
         // a part that yields nothing (its totals disagree with its index) ends it: no spinning
         let (mut n, mut went) = (0, true);
-        while went {
+        'parts: while went {
             let Some(s) = self.streams.get(stream) else {
-                return n;
+                break 'parts;
             };
             // by the oldest each may hold: RAM (exact; None) and the absorbed segments
             let ram = s
@@ -704,7 +704,7 @@ impl Inner {
             parts.sort_unstable();
             // the part to read, and the oldest any other part may hold
             let Some(&(_, base)) = parts.first() else {
-                return n;
+                break 'parts;
             };
             let bound = parts.get(1).map(|p| p.0);
             let mut recs = match base {
@@ -712,7 +712,7 @@ impl Inner {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::error!("reading the index of segment at {base}: {e}");
-                        return n;
+                        break 'parts;
                     }
                 },
                 None => s
@@ -744,7 +744,7 @@ impl Inner {
                     break;
                 }
                 if !over(self.streams[stream].bytes, &x) {
-                    return n;
+                    break 'parts;
                 }
                 // forgotten oldest first: everything older is gone too
                 let s = self.streams.get_mut(stream).unwrap();
