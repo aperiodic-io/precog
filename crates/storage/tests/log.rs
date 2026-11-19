@@ -1502,6 +1502,32 @@ fn a_flush_run_outside_the_log_lets_appends_go_on_and_leaves_them_due() {
 }
 
 #[test]
+fn unsynced_bytes_stay_bounded_while_a_flush_is_out() {
+    // Why: recovery tells a lost unsynced tail from interior damage by its size (the kernel writes
+    // unsynced pages back in any order), so a crash must never leave more than
+    // `Log::unsynced_bound` unsynced. Appends go on while the flusher's fsync runs outside the
+    // log, so past twice `flush_bytes` (what that fsync covers plus as much again) an append
+    // syncs itself.
+    let d = tempfile::tempdir().unwrap();
+    let c = deferred(d.path(), 1 << 20, 4 * KB);
+    assert_eq!(
+        Log::unsynced_bound(&c),
+        8 * KB + precog_storage::log::MAX_GROUP as u64
+    );
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 5, 1, 1000); // past flush_bytes: the flush is due, the append does not sync
+    assert_eq!(log.stats().syncs, 0);
+    let f = log.begin_flush().unwrap().unwrap();
+    fill(&mut log, 5, 2, 1, 1000); // ~7 KiB not yet synced, the fsync still out
+    assert_eq!(log.stats().syncs, 0, "below twice flush_bytes");
+    fill(&mut log, 7, 2, 1, 1000); // past twice flush_bytes
+    assert_eq!(log.stats().syncs, 1, "the append synced the bound back");
+    let r = f.sync();
+    log.end_flush(f, r).unwrap();
+    check_all(&log, 0, 9, 1000);
+}
+
+#[test]
 fn a_failed_flush_run_outside_the_log_fences_it() {
     // Why: fsyncgate, as for a flush under the lock: whatever was acknowledged since rests on the
     // replicas, and the log must refuse everything after the failure is known.
