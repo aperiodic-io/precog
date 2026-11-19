@@ -143,6 +143,8 @@ pub enum Reserve {
     Conflict(String),
     /// The range lies below this node's retention floor for that writer log.
     Expired,
+    /// The index could not be read: the outcome is unknown (retry).
+    Error(String),
 }
 
 /// A reader's position in a stream, valid on every node: per writer log, the next sequence to
@@ -599,7 +601,7 @@ impl Store {
         }
         let ix = inner.intern(&b.id.log);
         match inner.overlap(&self.reader, ix, first, end) {
-            Err(e) => return Reserve::Conflict(format!("{:?}: reading the index: {e}", b.id.log)),
+            Err(e) => return Reserve::Error(format!("{:?}: reading the index: {e}", b.id.log)),
             Ok(Some((s, e))) => {
                 if s == first && e.crc == b.ident && e.count == b.count {
                     return Reserve::Duplicate(match inner.pending.get(&(ix, first)) {
@@ -1883,6 +1885,7 @@ mod tests {
             },
             Reserve::Conflict(_) => "conflict",
             Reserve::Expired => "expired",
+            Reserve::Error(_) => "error",
         }
     }
 
@@ -2160,6 +2163,31 @@ mod tests {
             "the oldest segment, nothing past the gap"
         );
         assert_eq!(t.s.frontiers(Some("g"))[0].contiguous, 5);
+    }
+
+    #[test]
+    fn an_unreadable_index_is_no_conflict() {
+        // Why: a conflict is final (the producer drops the batch); an index that cannot be read
+        // says nothing about the batch, so a retry checked against it must be retryable
+        let mut t = store_with(TINY);
+        let xs: Vec<Batch> = (0..6).map(|i| on("s", "w", i)).collect();
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        t.s.absorb();
+        for f in std::fs::read_dir(t._dir.path()).unwrap() {
+            let p = f.unwrap().path();
+            if p.extension().is_some_and(|e| e == "idx") {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&p)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            }
+        }
+        assert!(matches!(t.s.reserve(&xs[0]), Reserve::Error(_)));
     }
 
     #[test]

@@ -1168,6 +1168,7 @@ impl Node {
                     }
                 },
                 Reserve::Conflict(e) => return Ok(Local::Conflict(e)),
+                Reserve::Error(e) => bail!(e),
                 Reserve::Expired => {
                     return Ok(Local::Conflict(format!(
                         "{:?} seq {} is below the retention floor",
