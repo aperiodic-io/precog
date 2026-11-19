@@ -1,7 +1,8 @@
 /target
 /run
 *.secret
-# TLC and cargo-mutants run files
+/results/harness*/
+/mutants.out*/
+# TLC run files
 states/
 *_TTrace_*
-mutants.out*/

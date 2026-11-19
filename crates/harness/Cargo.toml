@@ -1,0 +1,17 @@
+[package]
+name = "precog-harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Broker test harness: a 3-node Docker cluster (Precog, or the Redpanda dedup fork), faults, invariants"
+
+[dependencies]
+precog-mesh = { path = "../mesh" }
+precog-client = { path = "../client" }
+anyhow = "1"
+bytes = "1"
+rskafka = { version = "0.6", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

@@ -22,7 +22,7 @@ exclude_re = [
     # the node's serve-forever loop: only real processes (the acceptance suite) reach it
     "replace Node::run -> Result<\\(\\)> with Ok\\(\\(\\)\\)",
     # how many appends share one fsync: throughput only, held by the perf gate
-    "replace \\+= with \\*= in writer",
+    "replace \\+= with [*-]= in writer",
     "wal\\.rs:\\d+:\\d+: replace << with >>$",
     # closes a race with concurrent retention; not reachable deterministically from a test
     "replace match guard self.trimmed\\(lsn\\) with false in Reader::read",
