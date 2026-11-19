@@ -115,4 +115,15 @@ fn ram_per_retained_batch_stays_within_budget() {
         total <= BUDGET,
         "{total:.0} B of heap per retained batch, over the {BUDGET} B budget"
     );
+    // a restart rebuilds the store from the log: within the same budget, or the node
+    // crash-loops on the RAM it fitted in before
+    let t4 = live();
+    let again = Store::load(log.reader()).unwrap();
+    assert_eq!(again.totals(), store.totals());
+    let restart = per(live() - t4);
+    eprintln!("heap per retained batch after a restart: {restart:.0} B (store)");
+    assert!(
+        restart <= BUDGET,
+        "{restart:.0} B of heap per retained batch after a restart, over the {BUDGET} B budget"
+    );
 }
