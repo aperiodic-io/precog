@@ -17,7 +17,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -340,10 +340,17 @@ impl Node {
                 return;
             }
         };
-        let mut pos = if sub.from_start {
-            0
+        // A live feed sends each log in sequence from where it stood when the feed began (a
+        // log new to this node: from its start), holding a batch that lands before its
+        // predecessor: the client joins a log at the first batch it sees.
+        let (mut pos, mut live) = if sub.from_start {
+            (0, None)
         } else {
-            self.store.durable_len()
+            let (pos, next) = self.store.live_start(sub.stream.as_deref());
+            (
+                pos,
+                Some((pos, next, HashMap::<LogId, BTreeMap<u64, Batch>>::new())),
+            )
         };
         loop {
             let notified = self.store.durable_notify.notified();
@@ -359,15 +366,59 @@ impl Node {
                 continue;
             }
             for b in batches {
-                if tx
-                    .send(Frame::new(Kind::Push, req.req_id, b))
-                    .await
-                    .is_err()
-                {
-                    return;
+                let out = match live.as_mut() {
+                    None => vec![b],
+                    Some((start, next, held)) => self.in_log_order(*start, next, held, b),
+                };
+                for b in out {
+                    if tx
+                        .send(Frame::new(Kind::Push, req.req_id, b.bytes))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
+    }
+
+    /// A live feed's batches in log order: `b` and whatever it releases, or nothing while its
+    /// predecessor is missing. A batch already below the feed's start was never due.
+    fn in_log_order(
+        &self,
+        start: precog_storage::Lsn,
+        next: &mut HashMap<LogId, u64>,
+        held: &mut HashMap<LogId, BTreeMap<u64, Batch>>,
+        b: Batch,
+    ) -> Vec<Batch> {
+        let log = b.id.log.clone();
+        let n = next.entry(log.clone()).or_insert(0);
+        match b.id.first_seq.cmp(n) {
+            std::cmp::Ordering::Greater => {
+                held.entry(log).or_default().insert(b.id.first_seq, b);
+                return vec![];
+            }
+            std::cmp::Ordering::Less => return vec![], // below where the feed joined the log
+            std::cmp::Ordering::Equal => {}
+        }
+        *n = b.end_seq();
+        let mut out = vec![b];
+        let h = held.entry(log.clone()).or_default();
+        loop {
+            if let Some(end) = self.store.durable_below(&log, *n, start) {
+                *n = end;
+            } else if let Some(b) = h.remove(n) {
+                *n = b.end_seq();
+                out.push(b);
+            } else {
+                break;
+            }
+        }
+        if h.is_empty() {
+            held.remove(&log);
+        }
+        out
     }
 
     fn authenticate(&self, body: &[u8]) -> Result<Ident> {
