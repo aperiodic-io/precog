@@ -506,8 +506,9 @@ struct Spares {
     dir: PathBuf,
     counter: AtomicU64,
     made: AtomicU64,
-    /// When retention last recycled a segment into the pool.
-    last_recycle: Mutex<Option<std::time::Instant>>,
+    /// Until when the log counts as recycling: `RECYCLING` after retention last recycled a
+    /// segment into the pool.
+    recycling_until: Mutex<Option<std::time::Instant>>,
 }
 
 /// A log that recycled a segment this recently is at its retention budget: each roll is followed
@@ -522,11 +523,10 @@ impl Spares {
         &self,
         mut pool: std::sync::MutexGuard<'a, Vec<PathBuf>>,
     ) -> (std::sync::MutexGuard<'a, Vec<PathBuf>>, bool) {
-        let recycling = self
-            .last_recycle
-            .lock()
-            .unwrap()
-            .is_some_and(|t| t.elapsed() < RECYCLING);
+        let recycling = self.recycling_until.lock().unwrap().is_some_and(|u| {
+            u.checked_duration_since(std::time::Instant::now())
+                .is_some()
+        });
         if !recycling {
             return (pool, false);
         }
@@ -739,7 +739,7 @@ impl Log {
             dir: dir.clone(),
             counter: AtomicU64::new(counter),
             made: AtomicU64::new(0),
-            last_recycle: Mutex::new(None),
+            recycling_until: Mutex::new(None),
         });
         let mut log = Log {
             cfg,
@@ -1260,7 +1260,8 @@ impl Log {
             let to = self.cfg.dir.join(format!("spare-{n:08}.log"));
             std::fs::rename(path, &to)?;
             sync_dir(&self.cfg.dir)?;
-            *self.spares.last_recycle.lock().unwrap() = Some(std::time::Instant::now());
+            *self.spares.recycling_until.lock().unwrap() =
+                Some(std::time::Instant::now() + RECYCLING);
             let mut pool = self.spares.pool.lock().unwrap();
             pool.push(to);
             self.spares.cv.notify_all();

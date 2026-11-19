@@ -1637,3 +1637,57 @@ fn a_roll_that_finds_no_spare_fills_one_at_full_speed() {
         t.elapsed()
     );
 }
+
+#[test]
+fn the_deferred_flush_is_due_its_delay_after_the_first_unsynced_write() {
+    // the ack-before-fsync window is bounded by flush_delay_ms: never longer, and not shorter
+    // (an earlier flush would pay the fsync per group that write caching exists to avoid)
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(deferred(d.path(), 1 << 20, 1 << 20)).unwrap();
+    let before = std::time::Instant::now();
+    fill(&mut log, 0, 1, 1, 100);
+    let after = std::time::Instant::now();
+    let due = log.flush_due().unwrap();
+    let delay = std::time::Duration::from_millis(100);
+    assert!(due >= before + delay && due <= after + delay);
+}
+
+#[test]
+fn at_its_retention_budget_the_preallocator_waits_out_recycles_and_still_stops_promptly() {
+    // Why: a zero-filled spare made while recycles keep the pool full is deleted unused, also
+    // once the preallocator's recycle wait (5 s) has run out; and a closing log must not sit out
+    // that wait.
+    let d = tempfile::tempdir().unwrap();
+    let seg = 64 * KB;
+    let mut c = cfg(d.path(), seg);
+    c.prealloc_bytes_per_s = 0;
+    let mut log = Log::open(c).unwrap();
+    let mut i = 0;
+    for _ in 0..10 {
+        i += fill(&mut log, i, 30, 2, 1000);
+        log.retain(Some(3 * seg), None).unwrap();
+    }
+    // rolls take every spare: the preallocator waits for a recycle
+    let mut drain = |log: &mut Log, i: &mut u64| {
+        while !spare_files(d.path()).is_empty() {
+            *i += fill(log, *i, 5, 1, 1000);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    drain(&mut log, &mut i);
+    let made = log.stats().spares_made;
+    // exactly one recycle fills the pool to its target
+    log.retain(Some(log.stats().log_bytes - seg / 2), None)
+        .unwrap();
+    assert_eq!(spare_files(d.path()).len(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(5_500));
+    assert_eq!(log.stats().spares_made, made, "{:?}", log.stats());
+    drain(&mut log, &mut i);
+    let t = std::time::Instant::now();
+    drop(log);
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        t.elapsed()
+    );
+}
