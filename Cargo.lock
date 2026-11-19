@@ -2994,6 +2994,7 @@ dependencies = [
  "bytes",
  "parking_lot",
  "precog-mesh",
+ "proptest",
  "serde_json",
  "tempfile",
  "tokio",

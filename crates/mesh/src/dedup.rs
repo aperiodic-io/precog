@@ -171,7 +171,15 @@ impl Dedup {
     pub fn record(&mut self, digests: &[u64], now_s: u64) {
         self.started_s.get_or_insert(now_s);
         if self.pending.len() >= self.max_entries {
-            self.pending.drain(..self.pending.len() / 4); // the oldest quarter: the window shortens
+            // the oldest quarter goes and the window shortens past it (as `sweep` does at the
+            // cap), but never this second's ids: within a second the cap is soft there too
+            let n = (self.pending.len() / 4)
+                .min(self.pending.partition_point(|e| (e.1 as u64) < now_s));
+            if n > 0 {
+                let t = self.pending[n - 1].1 as u64;
+                self.pending.drain(..n);
+                self.oldest_s = self.oldest_s.max(t + 1);
+            }
         }
         self.pending
             .extend(digests.iter().map(|&h| (h, now_s as u32)));
@@ -370,13 +378,24 @@ mod tests {
         let mut d = Dedup::new(300, 3, 100);
         assert!(d.is_empty());
         for i in 0..3 {
-            d.record(&(i * 10..i * 10 + 10).collect::<Vec<u64>>(), 1);
+            d.record(&(i * 10..i * 10 + 10).collect::<Vec<u64>>(), 1 + i);
         }
         assert_eq!(d.len(), 30, "under the cap all are kept");
         assert!(!d.is_empty());
-        d.record(&(30..100).collect::<Vec<u64>>(), 1);
-        d.record(&[100], 1); // 100 pending: a quarter goes first
+        d.record(&(30..100).collect::<Vec<u64>>(), 4);
+        d.record(&[100], 5); // 100 pending: a quarter goes first
         assert_eq!(d.len(), 76);
+        // and the window says so: part of second 3 went, so ids from second 4 on are kept
+        assert_eq!(d.effective_window_s(5), 1);
+        assert_eq!(
+            dups(&mut d, &[24, 25, 30, 100], 5),
+            [false, false, true, true]
+        );
+        // this second's ids are never dropped: within a second the cap is soft
+        let mut d = Dedup::new(300, 3, 4);
+        d.record(&[1, 2, 3, 4], 7);
+        d.record(&[5], 7);
+        assert_eq!(dups(&mut d, &[1, 5], 7), [true, true]);
     }
 
     #[test]
@@ -392,5 +411,91 @@ mod tests {
     fn the_pass_through_hasher_takes_only_u64_digests() {
         // another key type would be hashed by `write`, which would put every key in one bucket
         Pass::default().write(b"x");
+    }
+}
+
+/// Model-based test: random checks and records over a nondecreasing clock against a map of
+/// each id's last-kept second. A duplicate is never claimed for an id not kept within the
+/// window, and every id kept within `effective_window_s` is caught.
+#[cfg(test)]
+mod model {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashMap;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        Check(Vec<u64>),
+        Record(Vec<u64>),
+        Tick(u64),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        let ids = prop::collection::vec(0u64..24, 1..4);
+        prop::collection::vec(
+            prop_oneof![
+                4 => ids.clone().prop_map(Op::Check),
+                2 => ids.prop_map(Op::Record),
+                2 => (0u64..6).prop_map(Op::Tick),
+            ],
+            1..80,
+        )
+    }
+
+    fn run(window: u64, cap: usize, ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let mut d = Dedup::new(window, 0, cap);
+        let mut last: HashMap<u64, u64> = HashMap::new();
+        let mut now = 100;
+        let mut dup = vec![];
+        for op in ops {
+            match op {
+                Op::Tick(dt) => now += dt,
+                Op::Record(ids) => {
+                    d.record(&ids, now);
+                    for h in ids {
+                        last.insert(h, now);
+                    }
+                }
+                Op::Check(ids) => {
+                    d.check(&ids, now, &mut dup);
+                    let eff = d.effective_window_s(now);
+                    for (&h, &got) in ids.iter().zip(&dup) {
+                        let seen = last.get(&h).copied();
+                        let within = seen.is_some_and(|t| t + window >= now);
+                        prop_assert!(!got || within, "id {} claimed a duplicate at {}", h, now);
+                        if cap >= 1 << 20 {
+                            prop_assert_eq!(got, within, "id {} at {}", h, now);
+                        } else if seen.is_some_and(|t| t + eff >= now) {
+                            prop_assert!(
+                                got,
+                                "id {} kept at {:?} within {}s missed at {}",
+                                h,
+                                seen,
+                                eff,
+                                now
+                            );
+                        }
+                        if !got {
+                            last.insert(h, now);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #[test]
+        fn without_the_cap_dedup_is_exact(window in 1u64..12, ops in ops()) {
+            run(window, 1 << 20, ops)?;
+        }
+
+        #[test]
+        fn at_the_cap_dedup_is_sound_and_keeps_its_effective_window(
+            window in 1u64..12, cap in 1usize..8, ops in ops(),
+        ) {
+            run(window, cap, ops)?;
+        }
     }
 }

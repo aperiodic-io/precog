@@ -67,6 +67,23 @@ jobs:
         env: { PRECOG_NODE: "${{ github.workspace }}/target/release/precog-node" }
         run: test -z "$(gofmt -l .)" && go vet ./... && go test ./...
 
+  # Formal coverage (AGENTS.md, Formal verification): every line a pull request adds or changes
+  # in the product crates must be run by a property or model test (`mod props` / `mod model`)
+  formal-coverage:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { fetch-depth: 0 }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with: { save-if: "false" }
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with: { tool: "cargo-nextest,cargo-llvm-cov" }
+      - run: >-
+          cargo llvm-cov nextest $WS --exclude precog-bench --lcov --output-path formal.lcov
+          -E 'test(/(^|::)(props|model)(_[a-z_]+)?::/)'
+      - run: scripts/formal-gate.py formal.lcov origin/${{ github.base_ref }}
+
   # TLA+ models of the protocols (spec/README.md): every spec/*/MC_*.cfg at its PR bounds.
   # ubuntu-latest has Java; the script fetches tla2tools.jar by checksum.
   tla:

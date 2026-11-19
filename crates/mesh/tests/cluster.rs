@@ -779,3 +779,35 @@ async fn a_conflict_without_a_majority_changes_nothing() {
     assert_eq!(held(&mc, 0, &id).await, Some(x));
     assert_eq!(held(&mc, 1, &id).await, Some(y));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_got_a_batch_by_repair_drops_a_later_duplicate_of_its_events() {
+    // node 2 was down while producer a's event went to nodes 0 and 1; once it has repaired, a
+    // producer replica's copy of that event landing on node 2 (its preferred node, back) is a
+    // duplicate there too
+    let c = cluster(3, &["a", "b", "c"]);
+    let _n0 = start(&c, 0).await;
+    let _n1 = start(&c, 1).await;
+    let mc = client(&c).await;
+    let log = |w: &str| LogId {
+        stream: "s".into(),
+        writer: w.into(),
+        epoch: 1,
+    };
+    let ev: [(u64, &[u8], &[u8]); 1] = [(1, b"k", b"from-a")];
+    mc.append(0, &Batch::encode_keyed(&log("a"), 0, &ev).unwrap(), 2)
+        .await
+        .unwrap();
+    let n2 = start(&c, 2).await;
+    let (fetched, errors) = n2.repair_pass().await;
+    assert!(errors.is_empty() && fetched == 1, "{fetched} {errors:?}");
+    let ev: [(u64, &[u8], &[u8]); 1] = [(2, b"k", b"from-b")];
+    assert!(
+        n2.append(1, Batch::encode_keyed(&log("b"), 0, &ev).unwrap())
+            .await
+            .is_success()
+    );
+    let (evs, _) = n2.store.read("s", 0, 1000);
+    let got: Vec<&[u8]> = evs.iter().map(|e| &e.payload[..]).collect();
+    assert_eq!(got, [&b"from-a"[..]], "b's copy of k is a duplicate");
+}

@@ -1,7 +1,9 @@
 # Formal verification
 
-What is checked, with which tool, to what bound, and what is left out. Every check runs in CI:
-the `formal` job on each pull request, bigger bounds in `nightly.yml`.
+What is checked, with which tool, to what bound, and what is left out. Every check runs in CI
+on each pull request (TLC in `tla`, Kani in `kani`, the property and model tests in `test`), with
+bigger bounds in `nightly.yml`; `formal-coverage` fails a pull request whose changed code no
+property or model test runs (below).
 
 | Part | Tool | Why this tool | Where |
 |---|---|---|---|
@@ -12,6 +14,12 @@ the `formal` job on each pull request, bigger bounds in `nightly.yml`.
 | Reader-group positions and compacted streams across nodes; cursor reads with failover | TLA+ / TLC | Commits and batches reach nodes in any order | `spec/consumers/Positions.tla` |
 | Live subscriptions: the start point, per-log order, held batches | TLA+ / TLC | Batches become durable out of order around the moment a feed starts | `spec/livefeed/LiveFeed.tla` |
 | Wire codecs: batches (every format), acks, append and replicate bodies, log keys, compacted-stream snapshots | proptest | The bytes come from the network or the disk; Kani does not finish them (below) | `mod props` in `crates/mesh/src/{proto,node}.rs` |
+| RPC frame reader | proptest | Any byte stream, cut into any reads | `rpc::props` |
+| The segment log's read APIs through appends, rolls, retention, lost index files and reopens | proptest, model-based | The code against a list of records, after every step | `model` in `crates/storage/tests/log.rs` |
+| The store's identity and frontier rules | proptest, model-based | | `store::model` |
+| The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
+| The dedup window and its cap | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
+| The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
 
 Run them:
 
@@ -26,6 +34,40 @@ A config whose first line is `\* expect: <Invariant>` must fail on that invarian
 counterexample of a bug a fix closed, so the model is shown to catch it (`spec/check.sh` fails
 if it stops failing).
 
+## Formal coverage: what the checks reach, and the gate
+
+A property or model test is a test in a module named `props` or `model` (or `props_*`,
+`model_*`). The `formal-coverage` job runs only those under `cargo llvm-cov` and fails if a line
+the pull request adds or changes in `crates/{storage,mesh,client}/src` is not run by one
+(`scripts/formal-gate.py`; test code, lines llvm-cov does not instrument, the `precog-node` CLI
+and TCP dialing are not gated). Kani and TLC report no lines; the tests beside them do.
+
+```sh
+cargo llvm-cov nextest --workspace --exclude storage-bench --exclude precog-bench \
+  -E 'test(/(^|::)(props|model)(_[a-z_]+)?::/)' --lcov --output-path formal.lcov
+scripts/formal-gate.py formal.lcov origin/main
+```
+
+Lines of each module (test code left out) the property and model tests run, before this audit
+and after it:
+
+| Module | Before | After | Checks | Not reached, and why |
+|---|---|---|---|---|
+| `storage/src/record.rs` | 97% | 97% | Kani, `SegmentLog.tla`, crash props | error formatting |
+| `storage/src/log.rs` | 58% | 88% | `SegmentLog.tla`, `SegmentRoll.tla`, Kani, crash props, `model` | roll failpoints and damaged-file paths (unit-tested), spare pacing |
+| `mesh/src/proto.rs` | 90% | 98% | `proto::props` | |
+| `mesh/src/wal.rs` | 0% | 95% | `wal::model` | the deferred flush's error log |
+| `mesh/src/dedup.rs` | 0% | 82% | `dedup::model`, `Replication.tla` | `Streams` (per-stream maps, unit-tested) |
+| `mesh/src/rpc.rs` | 0% | 76% | `rpc::props`, cluster model | timeouts and closed connections |
+| `mesh/src/store.rs` | 27% | 46% | `store::model`, cluster model, `Replication.tla`, `Positions.tla`, `LiveFeed.tla` | retention, time seeks, live feeds (unit and integration tests) |
+| `mesh/src/node.rs` | 5% | 53% | cluster model, `Replication.tla`, `Positions.tla`, `LiveFeed.tla` | subscriptions, metrics, retention, conflicts, restart |
+| `mesh/src/client.rs` | 0% | 35% | cluster model | retries on unknown acks, subscriptions |
+| `client/src/lib.rs` | 0% | 85% | cluster model, `Replication.tla` (`Client::end`) | time starts, compression off |
+| `mesh/src/bin/`, `transport.rs` | 0% | | acceptance suite | process setup, DNS (not gated) |
+
+The gate applies to new code; the "not reached" column is what the next model extensions
+should take (node restarts in the cluster model need a `Node` that can stop).
+
 ## Storage: `spec/storage`
 
 ### `SegmentLog.tla`: one active segment
@@ -35,7 +77,9 @@ the ack, one group at a time; with write caching an ack once written, the deferr
 the log's lock while appends go on (`Log::begin_flush`, `Flush::sync`, `Log::end_flush`), and an
 inline sync once unsynced plus in-flight bytes reach twice `flush_bytes`), the kernel writing dirty pages back in any order, a
 power loss that keeps each unsynced record whole, torn or not at all, media damage to a
-persisted record, and the recovery scan of `scan()` step for step: the forward scan with its LSN
+persisted record, an fsync that fails (Linux may drop the pages it could not write and mark
+them clean, so a later fsync succeeds without them; the log then refuses everything until a
+restart, `Error::Fatal`), and the recovery scan of `scan()` step for step: the forward scan with its LSN
 and group checks, the search past the stop for a later group (fail closed) or the torn group's
 own records (truncate), and the zeroing of every leftover record before the log goes on. A
 recycled file starts with records of an older generation in any slot.
@@ -60,11 +104,15 @@ or damaged record; the Kani proofs cover the decoder itself), and other segments
 
 | Config | Segment | Group | Crashes | Other | Distinct states |
 |---|---|---|---|---|---|
-| `MC_sync` | 5 records | ≤ 2 | 2 | media faults | 168,792 |
-| `MC_caching` | 6 | ≤ 2 | 1 | flush at 2, bound 6 (`2 × flush + group`) | 579,793 |
-| `Nightly_sync` | 6 | ≤ 3 | 2 | media faults | 1,502,239 |
+| `MC_sync` | 5 records | ≤ 2 | 2 | media faults, 1 failed fsync | 425,867 |
+| `MC_caching` | 6 | ≤ 2 | 1 | flush at 2, bound 6 (`2 × flush + group`), 1 failed fsync | 1,199,742 |
+| `Nightly_sync` | 6 | ≤ 3 | 2 | media faults, 1 failed fsync | 3,959,473 |
 | `Nightly_caching` | 6 | ≤ 2 | 2 | flush at 2, bound 6, media faults (`Prefix`) | 33,850,249 |
 | `MC_caching_onebound` (expect) | 6 | ≤ 2 | 1 | bound 4 (`flush + group`, before #16): `NoFalseAlarm` fails | |
+| `MC_sync_retry` (expect) | 4 | ≤ 2 | 1 | a failed fsync retried instead of fatal: `AckedSurvive` fails | |
+
+`MC_sync_retry` is the rule in AGENTS.md (never retry an fsync and then ack) as a model: the
+retry succeeds without the pages the failure dropped and acknowledges them.
 
 **Found.** Under write caching several groups are unsynced at once and the kernel writes them
 back in any order, so a power loss can keep a later group and lose an earlier one. The scan
@@ -147,6 +195,8 @@ Storing at a replica and replying are one step; a power loss between them is a l
   preferred node) store each key once.
 - `DedupLosesNothing`: every key of an acknowledged batch is kept (not a tombstone) in some
   durable copy.
+- `IndexCoversHeld`: a running node's dedup index holds the keys of every batch it holds,
+  however the copy arrived (accepted, replicated, repaired, recovered).
 - `Converge` (liveness, under weak fairness of commit, flush, restart and repair): every node
   ends up with every batch some node holds durably.
 - `EndCoversAcked`: the ends of any `EndNeed` nodes, merged per log, cover every acknowledged
@@ -157,14 +207,15 @@ replicas sending the same key, one attempt per batch plus repair.
 
 | Config | Faults | Checks | Distinct states |
 |---|---|---|---|
-| `MC_append` | 1 power loss, 1 lost disk | `AckedSurvive`, `AckedInCopiesDomains`, `NoConflictingAcks`, `EndCoversAcked` | 1,423,165 |
-| `MC_dedup` | 2 power losses | `AckedSurvive`, `DedupLosesNothing` | 570,582 |
-| `MC_one_index` | none, one entry node | `OneCopyPerKey`, `DedupLosesNothing` | 527,893 |
+| `MC_append` | 1 power loss, 1 lost disk | `AckedSurvive`, `AckedInCopiesDomains`, `NoConflictingAcks`, `EndCoversAcked`, `IndexCoversHeld` | 1,171,030 |
+| `MC_dedup` | 2 power losses | `AckedSurvive`, `DedupLosesNothing`, `IndexCoversHeld` | 455,955 |
+| `MC_one_index` | none, one entry node | `OneCopyPerKey`, `DedupLosesNothing` | 487,933 |
 | `MC_conflict` | 1 power loss, 1 lost disk; two variants of one identity | `AckedSurvive`, `NoConflictingAcks` | 91,985 |
-| `MC_converge` | write caching, 1 power loss | `Converge` | 6,967 |
+| `MC_converge` | write caching, 1 power loss | `Converge` | 5,295 |
 | `MC_end4_fixed` | none, four nodes, 3 ends | `EndCoversAcked`, `AckedInCopiesDomains` | 880 |
 | `MC_end4` (expect) | none, four nodes, 2 ends | `EndCoversAcked` fails | |
 | `MC_dedup_caching` (expect) | write caching, 1 power loss | `DedupLosesNothing` fails: open finding below | |
+| `MC_repair_unfixed` (expect) | 1 power loss; repair not recording keys | `IndexCoversHeld` fails | |
 
 **Found and fixed.** `Client::end` merged the ends of `min(n, 2)` nodes. An acked batch is on
 `copies` nodes, so only `n - copies + 1` ends are sure to include one: on four nodes with 2
@@ -190,9 +241,17 @@ was acknowledged (`MC_dedup_caching`: 8 steps; with a lost disk, `MC_append` wit
    within an ack round trip of each other (the common case) keep both copies;
 3. accept it and document it next to the failover limit (§7.4 of `docs/PLAN.md`).
 
-Also visible, not bugs: after a lost disk `Client::end` can be short until repair (a reader at
-the end re-reads a little), and repair does not record dedup keys (a node that got a batch only
-by repair keeps a later duplicate of it).
+**Found and fixed.** Repair stored a batch without recording its dedup keys (replication and
+a restart's rebuild both record them), so a node that got a batch only by repair (it was down,
+or lost its disk) accepted a later duplicate of its events: a producer replica's copy, or a
+resend, landing on it once it was back as the stream's preferred node. Found by the cluster
+model (`crates/client/tests/model.rs`: node 1 down, `e13` sent, node 1 joins and repairs, `e13`
+sent again, read twice); `MC_repair_unfixed` keeps it. Test:
+`a_node_that_got_a_batch_by_repair_drops_a_later_duplicate_of_its_events` (failed first: both
+copies stored).
+
+Also visible, not a bug: after a lost disk `Client::end` can be short until repair (a reader at
+the end re-reads a little).
 
 ### Wire codecs: property tests in `crates/mesh`
 
@@ -214,6 +273,65 @@ in any order and failed writes, checked after every step against a reference of 
 rules `Replication.tla` assumes (an exact retry is a duplicate, any other overlap a conflict, a
 failed write frees its range, only durable batches are served) and of frontier arithmetic (the
 durable prefix from 0, and one past the highest durable sequence). No discrepancy found.
+
+### The segment log against a list of records: `model` in `crates/storage/tests/log.rs`
+
+Appends of 1 to 3 records with keys from a set of three (16 KiB segments, so rolls and sealed
+index files come quickly), flushes, retention by size and by age, dropping the tail cache,
+deleting a sealed segment's index file and reopening, and clean reopens, with and without write
+caching; after every step `read`, `entries`, `sealed` and `by_key` agree with the model:
+records below the floor are gone, the sealed segments tile the log from it, each one's by-key
+lookup holds exactly its records of the key by `first_seq` (the order of `IDX_VERSION` 2),
+retention by age drops exactly the leading run of segments whose records are all older, and a
+lost index file is rebuilt. It catches a by-key section sorted by record index instead of
+`first_seq`. No discrepancy found.
+
+### The WAL: `wal::model`
+
+Bursts of plain and replacing appends submitted before any is awaited (so the writer groups
+them), retention, and the data fsync failing after a random number of syncs, with and without
+write caching: acks arrive in submit order with consecutive LSNs, each acked batch reads back
+with its bytes and its key (replacing or not), a failure fences the WAL (`fatal`), and from then
+on nothing is acknowledged or retained. No discrepancy found.
+
+### RPC frames: `rpc::props`
+
+Frames of every kind with random ids and bodies, the stream cut into random reads: they read
+back in order and end cleanly; cut inside a frame, the frames before the cut read back and the
+read fails; any bytes read as frames or fail, never a panic. No bug found.
+
+### The dedup window: `dedup::model`
+
+Checks, records (what a replica or repair keeps) and clock ticks against a map of each id's
+last-kept second. Without the cap dedup is exact (a duplicate iff kept within the window,
+inclusive); at any cap it never claims a duplicate for an id not kept within the window, and
+catches every id kept within `effective_window_s`.
+
+**Found and fixed.** Past `max_entries`, `record` dropped the oldest quarter of the recorded ids
+without shortening the window, so `effective_window_s` (`precog_dedup_window_seconds`) kept
+reporting ids as remembered that were gone, and could drop ids of the current second (the
+check path keeps a second's ids: the cap is soft within a second). It now raises the window's
+floor past what it drops, and never drops the current second. Test:
+`at_the_cap_dedup_is_sound_and_keeps_its_effective_window` (failed first: an id recorded at 100
+missed at 100 within a reported 0 s window).
+
+### The whole path: `crates/client/tests/model.rs`
+
+A 3-node cluster on loopback, optionally one node down from the start until it joins and runs
+a repair pass. Two producer replicas send events with dedup ids from a set of 24, a compacted
+stream takes puts; then a reader from the beginning reads each acked id exactly once and each
+writer in order, a reader that commits partway and resumes from the commit reads the rest
+exactly, a reader at the end reads nothing, and `latest` is the newest value of every key. 256
+runs of up to 24 steps.
+
+**Found and fixed.** `Consumer::poll` (Rust and Go) returned no events whenever the batches it
+fetched held none for the reader (a producer replica's copy whose events dedup all dropped, or
+one the cursor was past), though it is documented as empty only when caught up: a reader that
+reads until an empty poll stopped short (here: everything after b's copy of an event a sent).
+It now reads on until events come back or no batch does. Tests:
+`a_poll_is_empty_only_when_caught_up_even_past_a_batch_dedup_emptied` (Rust,
+`crates/client/tests/sdk.rs`) and `TestAPollIsEmptyOnlyWhenCaughtUpEvenPastABatchDedupEmptied`
+(Go); both failed first, reading only `t0`. And repair's dedup keys, above.
 
 ## Consumers and positions: `spec/consumers/Positions.tla`
 

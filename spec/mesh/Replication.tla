@@ -31,7 +31,8 @@ CONSTANTS
     MaxSends,         \* client attempts per identity and variant
     MaxFaults,        \* power losses (with write caching) plus disk losses
     MaxCrashes,       \* power losses in all
-    EndNeed           \* nodes `Client::end` merges (the code: min(nodes, 2))
+    EndNeed,          \* nodes `Client::end` merges (the code: min(nodes, 2))
+    RepairRecords     \* repair records the keys of what it stores (the fix); FALSE: before it
 
 None == [v |-> "none"]
 Domains(S) == {Dom[n] : n \in S}
@@ -159,14 +160,15 @@ Ack(o) ==
     /\ UNCHANGED <<st, q, idx, msgs, sends, up, lost, faults, crashes>>
 
 \* Anti-entropy: n fetches a durable batch peer p holds and n lacks (`repair_peer` ->
-\* `store_local`; repair does not record dedup keys).
+\* `store_local`), and records the keys it kept, as a replica does.
 Repair(n, p, i) ==
     /\ up[n] /\ up[p] /\ n # p
     /\ Durable(p, i)
     /\ st[n][i] = None
     /\ st' = [st EXCEPT ![n][i] = [st[p][i] EXCEPT !.s =
                                      IF WriteCaching THEN "written" ELSE "synced"]]
-    /\ UNCHANGED <<q, idx, ops, msgs, sends, acked, up, lost, faults, crashes>>
+    /\ idx' = IF Dedup /\ RepairRecords THEN [idx EXCEPT ![n] = @ \cup st[p][i].kept] ELSE idx
+    /\ UNCHANGED <<q, ops, msgs, sends, acked, up, lost, faults, crashes>>
 
 \* What a restart recovers: synced copies (and, without write caching, written ones).
 Kept(n) == [i \in Ids |-> IF st[n][i] # None /\ st[n][i].s = "synced" THEN st[n][i] ELSE None]
@@ -248,6 +250,12 @@ NoConflictingAcks == NoCopyLost => \A i \in Ids : Cardinality({v \in Variants : 
 DedupLosesNothing ==
     \A p \in acked : \A k \in KeysOf[p[1]] :
         \E n \in Nodes, i \in Ids : Durable(n, i) /\ k \in st[n][i].kept
+
+\* A running node's dedup index holds the keys of every batch it holds: whichever way a copy
+\* arrived (accepted, replicated, repaired, recovered), a later duplicate of its events on
+\* this node is dropped.
+IndexCoversHeld ==
+    Dedup => \A n \in Nodes : up[n] => \A i \in Ids : st[n][i] # None => st[n][i].kept \subseteq idx[n]
 
 \* Two producer replicas meeting one dedup index keep one copy of each key.
 OneCopyPerKey ==

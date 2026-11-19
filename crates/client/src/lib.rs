@@ -315,6 +315,18 @@ impl Consumer {
     /// The next events (about `max_bytes` of batches), per writer in sequence order; empty when
     /// caught up. Fails over to the next node on an error.
     pub async fn poll(&mut self, max_bytes: u32) -> Result<Vec<Event>> {
+        // a batch can hold no event for this reader (dedup dropped them all, or the cursor is
+        // past them): read on, so an empty poll still means caught up
+        loop {
+            match self.poll_batches(max_bytes).await? {
+                Some(evs) if evs.is_empty() => continue,
+                evs => return Ok(evs.unwrap_or_default()),
+            }
+        }
+    }
+
+    /// One read: None when no batch came back.
+    async fn poll_batches(&mut self, max_bytes: u32) -> Result<Option<Vec<Event>>> {
         let n = self.client.mc.node_count();
         let req = Control::ReadCursor {
             stream: self.stream.clone(),
@@ -337,7 +349,10 @@ impl Consumer {
         Err(last.unwrap()).context("no node answered")
     }
 
-    fn take(&mut self, mut body: Bytes) -> Result<Vec<Event>> {
+    fn take(&mut self, mut body: Bytes) -> Result<Option<Vec<Event>>> {
+        if body.remaining() < 4 {
+            return Ok(None);
+        }
         let mut out = vec![];
         while body.remaining() >= 4 {
             let len = body.get_u32_le() as usize;
@@ -347,7 +362,7 @@ impl Consumer {
             out.extend(b.try_events()?.into_iter().filter(|e| e.seq >= from));
             self.cursor.insert(b.id.log.clone(), b.end_seq());
         }
-        Ok(out)
+        Ok(Some(out))
     }
 
     /// Where the consumer is: a position valid on every node.

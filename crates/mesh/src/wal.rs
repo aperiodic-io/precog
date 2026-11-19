@@ -359,3 +359,148 @@ mod tests {
         assert_eq!(flags, [false, true], "flush_delay_ms {flush_delay_ms}");
     }
 }
+
+/// Model-based test: random bursts of appends (plain and replacing, queued together so the
+/// writer groups them), retention, and an fsync that fails after a random number of syncs.
+/// Acks arrive in submit order with consecutive LSNs, each acked batch reads back as logged,
+/// and from the first failure on nothing is acknowledged again (Error::Fatal: ack means durable).
+#[cfg(test)]
+mod model {
+    use super::*;
+    use crate::proto::{LogId, decode_record_key};
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// a burst of (payload bytes, replaces) submitted before any is awaited
+        Burst(Vec<(usize, bool)>),
+        Retain(u64),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                6 => prop::collection::vec((0usize..3000, any::<bool>()), 1..6).prop_map(Op::Burst),
+                1 => (16u64..128).prop_map(|k| Op::Retain(k << 10)),
+            ],
+            1..24,
+        )
+    }
+
+    fn run(caching: bool, fail_after: Option<u64>, ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Config::new(dir.path());
+        c.segment_size = 32 << 10;
+        c.failpoints.fail_data_sync_after = fail_after;
+        if caching {
+            // flush_bytes small enough that appends sync inline: the fsyncs happen in the test's order
+            c.flush_delay_ms = 60_000;
+            c.flush_bytes = 4 << 10;
+        }
+        let wal = Wal::open(c).unwrap();
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let mut logged: Vec<(bytes::Bytes, bool)> = vec![];
+        let mut first = 0;
+        let mut failed = false;
+        let mut seq = 0u64;
+        rt.block_on(async {
+            for op in ops {
+                match op {
+                    Op::Burst(bs) => {
+                        let mut rxs = vec![];
+                        for (n, replaces) in bs {
+                            let p: Vec<u8> = (0..n).map(|i| (seq as usize + i) as u8).collect();
+                            let b =
+                                Batch::parse(Batch::encode(&log, seq, &[(seq, &p[..])]).unwrap())
+                                    .unwrap();
+                            seq += 1;
+                            let bytes = b.bytes.clone();
+                            // under write caching a deferred fsync can fail on the WAL thread
+                            failed |= wal.fatal.load(Ordering::Acquire);
+                            match wal.submit_as(b, replaces) {
+                                Ok(rx) => rxs.push((rx, bytes, replaces, failed)),
+                                // under write caching an append fails at once, fencing the rest
+                                Err(_) => prop_assert!(
+                                    failed || wal.fatal.load(Ordering::Acquire),
+                                    "refused before any failure"
+                                ),
+                            }
+                        }
+                        for (rx, bytes, replaces, after) in rxs {
+                            match Wal::durable(rx).await {
+                                Ok(lsn) => {
+                                    prop_assert!(!after, "acked after an fsync failed");
+                                    prop_assert_eq!(
+                                        lsn,
+                                        logged.len() as u64,
+                                        "acks in submit order"
+                                    );
+                                    logged.push((bytes, replaces));
+                                }
+                                Err(_) => {
+                                    prop_assert!(
+                                        fail_after.is_some(),
+                                        "an append failed with no fault"
+                                    );
+                                    failed = true;
+                                }
+                            }
+                        }
+                        if failed {
+                            prop_assert!(
+                                wal.fatal.load(Ordering::Acquire),
+                                "a failed fsync fences the wal"
+                            );
+                        }
+                    }
+                    Op::Retain(max) => {
+                        failed |= wal.fatal.load(Ordering::Acquire);
+                        match wal.retain(Some(max), None).await {
+                            Ok(f) => {
+                                prop_assert!(!failed && f >= first);
+                                first = f;
+                            }
+                            Err(e) => prop_assert!(
+                                fail_after.is_some(),
+                                "retention failed with no fault: {e}"
+                            ),
+                        }
+                    }
+                }
+                for (lsn, (bytes, replaces)) in logged.iter().enumerate().skip(first as usize) {
+                    let r = wal.reader.read(lsn as u64).unwrap().unwrap();
+                    prop_assert_eq!(&r.payload[..], &bytes[..]);
+                    prop_assert_eq!(
+                        decode_record_key(&r.meta.key).unwrap(),
+                        (log.clone(), *replaces)
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    proptest! {
+
+        #[test]
+        fn the_wal_acks_in_order_and_never_after_a_failed_fsync(
+            fail_after in prop::option::of(0u64..12), ops in ops(),
+        ) {
+            run(false, fail_after, ops)?;
+        }
+
+        #[test]
+        fn under_write_caching_the_wal_acks_in_order_and_never_after_a_failed_fsync(
+            fail_after in prop::option::of(0u64..12), ops in ops(),
+        ) {
+            run(true, fail_after, ops)?;
+        }
+    }
+}
