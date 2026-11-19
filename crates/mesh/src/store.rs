@@ -591,6 +591,15 @@ impl Store {
     /// Rebuilds the index from the segment log, one chunk of its index at a time: the batches
     /// of sealed segments end up on disk, not in RAM.
     pub fn load(reader: Reader) -> anyhow::Result<Store> {
+        Self::load_with(reader, |_| {})
+    }
+
+    /// `load`, showing `each` every index entry of the log in LSN order (one pass for the
+    /// node's other indexes too).
+    pub fn load_with(
+        reader: Reader,
+        mut each: impl FnMut(&precog_storage::Entry),
+    ) -> anyhow::Result<Store> {
         let s = Store {
             inner: Mutex::default(),
             reader,
@@ -613,6 +622,7 @@ impl Store {
                 );
                 for e in es {
                     from = e.lsn + 1;
+                    each(&e);
                     let log = decode_log_key(&e.meta.key)?;
                     let ix = inner.intern(&log);
                     let first = e.meta.first_seq;

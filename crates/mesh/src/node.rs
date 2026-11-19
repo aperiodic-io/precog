@@ -371,26 +371,17 @@ impl Node {
             };
             compact.insert(name.to_string(), m);
         }
-        // one pass over the log's index, a chunk at a time: the dedup window's batches rebuild
-        // its index, the compacted streams' replay (bounded: those, not the log)
+        // the store's one pass over the log's index: the dedup window's batches rebuild its
+        // index, the compacted streams' replay (bounded: those, not the log)
         let (mut recent, mut replay) = (vec![], vec![]);
-        let mut from = wal.reader.first_lsn();
-        loop {
-            let es = wal.reader.entries(from, 1 << 16)?;
-            let Some(last) = es.last() else {
-                break;
-            };
-            from = last.lsn + 1;
-            for e in &es {
-                if since.is_some_and(|s| e.meta.time_ms >= s) {
-                    recent.push(e.lsn);
-                }
-                if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
-                    replay.push(e.lsn);
-                }
+        let store = Store::load_with(wal.reader.clone(), |e| {
+            if since.is_some_and(|s| e.meta.time_ms >= s) {
+                recent.push(e.lsn);
             }
-        }
-        let store = Store::load(wal.reader.clone())?;
+            if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
+                replay.push(e.lsn);
+            }
+        })?;
         let n = store.totals().0;
         for lsn in replay {
             if let Some(r) = wal.reader.read(lsn)? {
