@@ -369,3 +369,10 @@ async fn a_live_subscriber_gets_a_logs_batches_that_land_out_of_order() {
     }
     assert_eq!(got, [0, 1, 2]);
 }
+
+#[test]
+fn an_address_prints_as_configured() {
+    // errors and logs name peers by the address an operator wrote
+    let a: Addr = "tcp://127.0.0.1:7001".parse().unwrap();
+    assert_eq!(a.to_string(), "tcp://127.0.0.1:7001");
+}
