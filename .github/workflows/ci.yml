@@ -80,14 +80,14 @@ jobs:
   kani:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # the proofs' stubs are used only through #[kani::stub]: -D warnings would call them dead
-    env: { RUSTFLAGS: "" }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with: { save-if: "${{ github.ref == 'refs/heads/main' }}", shared-key: kani }
       - run: cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup
-      - run: cargo kani -p precog-storage -Z stubbing
+      # the proofs' stubs are used only through #[kani::stub]: -D warnings would call them dead
+      # (unset, not empty: an empty RUSTFLAGS reaches the compiler as an empty argument)
+      - run: env -u RUSTFLAGS cargo kani -p precog-storage -Z stubbing
 
   # One shard per 150 mutants of the diff, at most 4; none without mutants. Drafts skip it.
   mutants-plan:
