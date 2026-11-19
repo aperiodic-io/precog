@@ -59,7 +59,7 @@ impl Wal {
     pub fn open(cfg: Config) -> Result<(Wal, Vec<precog_storage::Entry>)> {
         let log = precog_storage::Log::open(cfg)?;
         let reader = log.reader();
-        let entries = reader.entries(reader.first_lsn(), usize::MAX);
+        let entries = reader.entries(reader.first_lsn(), usize::MAX)?;
         let (tx, rx) = std::sync::mpsc::channel::<Req>();
         let stats = Arc::new(WalStats::default());
         let s = log.stats();

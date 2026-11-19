@@ -683,6 +683,7 @@ impl Node {
                 .wal
                 .reader
                 .entries(lsn, 1)
+                .unwrap_or_default()
                 .first()
                 .filter(|e| e.lsn == lsn)
             {

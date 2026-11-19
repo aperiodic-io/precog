@@ -950,7 +950,7 @@ mod tests {
             t.durable(x);
         }
         let r = t.log.reader();
-        let s2 = Store::load(r.clone(), r.entries(0, 100)).unwrap();
+        let s2 = Store::load(r.clone(), r.entries(0, 100).unwrap()).unwrap();
         assert_eq!(s2.totals(), t.s.totals());
         assert_eq!(s2.frontiers(None), t.s.frontiers(None));
         assert_eq!(s2.get(&xs[3].id).unwrap().bytes, xs[3].bytes);
@@ -969,7 +969,7 @@ mod tests {
         }
         fn reload(&self) -> anyhow::Result<Store> {
             let r = self.log.reader();
-            Store::load(r.clone(), r.entries(0, 1000))
+            Store::load(r.clone(), r.entries(0, 1000)?)
         }
     }
 
@@ -1370,7 +1370,7 @@ mod tests {
         };
         t.log.append(&[(m, &a.bytes[..])]).unwrap();
         let r = t.log.reader();
-        let s = Store::load(r.clone(), r.entries(0, 10)).unwrap();
+        let s = Store::load(r.clone(), r.entries(0, 10).unwrap()).unwrap();
         assert_eq!(
             s.trim_stream("a", None, Some(500), 1_500),
             0,

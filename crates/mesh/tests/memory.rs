@@ -36,8 +36,8 @@ fn live() -> isize {
 
 const BATCHES: usize = 200_000;
 /// Bytes of heap per retained batch, the store's index and the segment log's together (requested
-/// sizes: malloc's own rounding and headers come on top). Today: 338 B (store 147 B).
-const BUDGET: f64 = 400.0;
+/// sizes: malloc's own rounding and headers come on top). Today: 151 B (store 147 B).
+const BUDGET: f64 = 200.0;
 
 #[test]
 fn ram_per_retained_batch_stays_within_budget() {
@@ -62,7 +62,7 @@ fn ram_per_retained_batch_stays_within_budget() {
         .collect();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = precog_storage::Config::new(dir.path());
-    cfg.segment_size = 16 << 20;
+    cfg.segment_size = 1 << 20;
     cfg.spares = 0;
     cfg.tail_cache_bytes = 0;
     let mut log = precog_storage::Log::open(cfg).unwrap();
