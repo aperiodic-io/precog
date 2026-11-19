@@ -292,4 +292,72 @@ mod tests {
         assert_eq!(s.len(), 100);
         assert_eq!(s.effective_window_s(2), 0, "the shortest: b started at 2");
     }
+
+    #[test]
+    fn an_id_is_remembered_for_exactly_the_window() {
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        assert_eq!(dups(&mut d, &[7], 10), [false]);
+        assert_eq!(dups(&mut d, &[7], 310), [true], "300 s later: still in");
+        assert_eq!(dups(&mut d, &[7], 311), [false], "301 s later: out");
+        // a recorded (replicated) id counts from the second it was recorded, the same way
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        d.record(&[8, 9], 0);
+        assert_eq!(dups(&mut d, &[8], 300), [true]);
+        assert_eq!(dups(&mut d, &[9], 301), [false]);
+    }
+
+    #[test]
+    fn expired_ids_are_swept_from_memory_every_quarter_window() {
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        dups(&mut d, &[1], 9);
+        dups(&mut d, &[2], 10);
+        dups(&mut d, &[3], 310); // a sweep: 9 is past the window, 10 is not yet
+        assert_eq!(d.len(), 2);
+        dups(&mut d, &[4], 384); // 2 has expired, but the next sweep is due at 385
+        assert_eq!(d.len(), 3);
+        dups(&mut d, &[5], 385);
+        assert_eq!(d.len(), 3, "2 swept");
+    }
+
+    #[test]
+    fn past_the_cap_the_oldest_quarter_of_the_window_goes() {
+        let mut d = Dedup::new(300, 3, 4);
+        for (id, t) in [(1, 0), (2, 40), (3, 80), (4, 120), (5, 160)] {
+            dups(&mut d, &[id], t);
+        }
+        assert_eq!(d.len(), 5, "at the cap nothing goes");
+        dups(&mut d, &[6], 170); // over it: the oldest quarter of 170 s (ids before 42) goes
+        assert_eq!(d.len(), 4);
+        assert_eq!(dups(&mut d, &[1, 3], 170), [false, true]);
+        assert_eq!(d.effective_window_s(170), 128);
+    }
+
+    #[test]
+    fn recorded_ids_past_the_cap_lose_their_oldest_quarter() {
+        let mut d = Dedup::new(300, 3, 100);
+        assert!(d.is_empty());
+        for i in 0..3 {
+            d.record(&(i * 10..i * 10 + 10).collect::<Vec<u64>>(), 1);
+        }
+        assert_eq!(d.len(), 30, "under the cap all are kept");
+        assert!(!d.is_empty());
+        d.record(&(30..100).collect::<Vec<u64>>(), 1);
+        d.record(&[100], 1); // 100 pending: a quarter goes first
+        assert_eq!(d.len(), 76);
+    }
+
+    #[test]
+    fn streams_are_empty_until_an_id_is_recorded() {
+        let mut s = Streams::new(300, 3, 100);
+        assert!(s.is_empty());
+        s.record("a", &[1], 1);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "only u64 keys")]
+    fn the_pass_through_hasher_takes_only_u64_digests() {
+        // another key type would be hashed by `write`, which would put every key in one bucket
+        Pass::default().write(b"x");
+    }
 }

@@ -384,7 +384,8 @@ impl Batch {
             b.put_u64_le(t);
             let k = if dropped { &b""[..] } else { k };
             b.put_u16_le(k.len() as u16);
-            b.put_u32_le(if dropped { n | DROPPED } else { n });
+            // n < DROPPED (checked above): adding the flag sets its bit
+            b.put_u32_le(if dropped { n + DROPPED } else { n });
             b.put_slice(k);
         }
         b.put_u32_le(block.len() as u32);
@@ -1013,6 +1014,19 @@ mod tests {
         assert_eq!(kept.len(), 198);
         assert_eq!((kept[0].seq, &kept[0].payload[..]), (8, &evs[1].2[..]));
         assert_eq!(f.keys().filter(|k| k.is_some()).count(), 198);
+    }
+
+    #[test]
+    fn a_compressed_batchs_keyless_events_have_no_dedup_key() {
+        // an empty key means "no key": such events must never be deduplicated against each other
+        let z = Batch::encode_compressed(
+            &log(),
+            0,
+            &[(1, b"", b"a"), (2, b"id", b"b"), (3, b"", b"a")],
+        )
+        .unwrap();
+        let b = Batch::parse(z).unwrap();
+        assert_eq!(b.keys().collect::<Vec<_>>(), [None, Some(&b"id"[..]), None]);
     }
 
     #[test]
