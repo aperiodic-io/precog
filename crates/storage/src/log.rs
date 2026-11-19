@@ -30,7 +30,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-const SEG_HEADER: u64 = 4096;
+/// A segment's header page: what a roll adds to the log's bytes before any record.
+pub const SEG_HEADER: u64 = 4096;
 const SEG_MAGIC: u32 = u32::from_le_bytes(*b"PCSG");
 const IDX_MAGIC: u32 = u32::from_le_bytes(*b"PCIX");
 const MF_MAGIC: u32 = u32::from_le_bytes(*b"PCMF");
@@ -71,7 +72,8 @@ pub struct Failpoints {
     /// The data sync after this many successful ones fails.
     pub fail_data_sync_after: Option<u64>,
     /// Fail at a named step ("roll:after_spare_rename", "roll:after_header",
-    /// "roll:after_manifest", "roll:after_index").
+    /// "roll:after_manifest", "roll:after_index", "retain:before_manifest",
+    /// "retain:after_manifest").
     pub fail_at: Option<&'static str>,
 }
 
@@ -106,6 +108,16 @@ pub struct Stats {
     pub spares_made: u64,
     pub cache_hits: u64,
     pub syncs: u64,
+}
+
+/// A sealed segment as retention sees it: its LSNs `base..end`, the bytes it adds to the log and
+/// the append time of its newest record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sealed {
+    pub base: Lsn,
+    pub end: Lsn,
+    pub bytes: u64,
+    pub max_time: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -328,6 +340,21 @@ impl Reader {
                 seg.id, e.offset
             ))),
         }
+    }
+
+    /// The append time of the record at `lsn`, from its segment's index (`None`: not in the log).
+    pub fn time_ms(&self, lsn: Lsn) -> Result<Option<u64>> {
+        let seg = {
+            let segs = self.shared.segs.read().unwrap();
+            match segs.partition_point(|g| g.base_lsn <= lsn).checked_sub(1) {
+                Some(i) => segs[i].clone(),
+                None => return Ok(None),
+            }
+        };
+        Ok(seg
+            .index(lsn - seg.base_lsn, 1)?
+            .first()
+            .map(|e| e.meta.time_ms))
     }
 
     /// Below the retention floor.
@@ -1521,28 +1548,59 @@ impl Log {
         if let Some(f) = &self.failed {
             return Err(Error::Fatal(f.clone()));
         }
-        let active_bytes = self.active.as_ref().map_or(0, |a| a.offset);
-        let mut total: u64 = self
-            .manifest
-            .segs
-            .iter()
-            .filter(|s| s.sealed)
-            .map(|s| s.end_offset)
-            .sum::<u64>()
-            + active_bytes;
-        let mut drop_n = 0;
-        for s in self.manifest.segs.iter().filter(|s| s.sealed) {
-            let by_size = max_bytes.is_some_and(|m| total > m);
+        let (segs, _) = self.segments();
+        match self.retirable(max_bytes, min_time_ms) {
+            0 => Ok(self.first_lsn()),
+            n => self.drop_until(segs[n - 1].end),
+        }
+    }
+
+    /// The sealed segments, oldest first, and the log's bytes now.
+    pub fn segments(&self) -> (Vec<Sealed>, u64) {
+        let segs = self.manifest.segs.iter().filter(|s| s.sealed);
+        let v = segs
+            .map(|s| Sealed {
+                base: s.base_lsn,
+                end: s.end_lsn,
+                bytes: s.end_offset,
+                max_time: s.max_time,
+            })
+            .collect();
+        (v, self.stats().log_bytes)
+    }
+
+    /// How many of the oldest sealed segments `retain` drops.
+    pub fn retirable(&self, max_bytes: Option<u64>, min_time_ms: Option<u64>) -> usize {
+        let (segs, mut left) = self.segments();
+        let mut n = 0;
+        for s in segs {
+            let by_size = max_bytes.is_some_and(|m| left > m);
             let by_age = min_time_ms.is_some_and(|t| s.max_time < t);
             if !(by_size || by_age) {
                 break;
             }
-            total -= s.end_offset;
-            drop_n += 1;
+            left -= s.bytes;
+            n += 1;
         }
+        n
+    }
+
+    /// Drops the sealed segments that end at or below `end`, oldest first (never the active
+    /// one). Returns the new first LSN.
+    pub fn drop_until(&mut self, end: Lsn) -> Result<Lsn> {
+        if let Some(f) = &self.failed {
+            return Err(Error::Fatal(f.clone()));
+        }
+        let drop_n = self
+            .manifest
+            .segs
+            .iter()
+            .take_while(|s| s.sealed && s.end_lsn <= end)
+            .count();
         if drop_n == 0 {
             return Ok(self.first_lsn());
         }
+        self.failpoint("retain:before_manifest", true)?;
         let mut m = self.manifest.clone();
         let dropped: Vec<MfSeg> = m.segs.drain(..drop_n).collect();
         m.first_lsn = m.segs.first().map_or(self.next_lsn(), |s| s.base_lsn);
@@ -1553,6 +1611,7 @@ impl Log {
         let floor = self.manifest.first_lsn;
         self.shared.first_lsn.store(floor, Ordering::Release);
         self.shared.segs.write().unwrap().drain(..drop_n);
+        self.failpoint("retain:after_manifest", true)?;
         for s in dropped {
             let _ = std::fs::remove_file(idx_path(&self.cfg.dir, s.id));
             self.recycle_file(&seg_path(&self.cfg.dir, s.id))?;
