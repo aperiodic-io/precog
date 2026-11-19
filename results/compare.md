@@ -71,6 +71,46 @@ A recycling log no longer zero-fills spares: with the log at its retention, a ro
 wrote a whole segment of zeros (11% of a node's CPU at 100 MB/s) that the next retention pass then deleted, having
 recycled a segment anyway. The preallocator now waits up to 5 s for that recycle.
 
+## Lowering CPU per record further: what was tried (2026-11-19)
+
+Goal: <= ~1.0 us/record in both modes (3x Redpanda's 3.26 / 3.39 with margin). Not reached; nothing measurably
+moved the end-to-end number on this VM. Same harness (`WARMUP=20 BATCH=250`, 20% resends, 2,000 in flight).
+
+Runs at `FLUSH_MS=0`, base interleaved with each candidate (records/s, p50 ms, p99 ms, us/record):
+
+- base: 714.6k/2.64/5.35/1.274, 692.6k/2.72/5.46/1.343, 685.6k/2.74/5.83/1.301, 672.6k/2.81/5.73/1.428,
+  711.2k/2.65/5.48/1.324, 720.2k/2.63/5.08/1.266, 737.3k/2.56/5.25/1.216, 749.3k/2.54/4.98/1.173,
+  763.5k/2.47/4.79/1.126, 769.5k/2.45/4.76/1.113, 770.9k/2.48/4.74/1.218. Median 1.266.
+- tail cache sharing the appended `Bytes` + dedup pending as a deque: 1.225, 1.328, 1.303, 1.398, 1.484, 1.311,
+  1.139, 1.328 (median 1.316); the replica's user time in `Log::append` fell from 10.1% to 5.5% of its samples.
+- writers to peers coalescing the acks of one group commit (requeue behind the runnable tasks): 1.196, 1.169, 1.244,
+  1.121, 1.318, 1.196 (median 1.196); all connections: 1.296, 1.269; `yield_now` in every writer: 1.313, 1.199,
+  1.249 at 612-640k records/s (throughput -10%).
+- glibc huge pages for the dedup table (`GLIBC_TUNABLES=glibc.malloc.hugetlb=1`): 1.415, 1.367 against 1.38, 1.551.
+
+The same binary ranges 1.11-1.50 us over a session, which is wider than any of these effects. Only the deque
+(pending replicated dedup ids: dropping the oldest quarter at the cap memmoved ~6M entries, 2.1% of a replica's
+samples) is committed. The rest was dropped: none measured above noise, and the tail-cache change adds a dependency
+and lets cached batches pin their network read buffers.
+
+Where the CPU goes (FLUSH_MS=0, perf with DWARF stacks, share of each node's samples):
+
+- accepting node: socket sends 14.6%, dedup lookups 13.3%, fsync 13.1%, tokio and other user code 11.7%,
+  `epoll_wait`/park 7.5%, recv 5.8%, rewriting batches without their duplicates 5.3%, WAL user code 5.3%,
+  pwrite 4.8%, index 4.7%, malloc/free 3.5%.
+- replica: fsync 20.8%, WAL user code 10.1% (5.5% with the tail-cache change), pwrite 9.5%, sends 9.3%,
+  `epoll_wait` 8.0%, index 8.0%, other user code 7.7%, dedup recording 6.7%, recv 5.5%, WAL wake-ups 5.6%.
+- At `FLUSH_MS=100`, the WAL handoff (worker -> WAL thread futex, the WAL thread's sleep, its eventfd wake of the
+  worker) is ~10% of every node: the WAL thread wakes for nearly every batch.
+- About a fifth of every node's samples land in context switches and wake-ups (`finish_task_switch`, IPIs): the
+  brokers run at 25-50% of a core because the load generator is CPU-bound (100% of its 1-CPU container), so each node
+  sleeps and wakes per event.
+
+What could reach the target, not attempted: appends written on the worker thread under write caching, with only
+the deferred fsync on another thread (~10% at `FLUSH_MS=100`; it touches the durability path and segment rolls
+would block the worker); coalescing sends at some latency cost; a prefetching dedup table (results/dedup.md found
+little over SwissTable).
+
 ## How Precog got here (same harness, 250-record batches unless noted)
 
 | change | CPU/record |
