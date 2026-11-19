@@ -44,7 +44,7 @@ on arrival play no part in read order.
 | `store.rs` | In-memory index: per-log `BTreeMap<first_seq, batch>`, reservation of pending ranges (concurrent duplicates coalesce), durable-only visibility, frontiers (`contiguous` prefix + `high`), event-time snapshot read |
 | `node.rs` | Append = local WAL ‖ replicate to one peer per other domain. **Early completion** at `copies`. Replicate is accepted only from authenticated peers and does not fan out further. Anti-entropy repair pulls each peer's durable inventory incrementally (cursor over the peer's WAL order). |
 | `rpc.rs` | Multiplexed request/response over one byte stream. The writer task coalesces frames. |
-| `transport.rs` | TCP. QUIC/Iroh was removed: TCP measured 1.4–1.6x faster. |
+| `transport.rs` | TCP. |
 | `client.rs` | `Writer` owns the sequence numbers. On a timeout, a transport error or an `Unknown` ack it retries the **same bytes** on the next node until a deadline. Failover sticks to the node that answered. |
 
 Tests are in `crates/mesh/src/*` (unit) and `crates/mesh/tests/cluster.rs`

@@ -23,7 +23,7 @@ This document is the plan of record. Evidence behind each decision:
 | | |
 |---|---|
 | Users | Producers we control (market data, telemetry, audit logs), many writers each with an independent sequence. Consumers that need per-source order, and optionally a global order. |
-| Interfaces | Rust client (`Writer`, `Subscription`) over TCP (QUIC/Iroh was removed: TCP measured 1.4–1.6x faster). Other languages and a Kafka-compatible gateway come later and are optional. |
+| Interfaces | Rust client (`Writer`, `Subscription`) over TCP. Other languages and a Kafka-compatible gateway come later and are optional. |
 | Deployment | 3+ commodity nodes in distinct failure domains, local disks, no object store required. |
 
 ### Guarantees (contract)
@@ -70,7 +70,7 @@ milestone's acceptance scenarios plus its performance gates.
 
 | # | Milestone | Scope | Exit criteria | Status |
 |---|---|---|---|---|
-| M0 | Proof of concept | Mesh, WAL, replication, repair, subscriptions, Iroh (since removed); benchmarks against Iggy 0.10 | Durable-2 throughput ≥ 2× Iggy; failover stalls in ms instead of seconds; results reproducible | **done** |
+| M0 | Proof of concept | Mesh, WAL, replication, repair, subscriptions; benchmarks against Iggy 0.10 | Durable-2 throughput ≥ 2× Iggy; failover stalls in ms instead of seconds; results reproducible | **done** |
 | M1 | Engineering foundation | AGENTS.md, CI on `ubuntu-latest`: fmt, clippy, tests + coverage gate, acceptance suite, mutation testing, instruction-count bench gate, wall-clock perf gate, nightly | CI required on `main`; gates fail on a deliberate regression | in progress |
 | M2 | Storage phases 0 + 1 | `precog-storage` replaces the in-memory WAL and store data (details in §5) | Acked data survives SIGKILL at any point; restart replays only the active segment; storage line coverage ≥ 90%; no throughput regression vs M0 | in progress |
 | M3 | Consumers | Resumable subscriptions keyed by per-writer frontiers, subscription failover between nodes, stored consumer positions, consumer groups that assign writer logs or keys | A subscriber killed or moved mid-stream loses and repeats nothing; group rebalance acceptance scenarios | planned |
