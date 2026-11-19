@@ -33,6 +33,7 @@ the bench and perf gates.
 | Coverage gate | `cargo llvm-cov nextest --workspace --lcov --output-path lcov.info && scripts/coverage-gate.sh lcov.info` |
 | Instruction-count benches | `cargo bench -p precog-storage --bench gate` (needs valgrind and `gungraun-runner`) |
 | Wall-clock perf gate | `python3 bench/perf-gate/gate.py --base <dir> --head <dir>` (see `.github/workflows/ci.yml`) |
+| Broker harness (Docker, root; optional CI job `harness`) | `sudo target/release/precog-harness run [--system redpanda] [--only a,b]` (see `crates/harness/README.md`) |
 | Mutants of a diff | `git diff origin/main... -- '*.rs' > pr.diff && cargo mutants --in-diff pr.diff` |
 
 The mesh crate needs `LIBCLANG_PATH` only for `storage-bench` (RocksDB bindings). Nothing else
@@ -68,6 +69,7 @@ Each invariant has tests that fail if it breaks. Keep them failing for the right
 |---|---|
 | `crates/storage` | `precog-storage`: segment log, group commit, index files, manifest, recovery, retention, tail cache |
 | `crates/mesh` | `precog-mesh`: node, replication, repair, RPC, TCP transport, client, CLI, acceptance tests |
+| `crates/harness` | Broker harness: a 3-node Docker cluster of Precog or the Redpanda dedup fork, faults, invariants |
 | `crates/bench` | Same-harness benchmarks against Apache Iggy |
 | `crates/storage-bench` | Storage-backend comparison (evidence; not part of the product) |
 | `bench/perf-gate` | Wall-clock gate comparing a PR with its merge base |
