@@ -22,7 +22,7 @@ Only what live-ingestion uses is built.
 | **Compacted streams**: the newest value of every key survives retention and restarts | `cleanup.policy=compact` (the collectors' `<name>.state` topics) |
 | **Broker-side dedup** by each event's dedup id, kept for a window (5 minutes on the raw streams) | the dedup fork's `redpanda.dedup.window.ms` keyed by `redpanda-dedup-key` |
 | **Durable acks on 2 of 3 nodes**, fsync before the ack by default | `acks=all` with RF=3 |
-| **Write caching** (`flush_delay_ms`, `flush_bytes`): ack once written on 2 nodes, fsync within 100 ms / 256 KiB; a failed fsync still fences the node | `write_caching_default=true`, as live-ingestion runs it |
+| **Write caching**, opt-in (`flush_delay_ms: 100`, `flush_bytes` 256 KiB by default): ack once written on 2 nodes, fsync within 100 ms / 256 KiB; a failed fsync still fences the node | `write_caching_default=true`, as live-ingestion runs it |
 | **Anti-entropy repair**: every node converges to the union of all copies, so a restarted node catches up by itself | partition replication and recovery |
 | **Cursors valid on every node** and **reader groups** with committed positions: consumers fail over between nodes and resume where they committed | consumer groups and committed offsets |
 | **A stream's end on a quorum** (`Client::end`), for readers that must prove they have read everything acked | high watermark |
@@ -62,7 +62,7 @@ numbers and caveats are in [results/compare.md](results/compare.md).
 | | **ratio** | **4.8x** | **3.9x** | **7.4x** | **3.0x** |
 | **fsync before every ack** | Precog | 696,600 | 2.71 ms | 5.49 ms | 1.39 µs |
 | | Redpanda | 159,000 | 11.5 ms | 21.3 ms | 3.26 µs |
-| | **ratio** | **4.4x** | **4.3x** | **3.9x** | **2.3x** |
+| | **ratio** | **4.4x** | **4.2x** | **3.9x** | **2.3x** |
 
 At these caps the load generator saturates before the brokers, which run at 25–50% of a core.
 
@@ -72,7 +72,7 @@ With every broker capped at 0.5 CPU, so the brokers are the bottleneck:
 
 Dedup drops exactly the resent share on both systems (Redpanda 19.99%).
 
-Where Precog's CPU goes and what was tried to lower it is also in `results/compare.md`. CPU per record is the one figure under 3x:
+Where Precog's CPU goes and what was tried to lower it is also in `results/compare.md`. CPU per record is the one ratio not clearly above 3x:
 - it is 3.0x with write caching, with no margin;
 - it is 2.3x with an fsync before every ack.
 
@@ -92,13 +92,12 @@ The protocol was chosen by measurement. [results/protocol.md](results/protocol.m
 
 The research behind them is in [reports/Native protocol design space.md](reports/Native%20protocol%20design%20space.md).
 
-The kept ideas compose:
+The ideas kept there compose. Precog's protocol ships these:
 - pipelining (8 batches in flight);
-- backlog frames with linger;
-- cumulative acks;
-- fixed 14-byte record columns with the dedup hash outside the compressed payload;
-- per-batch lz4 that the broker never decompresses.
+- fixed 14-byte event headers with the dedup keys outside the compressed payload;
+- per-batch lz4 that the broker never decompresses to deduplicate.
 
+The rest of the ideas kept there aren't built yet: linger, cumulative acks, interned ids and standby shadows.
 Varint and dictionary columns and the zero-copy buffer management bought too little and were dropped.
 
 ## Layout
@@ -112,20 +111,23 @@ Varint and dictionary columns and the zero-copy buffer management bought too lit
 | `crates/lab` | protocol and dedup proofs of concept (evidence, not part of the product) |
 | `crates/bench`, `crates/storage-bench` | the earlier Apache Iggy comparison and the storage-backend comparison (evidence) |
 | `bench/compare`, `bench/redpanda`, `bench/perf-gate` | the Redpanda comparison, its baseline, and CI's wall-clock gate |
+| `deploy/k8s`, `Dockerfile` | the Kubernetes manifest and the broker image |
 | `docs/`, `reports/`, `results/` | plan, architecture, research reports, raw benchmark results |
 
 ## Build, test, run
 
 ```bash
-cargo build --release
+cargo build --release -p precog-mesh --bin precog-node -p precog-client --example loadgen
 ```
+
+(`storage-bench` links RocksDB and needs libclang; nothing else does, so the commands here leave it out.)
 
 ```bash
 cargo nextest run --workspace --exclude storage-bench
 ```
 
 ```bash
-cargo test -p precog-mesh --test acceptance
+cargo test -p precog-mesh --test acceptance -- --tags 'not @nightly and not @stress'
 ```
 
 CI runs all of these, plus the following ([AGENTS.md](AGENTS.md) has the commands):
@@ -149,7 +151,7 @@ for i in 0 1 2; do target/release/precog-node serve --config run/demo/node-$i.js
 target/release/precog-node status --cluster run/demo/cluster.json
 ```
 
-The Redpanda comparison needs Docker, the release binaries and live-ingestion's franz-go load generator (`benchmarks/redpanda-dedup/loadgen`
+The Redpanda comparison needs Docker, the release binaries built above (`precog-node` and the `loadgen` example) and live-ingestion's franz-go load generator (`benchmarks/redpanda-dedup/loadgen`
 there). Precog first, then Redpanda at equal durability:
 
 ```bash
@@ -162,7 +164,7 @@ RP_WRITE_CACHING=true WARMUP=20 FRANZ_LOADGEN=/path/to/loadgen bench/compare/run
 
 ## Status
 
-- Merged to `main`; the image workflow publishes `ghcr.io/aperiodic-io/precog:sha-<commit>` from every push.
+- Merged to `main`; the image workflow publishes `ghcr.io/aperiodic-io/precog:sha-<commit>` from every push to `main` and every `v*` tag.
 - live-ingestion deploys Precog on staging beside `redpanda-raw-internal`, pinned to a published commit. From there it moves the
   producers to dual-write and then switches every raw-topic client with one setting (`rawBroker: precog`).
 - The rollout steps and rollbacks are in live-ingestion's `docs/operations.md`, section "Precog".
@@ -170,5 +172,7 @@ RP_WRITE_CACHING=true WARMUP=20 FRANZ_LOADGEN=/path/to/loadgen bench/compare/run
 ## History
 
 Precog started as a proof of concept against Apache Iggy 0.10. Durable on 2 of 3 nodes, it measured 2.1–3.3x Iggy's throughput
-and failed over in tens of milliseconds instead of seconds. Those numbers and their harness are kept in
-[results/RESULTS.md](results/RESULTS.md) and `crates/bench`.
+at Iggy's defaults (1.3–1.7x against Iggy tuned to one partition or 1000-message batches). Producers failed over within
+71 ms of a node being killed, where Iggy stalled up to 2.7 s, and within 1 s (the client's RPC timeout) of a node hanging,
+where Iggy stalled 30 s. Those numbers and their harness are kept in [results/RESULTS.md](results/RESULTS.md),
+`results/failover.jsonl` and `crates/bench`.

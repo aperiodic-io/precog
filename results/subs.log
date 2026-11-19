@@ -46,9 +46,6 @@ subs/mesh-c2-tcp/rate60k-s32     6 prod x 100 x  256B       60050 msg/s     15.4
 subs/mesh-c2-tcp/rate60k-s32     6 prod x 100 x  256B       60060 msg/s     15.4 MB/s  p50    1384us p99    3085us p999    4815us max     7063us  gap     0ms err 0 stalls [13, 12, 15, 15, 15, 13] | new events per node [n0=660000 n1=660000 n2=660000]; producers acked 660000
     subs  32:      60040 msg/s each,     1921280 total  e2e p50    1502us p99     3851us p999    14575us max     23663us  32/32 got all 659800 acked (min 659800)
 subs/mesh-c2-tcp/rate60k-s32     6 prod x 100 x  256B       60040 msg/s     15.4 MB/s  p50    1483us p99    3773us p999   13351us max    23199us  gap     0ms err 0 stalls [32, 24, 26, 27, 27, 28] | new events per node [n0=659800 n1=659800 n2=659800]; producers acked 659800
-    subs  16:      60060 msg/s each,      960960 total  e2e p50    2046us p99     4759us p999     6999us max      9911us  16/16 got all 655300 acked (min 655300)
-    subs  16:      60000 msg/s each,      960000 total  e2e p50    2243us p99     5759us p999    19487us max     45855us  16/16 got all 656100 acked (min 656100)
-    subs  16:      60050 msg/s each,      960800 total  e2e p50    2022us p99     4587us p999     6391us max      8059us  16/16 got all 656300 acked (min 656300)
     subs  16:      91900 msg/s each,     1470400 total  e2e p50    6899us p99    15271us p999    27743us max     52319us  16/16 got all 953500 acked (min 953500)
 subs/iggy-persisted-rf3/max-s16     6 prod x 100 x  256B       91900 msg/s     23.5 MB/s  p50    6123us p99   13039us p999   27151us max    51743us  gap     0ms err 0 stalls [27, 28, 28, 29, 51, 27] | topic reports 953500 messages; producers acked 953500
     subs  16:      90200 msg/s each,     1443200 total  e2e p50    7071us p99    15631us p999    22399us max     53919us  16/16 got all 936700 acked (min 936700)

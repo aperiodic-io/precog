@@ -60,7 +60,7 @@ Equal durability at steady state (2026-11-19): fsync before every ack on both si
 |---|---:|---:|---:|---:|
 | Precog, fsync before every ack | 696,600 | 2.71 ms | 5.49 ms | 1.39 us |
 | Redpanda, fsync before every ack | 159,000 | 11.5 ms | 21.3 ms | 3.26 us |
-| **Precog vs Redpanda** | **4.4x** | **4.3x** | **3.9x** | **2.3x** |
+| **Precog vs Redpanda** | **4.4x** | **4.2x** | **3.9x** | **2.3x** |
 
 Runs: Precog 703k/2.67/5.49/1.337, 697k/2.71/5.48/1.386, 647k/2.93/6.05/1.551; Redpanda 150k/11.9/16.9/3.036,
 160k/11.5/19.2/3.576, 159k/11.5/25.1/3.789, 165k/11.3/21.3/3.256, 128k/13.3/23.6/2.713. CPU per record is under 3x
@@ -75,7 +75,8 @@ recycled a segment anyway. The preallocator now waits up to 5 s for that recycle
 
 With brokers at 1 CPU each, the 1-CPU load generator is the bottleneck: the brokers run at 25-50% of a core and about a
 fifth of their CPU is spent sleeping and waking per event. To measure busy brokers, the same harness with every broker
-capped at **0.5 CPU** (both systems, `--cpus 0.5`), `WARMUP=20`, medians of 3 runs alternating Precog and Redpanda. The
+capped at **0.5 CPU** (both systems: `run.sh` has no setting for this, so its broker `docker run` lines were edited from
+`--cpus 1` to `--cpus 0.5`; the load generators stay at 1 CPU), `WARMUP=20`, medians of 3 runs alternating Precog and Redpanda. The
 last runs overlapped other builds on the VM, so treat the spread as wider than usual.
 
 | | records/s | p50 ack | p99 ack | broker CPU per record |
