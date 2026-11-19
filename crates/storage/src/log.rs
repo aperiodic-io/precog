@@ -756,6 +756,8 @@ impl Log {
             unsynced_since: None,
         };
 
+        let unsynced = (log.cfg.flush_delay_ms > 0)
+            .then(|| log.cfg.flush_bytes.saturating_add(MAX_GROUP as u64));
         // Sealed segments: drop ones missing at the head (retention whose manifest write was lost),
         // load their indexes (or rebuild them).
         let mut segs: Vec<Arc<Seg>> = vec![];
@@ -802,7 +804,7 @@ impl Log {
                 let entries = match index {
                     Some(e) => e,
                     None => {
-                        let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset))?;
+                        let s = scan(&file, m.generation, m.base_lsn, Some(m.end_offset), None)?;
                         log.stats.index_rebuilds += 1;
                         log.stats.recovery_scanned_bytes += s.scanned;
                         if s.damaged {
@@ -860,7 +862,7 @@ impl Log {
             && !last.sealed
         {
             let seg = segs.pop().unwrap();
-            let s = scan(&seg.file, seg.generation, seg.base_lsn, None)?;
+            let s = scan(&seg.file, seg.generation, seg.base_lsn, None, unsynced)?;
             log.stats.recovery_scanned_bytes += s.scanned;
             next_lsn = seg.base_lsn + s.entries.len() as u64;
             active = Some((seg, s));
@@ -878,7 +880,7 @@ impl Log {
                         && b == next_lsn
                         && g >= manifest.next_generation.saturating_sub(1) =>
                 {
-                    let s = scan(&file, g, b, None)?;
+                    let s = scan(&file, g, b, None, unsynced)?;
                     log.stats.recovery_scanned_bytes += s.scanned;
                     if let Some((prev, ps)) = active.take() {
                         // Lost records would make the successor's base LSN mismatch (refused
@@ -1349,7 +1351,18 @@ fn write_index(dir: &Path, seg: &Seg) -> Result<()> {
 /// Scans a segment's records. For a sealed segment `end` bounds the scan and any invalid
 /// record before it is damage. For the active segment the scan stops at the first invalid
 /// record and decides between a torn tail (truncate) and interior damage (error).
-fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result<Scan> {
+///
+/// `unsynced`: with write caching, at most this many bytes at the end can have been unsynced at
+/// a crash (`flush_bytes` + one group), and the kernel writes them back in any order. Damage
+/// followed only by records within that bound is that tail, partly lost: it is dropped as a
+/// whole (none of it was acknowledged on this node's fsync). Found by spec/storage.
+fn scan(
+    file: &File,
+    generation: u64,
+    base_lsn: Lsn,
+    end: Option<u64>,
+    unsynced: Option<u64>,
+) -> Result<Scan> {
     let len = file.metadata()?.len();
     let limit = end.unwrap_or(len).min(len);
     let mut s = Scan {
@@ -1415,6 +1428,8 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
     let x = s.end;
     let window_end = x.saturating_add(SEARCH_WINDOW).min(len);
     let mut later = None;
+    // the end of the furthest record found past x
+    let mut furthest = x;
     let mut torn: Option<u64> = None;
     // a record of this generation was written at x but fails validation: damage, not a clean end
     let mut dirty = x + u64::from(stopped_on_written);
@@ -1425,26 +1440,32 @@ fn scan(file: &File, generation: u64, base_lsn: Lsn, end: Option<u64>) -> Result
             // zeroing a record's header is enough to make it unreadable for good
             dirty = dirty.max(pos + record::HEADER as u64);
             if let Decoded::Record { header, next, .. } = record::decode(&w.buf, rel, generation) {
-                if header.group_start > x {
-                    later = Some(header.group_start);
-                    break;
-                }
-                torn = Some(torn.map_or(header.group_start, |t| t.min(header.group_start)));
                 pos += (next - rel) as u64;
+                furthest = pos;
+                if header.group_start > x {
+                    later = later.or(Some(header.group_start));
+                    if unsynced.is_none() {
+                        break; // fails closed below: no need to look further
+                    }
+                } else {
+                    torn = Some(torn.map_or(header.group_start, |t| t.min(header.group_start)));
+                }
                 continue;
             }
         }
         pos += 8;
     }
     s.scanned = w.scanned;
-    if let Some(g) = later {
+    let lost_tail = unsynced.is_some_and(|u| furthest <= x.saturating_add(u));
+    if let Some(g) = later.filter(|_| !lost_tail) {
         return Err(Error::Corrupt(format!(
             "damage at offset {x} of the active segment is followed by a later group at offset {g}"
         )));
     }
-    match torn {
+    match torn.or(later.map(|_| x)) {
         Some(g) => {
-            // drop the whole torn group: it was never acknowledged
+            // drop the whole torn group (it was never acknowledged), and with write caching
+            // the unsynced groups after it
             s.entries
                 .truncate(s.entries.iter().take_while(|e| e.offset < g).count());
             s.end = g;

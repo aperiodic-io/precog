@@ -1758,3 +1758,74 @@ fn spare_names_keep_counting_up_across_a_restart() {
         "{old:?} then {new:?}"
     );
 }
+
+/// Appends `groups` groups of `per` records without asking for a sync; returns the offset of
+/// the first record.
+fn unsynced_groups(log: &mut Log, start: u64, groups: u64, per: u64, size: usize) -> u64 {
+    fill(log, start, groups, per, size);
+    log.reader().entries(start, 1)[0].offset
+}
+
+#[test]
+fn a_power_loss_under_write_caching_drops_the_unsynced_tail_whatever_reached_disk() {
+    // Why: with write caching (live-ingestion's setting) several groups are unsynced at once and
+    // the kernel writes their pages back in any order, so a power loss can keep a later group and
+    // lose an earlier one. None of them was relied on locally (acks rested on the replicas), so
+    // the node must come back with its synced prefix and repair the rest, not refuse to start.
+    // Found by spec/storage (MC_caching_unfixed.cfg).
+    let d = tempfile::tempdir().unwrap();
+    let c = || deferred(d.path(), 1 << 20, 1 << 20);
+    let lost;
+    {
+        let mut log = Log::open(c()).unwrap();
+        fill(&mut log, 0, 4, 2, 300);
+        log.flush().unwrap();
+        lost = unsynced_groups(&mut log, 8, 3, 2, 300);
+        assert_eq!(log.stats().syncs, 1, "groups 8.. are unsynced");
+    }
+    // the first unsynced group never reached disk; the two after it did
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, lost, &[0u8; 64]);
+    let mut log = Log::open(c()).unwrap();
+    assert_eq!(
+        log.next_lsn(),
+        8,
+        "the synced prefix, nothing after the hole"
+    );
+    check_all(&log, 0, 8, 300);
+    // the dropped groups' records were zeroed: a shorter write cannot be followed by them
+    fill(&mut log, 8, 1, 1, 10);
+    log.flush().unwrap();
+    drop(log);
+    assert_eq!(Log::open(c()).unwrap().next_lsn(), 9);
+}
+
+#[test]
+fn under_write_caching_damage_before_more_than_the_unsynced_bound_still_fails_closed() {
+    // Why: at most flush_bytes plus one group (MAX_GROUP) can be unsynced, so a hole followed by
+    // more than that was synced: damage, not a lost tail. Dropping it would discard data the
+    // log had made durable.
+    let d = tempfile::tempdir().unwrap();
+    let c = || deferred(d.path(), 64 << 20, 64 * KB);
+    let early;
+    {
+        let mut log = Log::open(c()).unwrap();
+        fill(&mut log, 0, 4, 1, 300);
+        early = log.reader().entries(1, 1)[0].offset;
+        // past MAX_GROUP + flush_bytes of synced groups after the damage
+        let big = (record::MAX_RECORD - 4096) as u64;
+        let n = (precog_storage::log::MAX_GROUP as u64 + 64 * KB) / big + 2;
+        for i in 0..n {
+            let m = meta(4 + i);
+            log.append(&[(m, &vec![7u8; big as usize][..])]).unwrap();
+        }
+        log.flush().unwrap();
+    }
+    let active = segment_files(d.path()).pop().unwrap();
+    patch(&active, early + record::HEADER as u64 + 3, &[0x5A]);
+    match Log::open(c()) {
+        Err(Error::Corrupt(msg)) => assert!(msg.contains("later"), "{msg}"),
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(_) => panic!("opened a log with interior damage"),
+    }
+}
