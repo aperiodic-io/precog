@@ -291,6 +291,7 @@ mod tests {
         );
         assert_eq!(s.len(), 100);
         assert_eq!(s.effective_window_s(2), 0, "the shortest: b started at 2");
+        assert_eq!(s.effective_window_s(10), 8, "b's 8 s, not a's 9 s");
     }
 
     #[test]
