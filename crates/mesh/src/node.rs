@@ -788,15 +788,25 @@ impl Node {
         all.sort_unstable_by_key(|k| (k.time, k.lsn));
         for lsns in groups(&all, self.copy_limit()) {
             let _g = self.clean.lock().await;
-            let recs = lsns
+            // a record that does not read back goes with its segment, as before copying: failing
+            // the pass would fail every later one at it, and the cap would drop nothing again
+            let recs: Vec<_> = lsns
                 .iter()
-                .map(|&l| {
-                    self.wal
-                        .reader
-                        .read(l)?
-                        .ok_or_else(|| anyhow!("lsn {l} is gone"))
+                .filter_map(|&l| match self.wal.reader.read(l) {
+                    Ok(Some(r)) => Some(r),
+                    Ok(None) => {
+                        tracing::error!("retention: lsn {l} to copy is gone");
+                        None
+                    }
+                    Err(e) => {
+                        tracing::error!("retention: lsn {l} to copy does not read: {e}");
+                        None
+                    }
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect();
+            if recs.is_empty() {
+                continue;
+            }
             let first = self
                 .wal
                 .copy(

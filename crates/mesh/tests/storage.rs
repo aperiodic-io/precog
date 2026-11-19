@@ -733,3 +733,43 @@ async fn streams_over_the_cap_alike_are_cut_alike() {
         600 - a.len() - b.len()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_the_cleaner_cannot_read_does_not_stop_the_node_cap() {
+    // Why: the node cap protects the disk. A retained record that fails its checksum when the
+    // cleaner reads it to copy it cannot be kept anyway; if that failed the whole pass, every
+    // later pass would fail at it too, nothing would be dropped again, and the log would grow
+    // until the disk is full.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    let cap = 4 * 64 * 1024;
+    c.retention_bytes = Some(cap);
+    c.streams.insert("low".into(), stream_cfg(1 << 20));
+    c.tail_cache_bytes = 0; // reads go to the disk
+    let node = Node::open(c).await.unwrap();
+    for seq in 0..20 {
+        assert!(node.append(1, on("low", seq, 1000)).await.is_success());
+    }
+    for seq in 0..100 {
+        assert!(node.append(1, on("high", seq, 1000)).await.is_success());
+    }
+    // the first record of the oldest segment (low 0): one payload byte flips on disk
+    let seg = std::fs::read_dir(d.path().join("log"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .min()
+        .unwrap();
+    let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&f, &[0xff], 4096 + 600).unwrap();
+    for round in 1..6u64 {
+        for i in 0..100 {
+            let seq = round * 100 + i;
+            assert!(node.append(1, on("high", seq, 1000)).await.is_success());
+        }
+        node.apply_retention().await.unwrap();
+        let bytes = metric(&node, "precog_log_bytes");
+        assert!(bytes <= cap, "round {round}: {bytes}");
+    }
+    assert_eq!(cursor_seqs(&node, "low"), (1..20).collect::<Vec<_>>());
+}
