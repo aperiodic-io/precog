@@ -9,6 +9,7 @@ the `formal` job on each pull request, bigger bounds in `nightly.yml`.
 | Segment roll, directory fsyncs, the two-slot manifest | TLA+ / TLC | A power loss between any two steps of a multi-file protocol | `spec/storage/SegmentRoll.tla` |
 | Decoders of records, manifest slots and index files | Kani | Bounded proofs over every byte pattern, at the code itself | `#[cfg(kani)] mod proofs` in `crates/storage/src/{record,log}.rs` |
 | Leaderless appends at k of n, failure domains, retries, conflicts, repair, dedup, write caching, `Client::end` | TLA+ / TLC | The protocol's failure modes are interleavings of messages, power losses and disk losses across nodes | `spec/mesh/Replication.tla` |
+| Reader-group positions and compacted streams across nodes; cursor reads with failover | TLA+ / TLC | Commits and batches reach nodes in any order | `spec/consumers/Positions.tla` |
 | Wire codecs: batches (every format), acks, append and replicate bodies, log keys, compacted-stream snapshots | proptest | The bytes come from the network or the disk; Kani does not finish them (below) | `mod props` in `crates/mesh/src/{proto,node}.rs` |
 
 Run them:
@@ -204,6 +205,42 @@ in any order and failed writes, checked after every step against a reference of 
 rules `Replication.tla` assumes (an exact retry is a duplicate, any other overlap a conflict, a
 failed write frees its range, only durable batches are served) and of frontier arithmetic (the
 durable prefix from 0, and one past the highest durable sequence). No discrepancy found.
+
+## Consumers and positions: `spec/consumers/Positions.tla`
+
+**Models.** A reader committing positions 1, 2, ... through any node (`commit_position`: a
+keyed batch in that node's `__positions` writer log), replication and repair bringing each
+commit to every node in any order, each node serving per key the newest value it holds
+(`apply_compacted`); and a consumer reading one writer log by cursor, failing over between nodes
+that hold different parts of it (`Store::read_cursor` stops at the first batch the node lacks;
+`Consumer::take` advances past each batch).
+
+**Abstracts away.** Payloads, several groups and streams (keys are independent), several
+writer logs in one stream (`read_cursor` handles each log on its own), retention, max_bytes
+(a poll returns any number of batches).
+
+**Properties.** `ServesNewestHeld` (a node serves the newest commit it holds), `NoRegression`
+(a node's served position never goes back; temporal), `NoLossNoRepeat` (a consumer failing over
+reads each sequence once, in order, none skipped).
+
+| Config | Bounds | Distinct states |
+|---|---|---|
+| `MC_positions` | 3 nodes, 3 commits | 33,900 |
+| `MC_cursor` | 3 nodes, sequences 0..4 | 144,495 |
+| `Nightly_positions` | 3 nodes, 4 commits and sequences 0..2 together | nightly |
+| `MC_positions_lsn` (expect) | newest by LSN: `ServesNewestHeld` fails | |
+
+**Found and fixed.** A compacted stream kept, per key, the value logged last on the node. Each
+node logs commits in its own order, so a node that got commit 2 by replication and commit 1 by
+repair served commit 1: a reader failing over there re-read what it had committed past
+(`MC_positions_lsn`, 3 steps), and producers' compacted state could differ by node. The newest
+value is now the last in read order, (event time, writer, epoch, seq), the order every node
+with the same content agrees on; a position commit carries the commit time, increasing on each
+node. Snapshots are format 2 (`PCS2`, with each key's read order); format 1 still reads, its
+values older than any event. Test: `a_node_that_gets_two_commits_newest_first_serves_the_newest`
+(failed first: it served `(a, 5)` while holding `(a, 9)`).
+Known ceiling: two commits through two nodes closer together than the nodes' clock skew may
+keep the earlier one (an order from the reader would remove it).
 
 ## Not verified, and why
 
