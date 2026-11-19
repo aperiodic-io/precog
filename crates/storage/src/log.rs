@@ -58,8 +58,8 @@ pub struct Config {
     /// in 16 s. A roll that finds no spare fills one at full speed (counted in `roll_stalls`).
     pub prealloc_bytes_per_s: u64,
     /// 0: `append` fsyncs every group. Otherwise a group is acknowledged once written and the
-    /// fsync is deferred: it runs once `flush_bytes` are unsynced, or when the caller's `flush`
-    /// finds the oldest unsynced group this old (`flush_due` says when).
+    /// fsync is deferred to the caller's `flush` (or `begin_flush`), due once the oldest
+    /// unsynced group is this old or `flush_bytes` are unsynced (`flush_due` says when).
     pub flush_delay_ms: u64,
     pub flush_bytes: u64,
     pub failpoints: Failpoints,
@@ -795,6 +795,24 @@ pub struct Log {
     /// Bytes written to the active segment since its last fsync, and when the first of them was.
     unsynced: u64,
     unsynced_since: Option<std::time::Instant>,
+    /// Bytes an outstanding `Flush` (`begin_flush`) covers and has not synced yet (0: none out).
+    inflight: u64,
+}
+
+/// A deferred fsync taken out of the log (`Log::begin_flush`), so appends go on while it runs.
+pub struct Flush {
+    seg: Arc<Seg>,
+    fail: bool,
+}
+
+impl Flush {
+    /// Runs the fsync; hand the result to `Log::end_flush`.
+    pub fn sync(&self) -> std::io::Result<()> {
+        if self.fail {
+            return Err(std::io::Error::other("failpoint: data sync"));
+        }
+        self.seg.file.sync_data()
+    }
 }
 
 struct Active {
@@ -928,6 +946,7 @@ impl Log {
             buf: Vec::with_capacity(1 << 20),
             unsynced: 0,
             unsynced_since: None,
+            inflight: 0,
         };
 
         // Sealed segments: drop ones missing at the head (retention whose manifest write was lost),
@@ -1152,24 +1171,66 @@ impl Log {
         self.shared.first_lsn.load(Ordering::Acquire)
     }
 
-    /// When the deferred flush is due (`None`: nothing unsynced, or every group is synced).
+    /// When the deferred flush is due (`None`: nothing unsynced, or every group is synced or
+    /// covered by a `Flush` that is out). Past `flush_bytes` it is due at once.
     pub fn flush_due(&self) -> Option<std::time::Instant> {
-        self.unsynced_since
-            .map(|t| t + std::time::Duration::from_millis(self.cfg.flush_delay_ms))
+        let t = self.unsynced_since?;
+        if self.unsynced >= self.cfg.flush_bytes {
+            return Some(t);
+        }
+        Some(t + std::time::Duration::from_millis(self.cfg.flush_delay_ms))
+    }
+
+    /// The most bytes a crash can leave unsynced under write caching: what an outstanding flush
+    /// covers plus what was appended meanwhile stays below twice `flush_bytes` (an append past it
+    /// syncs), plus the group that crossed it. Recovery bounds a lost unsynced tail by this.
+    pub fn unsynced_bound(cfg: &Config) -> u64 {
+        cfg.flush_bytes
+            .saturating_mul(2)
+            .saturating_add(MAX_GROUP as u64)
     }
 
     /// Fsyncs what was written since the last fsync (nothing to do: free).
     pub fn flush(&mut self) -> Result<()> {
+        let Some(f) = self.begin_flush()? else {
+            return Ok(());
+        };
+        let r = f.sync();
+        self.end_flush(f, r)
+    }
+
+    /// Takes the deferred fsync out of the log: run `Flush::sync` without holding the log, then
+    /// `end_flush`. Groups appended meanwhile are not covered and keep their own deadline.
+    pub fn begin_flush(&mut self) -> Result<Option<Flush>> {
         if let Some(f) = &self.failed {
             return Err(Error::Fatal(f.clone()));
         }
         if self.unsynced_since.is_none() {
-            return Ok(());
+            return Ok(None);
         }
-        if let Err(e) = self.sync_active() {
+        let fail = self
+            .cfg
+            .failpoints
+            .fail_data_sync_after
+            .is_some_and(|n| self.stats.syncs >= n);
+        let seg = self.active.as_ref().unwrap().seg.clone();
+        self.inflight = self.unsynced;
+        self.unsynced = 0;
+        self.unsynced_since = None;
+        Ok(Some(Flush { seg, fail }))
+    }
+
+    /// Ends a `begin_flush`: a failed fsync is fatal, as under the lock.
+    pub fn end_flush(&mut self, _flush: Flush, r: std::io::Result<()>) -> Result<()> {
+        self.inflight = 0;
+        if let Err(e) = r {
             return self.fail(format!("deferred flush: {e}"));
         }
-        Ok(())
+        self.stats.syncs += 1;
+        match &self.failed {
+            Some(f) => Err(Error::Fatal(f.clone())),
+            None => Ok(()),
+        }
     }
 
     fn sync_active(&mut self) -> std::io::Result<()> {
@@ -1183,6 +1244,7 @@ impl Log {
         }
         self.stats.syncs += 1;
         self.unsynced = 0;
+        self.inflight = 0; // the whole file is synced, what an outstanding flush covers included
         self.unsynced_since = None;
         Ok(())
     }
@@ -1288,7 +1350,9 @@ impl Log {
             self.unsynced += self.buf.len() as u64;
             self.unsynced_since
                 .get_or_insert_with(std::time::Instant::now);
-            if self.cfg.flush_delay_ms == 0 || self.unsynced >= self.cfg.flush_bytes {
+            if self.cfg.flush_delay_ms == 0
+                || self.unsynced + self.inflight >= self.cfg.flush_bytes.saturating_mul(2)
+            {
                 self.sync_active()
             } else {
                 Ok(())
@@ -1357,8 +1421,9 @@ impl Log {
         let generation = self.manifest.next_generation;
         let base = self.next_lsn();
         let sealing = self.active.is_some();
-        // a sealed segment is never written again: its unsynced tail is synced now or never
-        if self.unsynced_since.is_some()
+        // a sealed segment is never written again: its unsynced tail is synced now or never (a
+        // `Flush` that is out may not have run yet)
+        if (self.unsynced_since.is_some() || self.inflight > 0)
             && let Err(e) = self.sync_active()
         {
             return self.fail(format!("sync of the segment being sealed: {e}"));
