@@ -13,5 +13,6 @@ tokio = { version = "1", features = ["time", "rt"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
+parking_lot = "0.12"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

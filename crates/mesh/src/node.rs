@@ -7,7 +7,7 @@
 //! by the writer's sequence numbers, and logs never have to be ordered relative
 //! to each other at write time. Readers merge logs by event time.
 
-use crate::dedup::{self, Dedup};
+use crate::dedup::{self, Streams};
 use crate::proto::*;
 use crate::rpc::{BoxRead, BoxWrite, RpcClient, read_frame, write_loop};
 use crate::store::{Cursor, Reserve, State, Store};
@@ -70,7 +70,8 @@ pub struct NodeConfig {
     /// minutes); `None` turns dedup off. Events without a key are never dropped.
     #[serde(default = "dedup_window_ms")]
     pub dedup_window_ms: Option<u64>,
-    /// At most this many dedup ids (~15 bytes each); past it the window shortens.
+    /// At most this many dedup ids per stream (~28 bytes each where the stream is accepted, 8
+    /// where it is only replicated); past it the stream's window shortens.
     #[serde(default = "dedup_max_entries")]
     pub dedup_max_entries: usize,
     /// Streams with a retention of their own (topicsync's `retention.bytes` / `retention.ms`);
@@ -162,7 +163,7 @@ fn dedup_window_ms() -> Option<u64> {
     Some(300_000)
 }
 fn dedup_max_entries() -> usize {
-    16_000_000
+    8_000_000
 }
 fn retention_interval_ms() -> u64 {
     10_000
@@ -193,13 +194,12 @@ pub struct Node {
     pub store: Store,
     wal: Wal,
     peers: Vec<Arc<Peer>>,
-    repair_cursor: parking_lot::Mutex<HashMap<u32, u64>>,
     repair_lock: tokio::sync::Mutex<()>,
     inflight: Semaphore,
     /// Held while a client batch is deduplicated and queued to the log, so ids are claimed in
     /// log order: a batch whose duplicates were dropped is durable only after the batches that
     /// claimed them (the log commits in order and fences on any write error).
-    dedup: parking_lot::Mutex<Option<Dedup>>,
+    dedup: parking_lot::Mutex<Option<Streams>>,
     dedup_dropped: AtomicU64,
     /// Compacted streams: key -> (LSN, payload) of its newest event.
     compact: parking_lot::Mutex<HashMap<String, Compacted>>,
@@ -284,9 +284,21 @@ fn digests(batch: &Batch) -> Vec<(usize, u64)> {
 
 /// Applies a durable batch at `lsn` to a compacted stream's newest values.
 fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
-    for (k, p) in batch.keyed() {
-        if m.get(k).is_none_or(|(l, _)| *l <= lsn) {
-            m.insert(k.to_vec(), (lsn, p));
+    let kvs = match batch.keyed() {
+        Ok(kvs) => kvs,
+        Err(e) => {
+            // the CRC held, so its producer wrote it this way; the log keeps it as written
+            tracing::error!(
+                "compacted stream {}: batch {:?} unreadable: {e}",
+                batch.id.log.stream,
+                batch.id
+            );
+            return;
+        }
+    };
+    for (k, p) in kvs {
+        if m.get(&k).is_none_or(|(l, _)| *l <= lsn) {
+            m.insert(k, (lsn, p));
         }
     }
 }
@@ -324,7 +336,7 @@ impl Node {
         let n = entries.len();
         let mut dedup = cfg
             .dedup_window_ms
-            .map(|w| Dedup::new(w.div_ceil(1000).max(1), 3, cfg.dedup_max_entries));
+            .map(|w| Streams::new(w.div_ceil(1000).max(1), 3, cfg.dedup_max_entries));
         // the last window of the log rebuilds the index (bounded: the window, not the log)
         let recent: Vec<_> = match cfg.dedup_window_ms {
             Some(w) => {
@@ -371,7 +383,7 @@ impl Node {
                 if let Some(r) = wal.reader.read(lsn)? {
                     let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
                     let ds: Vec<u64> = digests(&b).into_iter().map(|(_, h)| h).collect();
-                    d.record(&ds, now_s());
+                    d.record(&b.id.log.stream, &ds, now_s());
                 }
             }
         }
@@ -394,7 +406,6 @@ impl Node {
             store,
             wal,
             peers,
-            repair_cursor: Default::default(),
             repair_lock: Default::default(),
             inflight: Semaphore::new(16_384),
             dedup: parking_lot::Mutex::new(dedup),
@@ -894,6 +905,20 @@ impl Node {
                     }
                     return Ok(Frame::new(Kind::Batches, id, out.freeze()));
                 }
+                if let Control::FetchLog {
+                    log,
+                    from_seq,
+                    max_bytes,
+                } = &c
+                {
+                    let max = (*max_bytes as usize).min(MAX_FRAME_BYTES / 2);
+                    let mut out = BytesMut::new();
+                    for b in self.store.log_batches(log, *from_seq, max) {
+                        out.put_u32_le(b.len() as u32);
+                        out.put_slice(&b);
+                    }
+                    return Ok(Frame::new(Kind::Batches, id, out.freeze()));
+                }
                 if let Control::ReadCursor {
                     stream,
                     cursor,
@@ -934,15 +959,13 @@ impl Node {
                         .read(&stream, from_time_us, limit.min(10_000) as usize);
                 ControlResp::Read { events, coverage }
             }
-            Control::Inventory { after, limit } => {
-                let (items, next, more) = self.store.inventory(after, limit.min(16_384));
-                ControlResp::Inventory { items, next, more }
-            }
             Control::Repair => {
                 let (fetched, errors) = self.repair_pass().await;
                 ControlResp::Repair { fetched, errors }
             }
-            Control::Fetch { .. } | Control::ReadCursor { .. } => unreachable!(),
+            Control::Fetch { .. } | Control::ReadCursor { .. } | Control::FetchLog { .. } => {
+                unreachable!()
+            }
             Control::CursorAt { stream, time_ms } => {
                 let c = self.store.cursor_at(&stream, time_ms);
                 ControlResp::Cursor {
@@ -993,7 +1016,7 @@ impl Node {
             if !ds.is_empty() {
                 let hs: Vec<u64> = ds.iter().map(|&(_, h)| h).collect();
                 let mut dup = vec![];
-                d.check(&hs, now_s(), &mut dup);
+                d.check(&batch.id.log.stream, &hs, now_s(), &mut dup);
                 claimed = dup.contains(&false);
                 if dup.contains(&true) {
                     let n = dup.iter().filter(|&&x| x).count();
@@ -1099,7 +1122,7 @@ impl Node {
         // the origin decided; record the ids it kept, so this node dedups too after a failover
         if let Some(d) = self.dedup.lock().as_mut() {
             let ds: Vec<u64> = digests(&batch).into_iter().map(|(_, h)| h).collect();
-            d.record(&ds, now_s());
+            d.record(&batch.id.log.stream, &ds, now_s());
         }
         ack.crc = batch.ident; // the origin compares identities, not the rewritten bytes' CRC
         match self.store_local(&batch).await {
@@ -1344,53 +1367,50 @@ impl Node {
         (fetched, errors)
     }
 
+    /// Compares the peer's per-log frontiers with ours and fetches only the logs where it holds
+    /// sequences we lack (from our contiguous end on). A healthy cluster's pass costs O(logs).
     async fn repair_peer(&self, p: &Peer) -> Result<u64> {
+        let f = self.peer_control(p, &Control::Status).await?;
+        let ControlResp::Status(theirs) = serde_json::from_slice(&f.body)? else {
+            bail!("unexpected status response");
+        };
+        let mine: HashMap<LogId, Frontier> = self
+            .store
+            .frontiers(None)
+            .into_iter()
+            .map(|f| (f.log.clone(), f))
+            .collect();
         let mut fetched = 0;
-        for _ in 0..64 {
-            let after = *self.repair_cursor.lock().get(&p.cfg.id).unwrap_or(&0);
-            let f = self
-                .peer_control(p, &Control::Inventory { after, limit: 8192 })
-                .await?;
-            let ControlResp::Inventory { items, next, more } = serde_json::from_slice(&f.body)?
-            else {
-                bail!("unexpected inventory response");
-            };
-            let missing: Vec<BatchId> = items
-                .into_iter()
-                .filter(|(_, id, _, crc)| !self.store.has(id, *crc))
-                .map(|(_, id, _, _)| id)
-                .collect();
-            for chunk in missing.chunks(512) {
-                let mut want: Vec<BatchId> = chunk.to_vec();
-                while !want.is_empty() {
-                    let f = self
-                        .peer_control(p, &Control::Fetch { ids: want.clone() })
-                        .await?;
-                    anyhow::ensure!(f.kind == Kind::Batches, "unexpected fetch response");
-                    let mut got = HashSet::new();
-                    let mut body = &f.body[..];
-                    while body.len() >= 4 {
-                        let n = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-                        let b = Batch::parse(f.body.slice_ref(&body[4..4 + n]))?;
-                        body = &body[4 + n..];
-                        match self.store_local(&b).await? {
-                            Local::Stored => fetched += 1,
-                            Local::Duplicate => {}
-                            Local::Conflict(e) => {
-                                tracing::error!("repair conflict from peer {}: {e}", p.cfg.id)
-                            }
+        for t in theirs.logs {
+            // from the first sequence we lack up to the peer's high (nothing, if we lack none)
+            let mut from = mine.get(&t.log).map_or(0, |m| m.contiguous);
+            while from < t.high {
+                let req = Control::FetchLog {
+                    log: t.log.clone(),
+                    from_seq: from,
+                    max_bytes: 4 << 20,
+                };
+                let f = self.peer_control(p, &req).await?;
+                anyhow::ensure!(f.kind == Kind::Batches, "unexpected fetch response");
+                let mut body = &f.body[..];
+                let mut end = from;
+                while body.len() >= 4 {
+                    let n = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+                    let b = Batch::parse(f.body.slice_ref(&body[4..4 + n]))?;
+                    body = &body[4 + n..];
+                    end = end.max(b.end_seq());
+                    match self.store_local(&b).await? {
+                        Local::Stored => fetched += 1,
+                        Local::Duplicate => {}
+                        Local::Conflict(e) => {
+                            tracing::error!("repair conflict from peer {}: {e}", p.cfg.id)
                         }
-                        got.insert(b.id);
                     }
-                    if got.is_empty() {
-                        break; // peer no longer serves them (cannot happen without deletion)
-                    }
-                    want.retain(|id| !got.contains(id));
                 }
-            }
-            self.repair_cursor.lock().insert(p.cfg.id, next);
-            if !more {
-                break;
+                if end == from {
+                    break; // the peer has nothing more from here (trimmed)
+                }
+                from = end;
             }
         }
         Ok(fetched)

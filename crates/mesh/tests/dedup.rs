@@ -116,11 +116,11 @@ fn an_omitted_dedup_config_takes_live_ingestion_s_five_minutes() {
     )
     .unwrap();
     assert_eq!(c.dedup_window_ms, Some(300_000));
-    assert_eq!(c.dedup_max_entries, 16_000_000);
+    assert_eq!(c.dedup_max_entries, 8_000_000);
     let s = NodeConfig::single(0, "a", "/d".into(), "t".into());
     assert_eq!(
         (s.dedup_window_ms, s.dedup_max_entries),
-        (Some(300_000), 16_000_000)
+        (Some(300_000), 8_000_000)
     );
 }
 

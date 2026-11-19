@@ -15,9 +15,6 @@ use precog_storage::{Lsn, Reader};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tokio::sync::watch;
 
-/// (lsn, batch id, event count, batch checksum)
-pub type InventoryItem = (u64, BatchId, u32, u32);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Pending,
@@ -78,6 +75,9 @@ struct Inner {
     bytes: u64,
     /// Per stream, its durable batches by LSN, for its own retention.
     by_stream: HashMap<String, StreamLog>,
+    /// Per writer log: every sequence below this is durable here or trimmed (kept as batches
+    /// arrive, so frontiers, and with them repair, cost O(logs) instead of O(batches)).
+    contig: HashMap<LogId, u64>,
 }
 
 #[derive(Default)]
@@ -127,6 +127,19 @@ impl Inner {
         let s = self.by_stream.entry(id.log.stream.clone()).or_default();
         s.order.insert(lsn, (id.log.clone(), time_ms, len));
         s.bytes += len as u64;
+        self.advance(&id.log);
+    }
+
+    /// Moves the log's contiguous end past every durable batch that now follows it.
+    fn advance(&mut self, log: &LogId) {
+        let floor = self.trimmed.get(log).copied().unwrap_or(0);
+        let mut c = self.contig.get(log).copied().unwrap_or(0).max(floor);
+        if let Some(map) = self.logs.get(log) {
+            while let Some(e) = map.get(&c).filter(|e| e.lsn.is_some()) {
+                c = e.shape.end;
+            }
+        }
+        self.contig.insert(log.clone(), c);
     }
 
     /// Forgets the durable batch at `lsn` (retention): later copies of it are `Expired`.
@@ -149,6 +162,7 @@ impl Inner {
             if map.is_empty() {
                 self.logs.remove(&id.log);
             }
+            self.advance(&id.log);
         }
     }
 }
@@ -375,21 +389,6 @@ impl Store {
         self.read_batch(self.lsn_of(id)?)
     }
 
-    /// Durable batches with LSN >= `after`: (lsn, id, count, crc), the next cursor, and
-    /// whether more remain.
-    pub fn inventory(&self, after: u64, limit: u32) -> (Vec<InventoryItem>, u64, bool) {
-        let g = self.inner.lock();
-        let items: Vec<_> = g
-            .order
-            .range(after..)
-            .take(limit as usize)
-            .map(|(&l, (id, n, crc, _))| (l, id.clone(), *n, *crc))
-            .collect();
-        let next = items.last().map_or(after, |x| x.0 + 1);
-        let more = g.order.range(next..).next().is_some();
-        (items, next, more)
-    }
-
     /// Durable batches at LSNs `from..`, optionally only one stream, up to about `max_bytes`.
     /// Returns the batches and the next LSN to ask for.
     pub fn tail(&self, from: u64, stream: Option<&str>, max_bytes: usize) -> (Vec<Batch>, u64) {
@@ -554,23 +553,56 @@ impl Store {
         (g.order.len() as u64, g.events, g.bytes)
     }
 
-    fn frontier_of(log: &LogId, entries: Option<&BTreeMap<u64, Entry>>, trimmed: u64) -> Frontier {
-        let mut contiguous = trimmed;
-        let mut high = trimmed;
-        for (&s, e) in entries.into_iter().flatten() {
-            if *e.state.borrow() != State::Durable {
-                continue;
-            }
-            if s == contiguous {
-                contiguous = e.shape.end;
-            }
-            high = high.max(e.shape.end);
-        }
+    fn frontier_of(g: &Inner, log: &LogId) -> Frontier {
+        let trimmed = g.trimmed.get(log).copied().unwrap_or(0);
+        let contiguous = g.contig.get(log).copied().unwrap_or(0).max(trimmed);
+        let high = g
+            .logs
+            .get(log)
+            .and_then(|m| {
+                m.values()
+                    .rev()
+                    .find(|e| e.lsn.is_some())
+                    .map(|e| e.shape.end)
+            })
+            .unwrap_or(0)
+            .max(contiguous);
         Frontier {
             log: log.clone(),
             contiguous,
             high,
         }
+    }
+
+    /// A log's durable batches from sequence `from` (one that starts before it included), up to
+    /// about `max_bytes` (repair).
+    pub fn log_batches(&self, log: &LogId, from: u64, max_bytes: usize) -> Vec<bytes::Bytes> {
+        let lsns: Vec<Lsn> = {
+            let g = self.inner.lock();
+            let Some(map) = g.logs.get(log) else {
+                return vec![];
+            };
+            let first = map
+                .range(..=from)
+                .next_back()
+                .filter(|(_, e)| e.shape.end > from)
+                .map_or(from, |(&s, _)| s);
+            let mut size = 0usize;
+            let mut out = vec![];
+            for e in map.range(first..).map(|(_, e)| e) {
+                if size >= max_bytes {
+                    break;
+                }
+                if let Some(lsn) = e.lsn {
+                    size += e.shape.len as usize;
+                    out.push(lsn);
+                }
+            }
+            out
+        };
+        lsns.into_iter()
+            .filter_map(|lsn| self.read_batch(lsn).map(|b| b.bytes))
+            .collect()
     }
 
     pub fn frontiers(&self, stream: Option<&str>) -> Vec<Frontier> {
@@ -580,7 +612,7 @@ impl Store {
         let mut v: Vec<_> = keys
             .into_iter()
             .filter(|l| stream.is_none_or(|s| l.stream == s))
-            .map(|l| Self::frontier_of(l, g.logs.get(l), g.trimmed.get(l).copied().unwrap_or(0)))
+            .map(|l| Self::frontier_of(&g, l))
             .filter(|f| f.high > 0)
             .collect();
         v.sort_by(|a, b| a.log.cmp(&b.log));
@@ -600,11 +632,7 @@ impl Store {
             let mut cov = vec![];
             if let Some(logs) = g.streams.get(stream) {
                 for l in logs {
-                    cov.push(Self::frontier_of(
-                        l,
-                        g.logs.get(l),
-                        g.trimmed.get(l).copied().unwrap_or(0),
-                    ));
+                    cov.push(Self::frontier_of(&g, l));
                     for e in g.logs.get(l).into_iter().flat_map(|m| m.values()) {
                         if let (State::Durable, Some(lsn)) = (*e.state.borrow(), e.lsn) {
                             lsns.push(lsn);
@@ -791,8 +819,9 @@ mod tests {
             t.s.has(&xs[0].id, 0),
             "repair must not fetch expired batches back"
         );
-        let (items, next, more) = t.s.inventory(0, 10);
-        assert_eq!((items[0].0, next, more), (3, 6, false));
+        // repair is served from after the trimmed prefix
+        let served = t.s.log_batches(&xs[0].id.log, 0, 1 << 20);
+        assert_eq!(Batch::parse(served[0].clone()).unwrap().id.first_seq, 3);
     }
 
     #[test]
@@ -1164,6 +1193,41 @@ mod tests {
     }
 
     #[test]
+    fn a_logs_batches_from_a_sequence_serve_repair_and_frontiers_track_gaps() {
+        let mut t = store();
+        let xs: Vec<Batch> = (0..6).map(|i| on("s", "w", i)).collect();
+        for x in xs.iter().filter(|x| x.id.first_seq != 2) {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        let f = &t.s.frontiers(None)[0];
+        assert_eq!((f.contiguous, f.high), (2, 6), "a gap at 2");
+        let got: Vec<u64> =
+            t.s.log_batches(&xs[0].id.log, 1, 1 << 20)
+                .into_iter()
+                .map(|b| Batch::parse(b).unwrap().id.first_seq)
+                .collect();
+        assert_eq!(got, [1, 3, 4, 5]);
+        let one = xs[0].bytes.len();
+        assert_eq!(
+            t.s.log_batches(&xs[0].id.log, 3, one).len(),
+            1,
+            "bounded by max_bytes"
+        );
+        t.s.reserve(&xs[2]);
+        t.durable(&xs[2]);
+        let f = &t.s.frontiers(None)[0];
+        assert_eq!((f.contiguous, f.high), (6, 6), "the gap filled");
+        t.s.trim_stream("s", Some(0), None, 0);
+        let f = &t.s.frontiers(None)[0];
+        assert_eq!(
+            (f.contiguous, f.high),
+            (6, 6),
+            "trimmed sequences count as present"
+        );
+    }
+
+    #[test]
     fn a_cursor_read_stops_at_about_max_bytes() {
         // a subscriber's response is bounded: a long backlog comes in steps, not one frame
         let mut t = store();
@@ -1236,5 +1300,44 @@ mod tests {
             "exactly 500 ms old"
         );
         assert_eq!(s.trim_stream("a", None, Some(500), 1_501), 1, "older");
+    }
+
+    #[test]
+    fn a_logs_batches_start_at_the_batch_holding_the_sequence() {
+        // repair asks from the first sequence it lacks: it gets the batch holding it (even from
+        // inside a batch), and not the batch before, which it has
+        let mut t = store();
+        let xs = [
+            b("w", 1, 0, &[(1, b"a"), (2, b"b")]),
+            b("w", 1, 2, &[(3, b"c"), (4, b"d")]),
+            b("w", 1, 4, &[(5, b"e"), (6, b"f")]),
+        ];
+        for x in &xs {
+            t.s.reserve(x);
+            t.durable(x);
+        }
+        let firsts = |from| -> Vec<u64> {
+            t.s.log_batches(&xs[0].id.log, from, 1 << 20)
+                .into_iter()
+                .map(|b| Batch::parse(b).unwrap().id.first_seq)
+                .collect()
+        };
+        assert_eq!(firsts(2), [2, 4], "from a batch's start");
+        assert_eq!(firsts(3), [2, 4], "from inside a batch");
+        // a gap at 2: the batch ending at 2 is not resent
+        let ys = [
+            b("v", 1, 0, &[(1, b"a"), (2, b"b")]),
+            b("v", 1, 4, &[(5, b"e")]),
+        ];
+        for y in &ys {
+            t.s.reserve(y);
+            t.durable(y);
+        }
+        let got: Vec<u64> =
+            t.s.log_batches(&ys[0].id.log, 2, 1 << 20)
+                .into_iter()
+                .map(|b| Batch::parse(b).unwrap().id.first_seq)
+                .collect();
+        assert_eq!(got, [4]);
     }
 }

@@ -43,6 +43,10 @@ pub struct Config {
     pub spares: usize,
     /// Bytes of recent records kept in memory for tail readers.
     pub tail_cache_bytes: usize,
+    /// How fast the background preallocator zero-fills a spare (0: unpaced). Full speed
+    /// saturates the disk and the log's fsyncs queue behind it; 64 MiB/s readies a 1 GiB spare
+    /// in 16 s. A roll that finds no spare fills one at full speed (counted in `roll_stalls`).
+    pub prealloc_bytes_per_s: u64,
     pub failpoints: Failpoints,
 }
 
@@ -63,6 +67,7 @@ impl Config {
             segment_size: 1 << 30,
             spares: 1,
             tail_cache_bytes: 64 << 20,
+            prealloc_bytes_per_s: 64 << 20,
             failpoints: Failpoints::default(),
         }
     }
@@ -485,23 +490,40 @@ struct Spares {
     stop: AtomicBool,
     target: usize,
     size: u64,
+    rate: u64,
     dir: PathBuf,
     counter: AtomicU64,
 }
 
 impl Spares {
-    /// Creates one zero-filled spare file, durably named.
-    fn make(&self) -> std::io::Result<PathBuf> {
+    /// Creates one zero-filled spare file, durably named; `paced`: at `rate`, synced every
+    /// 4 MiB, so it never floods the disk the log fsyncs on.
+    fn make(&self, paced: bool) -> std::io::Result<PathBuf> {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let tmp = self.dir.join(format!("spare-tmp-{n}"));
         let path = self.dir.join(format!("spare-{n:08}.log"));
         let mut f = File::create(&tmp)?;
-        let zeros = vec![0u8; 1 << 20];
-        let mut left = self.size;
-        while left > 0 {
-            let k = left.min(zeros.len() as u64) as usize;
+        let zeros = vec![0u8; 4 << 20]; // paced, each chunk is synced
+        let (start, mut done) = (std::time::Instant::now(), 0u64);
+        while done < self.size {
+            let k = (self.size - done).min(zeros.len() as u64) as usize;
             f.write_all(&zeros[..k])?;
-            left -= k as u64;
+            done += k as u64;
+            if paced && self.rate > 0 {
+                f.sync_data()?;
+                let due = std::time::Duration::from_secs_f64(done as f64 / self.rate as f64);
+                if let Some(wait) = due.checked_sub(start.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+                if self.stop.load(Ordering::Acquire) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "log closed",
+                    ));
+                }
+            }
         }
         f.sync_all()?;
         std::fs::rename(&tmp, &path)?;
@@ -520,7 +542,7 @@ impl Spares {
             if self.stop.load(Ordering::Acquire) {
                 return;
             }
-            match self.make() {
+            match self.make(true) {
                 Ok(p) => self.pool.lock().unwrap().push(p),
                 Err(_) => {
                     // the roll path creates its own when none is ready; retry later
@@ -626,17 +648,20 @@ impl Log {
         let mut counter = 0u64;
         for e in std::fs::read_dir(&dir)?.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
+            // a closing log's paced preallocator may still rename or remove its own spare while
+            // this lists them (a quick restart in one process)
             if name.starts_with("spare-tmp-") {
-                std::fs::remove_file(e.path())?;
+                let _ = std::fs::remove_file(e.path()); // best effort: gone is as good
             } else if let Some(n) = name
                 .strip_prefix("spare-")
                 .and_then(|s| s.strip_suffix(".log"))
             {
                 counter = counter.max(n.trim_start_matches('r').parse::<u64>().unwrap_or(0) + 1);
-                if e.metadata()?.len() == cfg.segment_size {
-                    pool.push(e.path());
-                } else {
-                    std::fs::remove_file(e.path())?;
+                match std::fs::metadata(e.path()) {
+                    Ok(m) if m.len() == cfg.segment_size => pool.push(e.path()),
+                    Ok(_) => std::fs::remove_file(e.path())?,
+                    Err(x) if x.kind() == std::io::ErrorKind::NotFound => {} // gone since listed
+                    Err(x) => return Err(x.into()),
                 }
             }
         }
@@ -657,6 +682,7 @@ impl Log {
             stop: AtomicBool::new(false),
             target: cfg.spares,
             size: cfg.segment_size,
+            rate: cfg.prealloc_bytes_per_s,
             dir: dir.clone(),
             counter: AtomicU64::new(counter),
         });
@@ -1051,7 +1077,7 @@ impl Log {
             }
             None => {
                 self.stats.roll_stalls += 1;
-                self.spares.make()?
+                self.spares.make(false)?
             }
         })
     }

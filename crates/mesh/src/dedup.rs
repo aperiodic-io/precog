@@ -1,179 +1,190 @@
 //! Broker-side dedup: drops an event whose dedup key was seen within the window on this node.
 //!
-//! The index is a few generations of open-addressing tables of 64-bit digests (`xxh3(key)`
-//! seeded by the stream), each sized for the last one's count; the oldest is dropped whole.
-//! Chosen in `results/dedup.md` against eight other exact indexes: ~15 bytes per live id at
-//! k = 3, ~100-250 ns per event with a batch's probes prefetched. It remembers an id for at least
-//! the window (up to window * k / (k - 1)). At `max_entries` the oldest generation goes early:
-//! the window shortens instead of memory growing (`effective_window_s` reports it).
+//! One map per stream from a key's 64-bit digest (`xxh3(key)` seeded by the stream) to the second
+//! it was last seen: one lookup per event (a new id, the common case, misses once instead of once
+//! per generation). It is std's SwissTable with the digest as its own hash. Expired entries count
+//! as absent and are dropped in one pass every quarter window. Chosen by measurement
+//! (`results/dedup.md` and the broker profile in bench/compare: open addressing at 7/8 load, then
+//! three generations of sets, cost 22% and 11% of a node's CPU). A node that only replicates a
+//! stream appends the origin's kept ids and indexes them at the stream's next check. At
+//! `max_entries` the oldest quarter goes: the window shortens instead of memory growing
+//! (`effective_window_s` reports it).
 
-use std::collections::VecDeque;
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// The digest is already xxh3: hash it no further.
+#[derive(Default)]
+struct Pass(u64);
+
+impl Hasher for Pass {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys")
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
 
 pub struct Dedup {
-    k: usize,
-    span_s: u64,
+    window_s: u64,
     max_entries: usize,
-    gens: VecDeque<Table>,
-    sized: usize,
+    /// digest -> the second it was last seen, plus one; an entry past the window counts as absent
+    seen: HashMap<u64, u32, BuildHasherDefault<Pass>>,
+    /// recorded (replicated) digests not yet indexed
+    pending: Vec<(u64, u32)>,
+    swept_s: u64,
+    /// the oldest second any kept entry may carry (the window, or less after the cap bit)
+    oldest_s: u64,
+    /// when this index first saw an id
+    started_s: Option<u64>,
 }
 
-struct Table {
-    slots: Vec<u64>,
-    len: usize,
-    start_s: u64,
+/// One index per stream (a node accepts some streams and replicates others; a replica only
+/// records, so the cost of indexing lands where the stream is accepted). `max_entries` is per
+/// stream, as the fork's cap is per partition.
+pub struct Streams {
+    window_s: u64,
+    k: usize,
+    max_entries: usize,
+    by_stream: std::collections::HashMap<String, Dedup>,
 }
 
-/// 0 marks an empty slot.
-fn nz(h: u64) -> u64 {
-    h.max(1)
-}
-
-/// A key's digest within its stream.
-pub fn digest(stream_seed: u64, key: &[u8]) -> u64 {
-    nz(xxhash_rust::xxh3::xxh3_64_with_seed(key, stream_seed))
-}
-
-pub fn stream_seed(stream: &str) -> u64 {
-    xxhash_rust::xxh3::xxh3_64(stream.as_bytes())
-}
-
-impl Table {
-    fn new(cap: usize, start_s: u64) -> Table {
-        Table {
-            slots: vec![0; cap.max(1024)],
-            len: 0,
-            start_s,
-        }
-    }
-    /// Any capacity: multiply-shift instead of a power-of-two mask.
-    fn home(&self, h: u64) -> usize {
-        ((h as u128 * self.slots.len() as u128) >> 64) as usize
-    }
-    fn next(&self, i: usize) -> usize {
-        if i + 1 == self.slots.len() { 0 } else { i + 1 }
-    }
-    fn contains(&self, h: u64) -> bool {
-        let mut i = self.home(h);
-        loop {
-            match self.slots[i] {
-                0 => return false,
-                x if x == h => return true,
-                _ => i = self.next(i),
-            }
-        }
-    }
-    fn insert(&mut self, h: u64) {
-        if (self.len + 1) * 8 > self.slots.len() * 7 {
-            let cap = self.slots.len() + self.slots.len() / 2;
-            let old = std::mem::replace(&mut self.slots, vec![0; cap]);
-            self.len = 0;
-            for x in old.into_iter().filter(|&x| x != 0) {
-                self.insert(x);
-            }
-        }
-        let mut i = self.home(h);
-        while self.slots[i] != 0 {
-            i = self.next(i);
-        }
-        self.slots[i] = h;
-        self.len += 1;
-    }
-}
-
-fn prefetch<T>(p: &T) {
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: a prefetch is a hint; it never faults and reads nothing into the program.
-    unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0)
-    }
-}
-
-impl Dedup {
-    /// `k` generations (at least 2) over `window_s`, at most `max_entries` ids.
-    pub fn new(window_s: u64, k: usize, max_entries: usize) -> Dedup {
-        assert!(k >= 2 && window_s > 0);
-        Dedup {
+impl Streams {
+    pub fn new(window_s: u64, k: usize, max_entries: usize) -> Streams {
+        Streams {
+            window_s,
             k,
-            span_s: window_s.div_ceil(k as u64 - 1),
             max_entries,
-            gens: VecDeque::new(),
-            sized: 1024,
+            by_stream: Default::default(),
         }
     }
 
-    fn roll(&mut self, now_s: u64) {
-        // a new generation each span, or early once the newest holds its share of the cap
-        if self
-            .gens
-            .back()
-            .is_none_or(|t| now_s >= t.start_s + self.span_s || t.len >= self.max_entries / self.k)
-        {
-            // sized for the last generation's count at 7/8 load, plus 10%
-            self.sized = self
-                .gens
-                .back()
-                .map_or(self.sized, |t| t.len * 8 / 7 * 11 / 10);
-            self.gens.push_back(Table::new(self.sized, now_s));
+    fn of(&mut self, stream: &str) -> &mut Dedup {
+        if !self.by_stream.contains_key(stream) {
+            self.by_stream.insert(
+                stream.to_string(),
+                Dedup::new(self.window_s, self.k, self.max_entries),
+            );
         }
-        // by count, by age after an idle gap, and by the entry cap (never the newest: it is
-        // new, or under its share of the cap)
-        while self.gens.len() > self.k
-            || self
-                .gens
-                .front()
-                .is_some_and(|t| now_s >= t.start_s + self.span_s * self.k as u64)
-            || self.len() > self.max_entries
-        {
-            self.gens.pop_front();
-        }
+        self.by_stream.get_mut(stream).unwrap()
     }
 
-    /// For each digest in order: was it seen within the window (a duplicate)? New ones are
-    /// recorded, so a batch's later events see its earlier ones.
-    pub fn check(&mut self, digests: &[u64], now_s: u64, dup: &mut Vec<bool>) {
-        self.roll(now_s);
-        for t in &self.gens {
-            for &h in digests {
-                prefetch(&t.slots[t.home(h)]);
-            }
-        }
-        dup.clear();
-        for &h in digests {
-            let seen = self.gens.iter().rev().any(|t| t.contains(h));
-            if !seen {
-                self.gens.back_mut().unwrap().insert(h);
-            }
-            dup.push(seen);
-        }
+    pub fn check(&mut self, stream: &str, digests: &[u64], now_s: u64, dup: &mut Vec<bool>) {
+        self.of(stream).check(digests, now_s, dup)
     }
 
-    /// Records digests without asking (replicated copies, a restart's rebuild).
-    pub fn record(&mut self, digests: &[u64], now_s: u64) {
-        self.roll(now_s);
-        for &h in digests {
-            if !self.gens.iter().any(|t| t.contains(h)) {
-                self.gens.back_mut().unwrap().insert(h);
-            }
-        }
+    pub fn record(&mut self, stream: &str, digests: &[u64], now_s: u64) {
+        self.of(stream).record(digests, now_s)
     }
 
     pub fn len(&self) -> usize {
-        self.gens.iter().map(|t| t.len).sum()
+        self.by_stream.values().map(Dedup::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn bytes(&self) -> usize {
-        self.gens.iter().map(|t| t.slots.len() * 8).sum()
+    /// The shortest window any stream remembers now.
+    pub fn effective_window_s(&self, now_s: u64) -> u64 {
+        self.by_stream
+            .values()
+            .map(|d| d.effective_window_s(now_s))
+            .min()
+            .unwrap_or(0)
+    }
+}
+
+/// A key's digest within its stream.
+pub fn digest(stream_seed: u64, key: &[u8]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64_with_seed(key, stream_seed)
+}
+
+pub fn stream_seed(stream: &str) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(stream.as_bytes())
+}
+
+impl Dedup {
+    /// Remembers ids for `window_s`, at most `max_entries` of them. (`_k` is kept for callers
+    /// that tuned the old generations; one map with a timestamp per id needs no generations.)
+    pub fn new(window_s: u64, _k: usize, max_entries: usize) -> Dedup {
+        assert!(window_s > 0);
+        Dedup {
+            window_s,
+            max_entries,
+            seen: HashMap::default(),
+            pending: vec![],
+            swept_s: 0,
+            oldest_s: 0,
+            started_s: None,
+        }
+    }
+
+    /// Every quarter window, drops expired entries in one pass; at the cap, the oldest quarter
+    /// of what is kept too (the window shortens instead of memory growing).
+    fn sweep(&mut self, now_s: u64) {
+        let full = self.seen.len() > self.max_entries;
+        if !full && now_s < self.swept_s + (self.window_s / 4).max(1) {
+            return;
+        }
+        let window_start = now_s.saturating_sub(self.window_s);
+        self.oldest_s = self.oldest_s.max(window_start);
+        if full {
+            self.oldest_s += (now_s.saturating_sub(self.oldest_s) / 4).max(1);
+        }
+        let oldest = self.oldest_s;
+        self.seen.retain(|_, t| (*t - 1) as u64 >= oldest);
+        self.swept_s = now_s;
+    }
+
+    /// For each digest in order: was it seen within the window (a duplicate)? New ones are
+    /// recorded, so a batch's later events see its earlier ones.
+    pub fn check(&mut self, digests: &[u64], now_s: u64, dup: &mut Vec<bool>) {
+        self.started_s.get_or_insert(now_s);
+        for (h, t) in self.pending.drain(..) {
+            self.seen.insert(h, t + 1); // what this node recorded as a replica
+        }
+        self.sweep(now_s);
+        dup.clear();
+        let oldest = self.oldest_s.max(now_s.saturating_sub(self.window_s));
+        for &h in digests {
+            // one probe: a new id (the common case) is inserted where the lookup ended
+            let t = self.seen.entry(h).or_insert(0); // stored as second + 1: 0 is never seen
+            let fresh = *t != 0 && (*t - 1) as u64 >= oldest;
+            if !fresh {
+                *t = now_s as u32 + 1;
+            }
+            dup.push(fresh);
+        }
+    }
+
+    /// Records digests without asking (replicated copies, a restart's rebuild): appended, and
+    /// indexed by the next `check` (a node that only replicates the stream never pays for it).
+    pub fn record(&mut self, digests: &[u64], now_s: u64) {
+        self.started_s.get_or_insert(now_s);
+        if self.pending.len() >= self.max_entries {
+            self.pending.drain(..self.pending.len() / 4); // the oldest quarter: the window shortens
+        }
+        self.pending
+            .extend(digests.iter().map(|&h| (h, now_s as u32)));
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len() + self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// How far back ids are remembered now: the window, or less once the cap bites.
     pub fn effective_window_s(&self, now_s: u64) -> u64 {
-        self.gens
-            .front()
-            .map_or(0, |t| now_s.saturating_sub(t.start_s))
+        let since = self.oldest_s.max(self.started_s.unwrap_or(now_s));
+        now_s.saturating_sub(since).min(self.window_s)
     }
 }
 
@@ -250,123 +261,104 @@ mod tests {
         );
     }
 
-    /// Fresh distinct digests (never 0, which marks an empty slot).
-    fn ids(range: std::ops::Range<u64>) -> Vec<u64> {
-        range.map(|i| digest(9, &i.to_le_bytes())).collect()
-    }
-
     #[test]
-    fn no_digest_is_the_empty_slot_marker() {
-        // a digest of 0 would read as an empty slot: never found, so never a duplicate
-        assert_ne!(nz(0), 0);
-        assert_eq!(nz(5), 5, "other digests are kept as they are");
-        assert_eq!(nz(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn an_id_is_held_for_the_window_and_forgotten_by_window_k_over_k_minus_1() {
-        // window 300 s, k = 3: generations of 150 s, three of them
+    fn recording_only_appends_and_the_first_check_indexes_what_was_recorded() {
+        // replicas record every event the origin kept: that must cost a push, not a hash insert
         let mut d = Dedup::new(300, 3, 1 << 30);
-        let (p1, p2) = (digest(9, b"p1"), digest(9, b"p2"));
-        for t in 0..=600u64 {
-            // steady traffic: every second opens the generations it should
-            d.record(&ids(1_000_000 + t..1_000_001 + t), t);
-            match t {
-                149 => d.record(&[p1], t), // the last second of the first generation
-                150 => d.record(&[p2], t), // the first second of the second
-                449 => assert_eq!(dups(&mut d, &[p1], t), [true], "held the full window"),
-                450 => {
-                    assert_eq!(dups(&mut d, &[p1], t), [false], "gone with its generation");
-                    assert_eq!(d.effective_window_s(t), 300, "the window is what is held");
-                }
-                599 => assert_eq!(dups(&mut d, &[p2], t), [true], "held up to 450 s"),
-                600 => assert_eq!(dups(&mut d, &[p2], t), [false], "not past 450 s"),
-                _ => {}
-            }
-        }
-    }
-
-    #[test]
-    fn after_an_idle_gap_old_ids_expire_by_age() {
-        let mut d = Dedup::new(300, 3, 1 << 30);
-        let (p1, p2) = (digest(9, b"p1"), digest(9, b"p2"));
-        d.record(&[p1, p2], 0);
-        // no traffic in between: only the generation's age can expire it
-        assert_eq!(
-            dups(&mut d, &[p1], 449),
-            [true],
-            "within window * k / (k - 1)"
-        );
-        assert_eq!(dups(&mut d, &[p2], 450), [false], "past it");
-        assert!(!d.is_empty(), "p1, re-recorded at 450, is held");
-        assert!(Dedup::new(300, 3, 1 << 30).is_empty());
-    }
-
-    #[test]
-    fn a_table_grows_by_half_once_seven_eighths_full() {
-        let mut d = Dedup::new(300, 3, 1 << 30);
-        d.record(&ids(0..896), 0);
-        assert_eq!(d.bytes(), 1024 * 8, "896 of 1024 slots: still at 7/8 load");
-        d.record(&ids(896..897), 0);
-        assert_eq!(d.bytes(), 1536 * 8, "one more: 1.5x");
-        assert_eq!(d.len(), 897);
-        assert_eq!(
-            dups(&mut d, &ids(0..897), 0),
-            [true; 897],
-            "nothing lost in the rehash"
-        );
-    }
-
-    #[test]
-    fn a_new_generation_is_sized_for_the_last_ones_count() {
-        let n = 10_000;
-        let mut d = Dedup::new(300, 3, 1 << 30);
-        d.record(&ids(0..n), 0);
-        let first = d.bytes();
-        d.record(&ids(n..n + 1), 150); // opens the second generation
-        let second = (d.bytes() - first) / 8;
-        // the same count, and a little more (traffic grows), fits without regrowing
-        d.record(&ids(n + 1..2 * n + n / 20), 150);
-        assert_eq!(d.bytes() - first, second * 8, "5% more fits");
-        let n = n as usize;
+        let ids: Vec<u64> = (0..1000u64).map(|i| digest(3, &i.to_le_bytes())).collect();
+        d.record(&ids, 5);
+        assert!(d.seen.is_empty() && d.pending.len() == 1000);
+        assert_eq!(d.len(), 1000);
         assert!(
-            second <= n * 8 / 7 * 11 / 10,
-            "at most 10% over 7/8 load: {second}"
+            dups(&mut d, &ids, 6).iter().all(|&x| x),
+            "a node taking over still drops them"
         );
+        assert!(d.pending.is_empty());
     }
 
     #[test]
-    fn at_the_cap_the_oldest_share_goes_first() {
-        // a cap of 3000 ids over k = 3: a generation closes once it holds 1000
-        let mut d = Dedup::new(300, 3, 3_000);
-        for b in 0..4 {
-            d.record(&ids(b * 1000..(b + 1) * 1000), 0);
+    fn each_stream_has_its_own_index_and_cap() {
+        let mut s = Streams::new(300, 3, 100);
+        let ids: Vec<u64> = (0..50u64).map(|i| digest(1, &i.to_le_bytes())).collect();
+        s.record("a", &ids, 1);
+        let mut out = vec![];
+        s.check("a", &ids, 2, &mut out);
+        assert!(out.iter().all(|&x| x));
+        s.check("b", &ids, 2, &mut out);
+        assert!(
+            out.iter().all(|&x| !x),
+            "another stream's ids are not duplicates"
+        );
+        assert_eq!(s.len(), 100);
+        assert_eq!(s.effective_window_s(2), 0, "the shortest: b started at 2");
+        assert_eq!(s.effective_window_s(10), 8, "b's 8 s, not a's 9 s");
+    }
+
+    #[test]
+    fn an_id_is_remembered_for_exactly_the_window() {
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        assert_eq!(dups(&mut d, &[7], 10), [false]);
+        assert_eq!(dups(&mut d, &[7], 310), [true], "300 s later: still in");
+        assert_eq!(dups(&mut d, &[7], 311), [false], "301 s later: out");
+        // a recorded (replicated) id counts from the second it was recorded, the same way
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        d.record(&[8, 9], 0);
+        assert_eq!(dups(&mut d, &[8], 300), [true]);
+        assert_eq!(dups(&mut d, &[9], 301), [false]);
+    }
+
+    #[test]
+    fn expired_ids_are_swept_from_memory_every_quarter_window() {
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        dups(&mut d, &[1], 9);
+        dups(&mut d, &[2], 10);
+        dups(&mut d, &[3], 310); // a sweep: 9 is past the window, 10 is not yet
+        assert_eq!(d.len(), 2);
+        dups(&mut d, &[4], 384); // 2 has expired, but the next sweep is due at 385
+        assert_eq!(d.len(), 3);
+        dups(&mut d, &[5], 385);
+        assert_eq!(d.len(), 3, "2 swept");
+    }
+
+    #[test]
+    fn past_the_cap_the_oldest_quarter_of_the_window_goes() {
+        let mut d = Dedup::new(300, 3, 4);
+        for (id, t) in [(1, 0), (2, 40), (3, 80), (4, 120), (5, 160)] {
+            dups(&mut d, &[id], t);
         }
-        assert_eq!(d.len(), 3_000, "exactly the cap is kept");
-        assert_eq!(
-            dups(&mut d, &[ids(0..1)[0], ids(3999..4000)[0]], 0),
-            [false, true]
-        );
+        assert_eq!(d.len(), 5, "at the cap nothing goes");
+        dups(&mut d, &[6], 170); // over it: the oldest quarter of 170 s (ids before 42) goes
+        assert_eq!(d.len(), 4);
+        assert_eq!(dups(&mut d, &[1, 3], 170), [false, true]);
+        assert_eq!(d.effective_window_s(170), 128);
     }
 
     #[test]
-    fn one_batch_over_the_cap_is_dropped_at_the_next_roll_but_the_cap_itself_is_kept() {
-        let mut d = Dedup::new(300, 3, 3_000);
-        d.record(&ids(0..3_000), 0);
-        d.record(&ids(3_000..3_001), 0);
-        assert_eq!(
-            d.len(),
-            3_001,
-            "at the cap (not over it) nothing is dropped"
-        );
-        let mut d = Dedup::new(300, 3, 3_000);
-        d.record(&ids(0..5_000), 0); // one batch: a single generation over the cap
-        d.record(&ids(5_000..5_001), 0);
-        assert_eq!(
-            d.len(),
-            1,
-            "the over-full generation went, the newest stays"
-        );
-        assert_eq!(dups(&mut d, &ids(5_000..5_001), 0), [true]);
+    fn recorded_ids_past_the_cap_lose_their_oldest_quarter() {
+        let mut d = Dedup::new(300, 3, 100);
+        assert!(d.is_empty());
+        for i in 0..3 {
+            d.record(&(i * 10..i * 10 + 10).collect::<Vec<u64>>(), 1);
+        }
+        assert_eq!(d.len(), 30, "under the cap all are kept");
+        assert!(!d.is_empty());
+        d.record(&(30..100).collect::<Vec<u64>>(), 1);
+        d.record(&[100], 1); // 100 pending: a quarter goes first
+        assert_eq!(d.len(), 76);
+    }
+
+    #[test]
+    fn streams_are_empty_until_an_id_is_recorded() {
+        let mut s = Streams::new(300, 3, 100);
+        assert!(s.is_empty());
+        s.record("a", &[1], 1);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "only u64 keys")]
+    fn the_pass_through_hasher_takes_only_u64_digests() {
+        // another key type would be hashed by `write`, which would put every key in one bucket
+        Pass::default().write(b"x");
     }
 }

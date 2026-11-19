@@ -24,8 +24,6 @@ exclude_re = [
     # how many appends share one fsync: throughput only, held by the perf gate
     "replace \\+= with \\*= in writer",
     "wal\\.rs:\\d+:\\d+: replace << with >>$",
-    # the dedup index's cache prefetch: a hint that never changes a result, speed only
-    "replace prefetch with \\(\\)",
     # closes a race with concurrent retention; not reachable deterministically from a test
     "replace match guard self.trimmed\\(lsn\\) with false in Reader::read",
 ]

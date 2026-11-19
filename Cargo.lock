@@ -2919,6 +2919,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "parking_lot",
  "precog-mesh",
  "serde_json",
  "tempfile",
@@ -2950,6 +2951,7 @@ dependencies = [
  "cucumber",
  "futures",
  "gungraun",
+ "lz4_flex",
  "parking_lot",
  "precog-storage",
  "rand 0.9.5",

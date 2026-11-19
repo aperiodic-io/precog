@@ -1410,3 +1410,171 @@ fn a_damaged_final_record_is_dropped_and_zeroed() {
         "its header was zeroed"
     );
 }
+
+#[test]
+fn spares_are_filled_at_a_paced_rate_in_the_background() {
+    // A spare zero-filled at full speed saturates the disk and the log's own fsyncs queue
+    // behind it (p99 acks of 400 ms in bench/compare at each roll); the preallocator paces itself.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 4 << 20);
+    c.prealloc_bytes_per_s = 4 << 20;
+    let _log = Log::open(c).unwrap();
+    let spares = || {
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("spare-0")
+            })
+            .count()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        spares(),
+        0,
+        "a 4 MiB spare at 4 MiB/s is not ready after 300 ms"
+    );
+    let t = std::time::Instant::now();
+    while spares() == 0 && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(spares(), 1, "ready within a few seconds");
+}
+
+#[test]
+fn a_spare_gone_since_the_directory_was_listed_is_skipped_but_other_errors_stop_the_open() {
+    // A closing log's paced preallocator can rename or remove a spare while the next open lists
+    // the directory (a quick restart in one process). A dangling link stands in for a spare
+    // listed and then gone; a link loop for a spare that cannot be examined at all.
+    let d = tempfile::tempdir().unwrap();
+    drop(Log::open(cfg(d.path(), 1 << 20)).unwrap());
+    let link = d.path().join("spare-00000099.log");
+    std::os::unix::fs::symlink(d.path().join("gone"), &link).unwrap();
+    let mut log = Log::open(cfg(d.path(), 1 << 20)).unwrap();
+    log.append(&[(meta(0), &b"x"[..])]).unwrap();
+    drop(log);
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&link, &link).unwrap();
+    assert!(
+        Log::open(cfg(d.path(), 1 << 20)).is_err(),
+        "not a vanished spare"
+    );
+}
+
+fn spare_files(dir: &Path) -> Vec<std::fs::Metadata> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("spare-0"))
+        .map(|e| e.metadata().unwrap())
+        .collect()
+}
+
+#[test]
+fn an_unpaced_spare_is_ready_at_once_and_exactly_a_segment_long() {
+    // rate 0 turns pacing off; a spare becomes a segment, so it is a segment's size, also when
+    // that is not a whole number of fill chunks
+    let d = tempfile::tempdir().unwrap();
+    let size = (4 << 20) + (1 << 19);
+    let mut c = cfg(d.path(), size);
+    c.prealloc_bytes_per_s = 0;
+    let _log = Log::open(c).unwrap();
+    let t = std::time::Instant::now();
+    while spare_files(d.path()).is_empty() && t.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let s = spare_files(d.path());
+    assert_eq!(s.len(), 1, "ready within seconds");
+    assert_eq!(s[0].len(), size);
+}
+
+#[test]
+fn a_roll_that_finds_no_spare_fills_one_at_full_speed() {
+    // the append path waits for this spare: pacing it would stall writes for seconds
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 4 << 20);
+    c.spares = 0; // nothing prepared: every segment is made when it is needed
+    c.prealloc_bytes_per_s = 1 << 20; // a paced 4 MiB spare would take 4 s
+    let t = std::time::Instant::now();
+    let mut log = Log::open(c).unwrap();
+    let rec = vec![1u8; 64 << 10];
+    for i in 0..80 {
+        log.append(&[(meta(i), &rec[..])]).unwrap(); // 5 MiB: one roll
+    }
+    assert!(log.stats().segments >= 2, "{:?}", log.stats());
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+#[test]
+fn a_spare_of_the_right_size_is_reused_after_a_restart() {
+    // a restart must not throw away a ready spare and zero-fill another
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 1 << 20);
+    c.prealloc_bytes_per_s = 0;
+    let names = || -> Vec<String> {
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("spare-0"))
+            .collect()
+    };
+    {
+        let _log = Log::open(c.clone()).unwrap();
+        let t = std::time::Instant::now();
+        while names().is_empty() && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    let before = names();
+    assert_eq!(before.len(), 1);
+    let _log = Log::open(c).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(names(), before, "the same spare, not a new one");
+}
+
+#[test]
+fn spare_names_keep_counting_up_across_a_restart() {
+    // a name below one already on disk could be reused and its rename overwrite a pooled spare
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 64 * 1024);
+    c.prealloc_bytes_per_s = 0;
+    let numbers = || -> Vec<u64> {
+        let mut v: Vec<u64> = std::fs::read_dir(d.path())
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().to_string();
+                n.strip_prefix("spare-")?.strip_suffix(".log")?.parse().ok()
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let wait = |want: usize| {
+        let t = std::time::Instant::now();
+        while numbers().len() < want && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    {
+        let _log = Log::open(c.clone()).unwrap();
+        wait(1);
+    }
+    let old = numbers();
+    assert_eq!(old.len(), 1);
+    let mut log = Log::open(c).unwrap();
+    fill(&mut log, 0, 40, 2, 1000); // ~80 KiB: a roll takes the old spare
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait(1);
+    let new = numbers();
+    assert!(
+        !new.is_empty() && new.iter().all(|&n| n > old[0]),
+        "{old:?} then {new:?}"
+    );
+}
