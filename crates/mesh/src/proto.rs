@@ -732,15 +732,36 @@ pub fn encode_log_key(log: &LogId) -> Vec<u8> {
     v
 }
 
-pub fn decode_log_key(mut b: &[u8]) -> Result<LogId> {
+/// The key of a record that replaces a conflicting batch under the same identity (a node that
+/// held bytes a majority of nodes do not): the log key and one byte `1`. Recovery keeps the
+/// replacement. A node that predates it refuses such a log ("bad log key") instead of reading it.
+pub fn encode_replacing_key(log: &LogId) -> Vec<u8> {
+    let mut v = encode_log_key(log);
+    v.push(1);
+    v
+}
+
+pub fn decode_log_key(b: &[u8]) -> Result<LogId> {
+    Ok(decode_record_key(b)?.0)
+}
+
+/// A record's writer log, and whether the record replaces a conflicting batch.
+pub fn decode_record_key(mut b: &[u8]) -> Result<(LogId, bool)> {
     let stream = take_str(&mut b)?;
     let writer = take_str(&mut b)?;
-    ensure!(b.len() == 8, "bad log key");
-    Ok(LogId {
-        stream,
-        writer,
-        epoch: u64::from_le_bytes(b.try_into().unwrap()),
-    })
+    let replaces = match b.len() {
+        8 => false,
+        9 if b[8] == 1 => true,
+        _ => bail!("bad log key"),
+    };
+    Ok((
+        LogId {
+            stream,
+            writer,
+            epoch: u64::from_le_bytes(b[..8].try_into().unwrap()),
+        },
+        replaces,
+    ))
 }
 
 pub fn batch_crc(batch: &Bytes) -> u32 {
@@ -887,6 +908,30 @@ pub fn hex_encode(b: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_key_says_whether_it_replaces_a_conflicting_batch() {
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 7,
+        };
+        assert_eq!(
+            decode_record_key(&encode_log_key(&log)).unwrap(),
+            (log.clone(), false)
+        );
+        let k = encode_replacing_key(&log);
+        assert_eq!(decode_record_key(&k).unwrap(), (log.clone(), true));
+        assert_eq!(decode_log_key(&k).unwrap(), log);
+        let mut bad = k.clone();
+        *bad.last_mut().unwrap() = 2;
+        assert!(
+            decode_record_key(&bad).is_err(),
+            "an unknown flag is refused"
+        );
+        bad.push(1);
+        assert!(decode_record_key(&bad).is_err(), "so is a longer key");
+    }
 
     fn log() -> LogId {
         LogId {

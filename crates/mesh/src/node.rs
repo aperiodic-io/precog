@@ -1328,6 +1328,8 @@ impl Node {
             let mut domains = HashSet::new();
             let mut nodes = 0u32;
             let mut tx = Some(tx);
+            // a peer holds other bytes under the batch's identity
+            let mut peer_conflict = false;
             while let Some(r) = futs.next().await {
                 match r {
                     R::Local(Ok(Local::Stored | Local::Duplicate)) => {
@@ -1353,6 +1355,7 @@ impl Node {
                         nodes |= 1 << pid;
                     }
                     R::Remote(pid, _, Ok(a)) => {
+                        peer_conflict |= a.status == AckStatus::Conflict;
                         tracing::debug!("peer {pid} did not confirm: {a:?}")
                     }
                     R::Remote(pid, _, Err(e)) => {
@@ -1381,6 +1384,9 @@ impl Node {
                     nodes,
                     crc,
                 });
+            }
+            if peer_conflict && let Err(e) = node.yield_to_majority(&batch).await {
+                tracing::warn!("conflict at {:?} unresolved: {e}", batch.id);
             }
         });
         rx.await.unwrap_or(Ack {
@@ -1454,6 +1460,45 @@ impl Node {
     async fn peer_control(&self, p: &Peer, c: &Control) -> Result<Frame> {
         self.peer_call(p, Kind::Control, Bytes::from(serde_json::to_vec(c)?))
             .await
+    }
+
+    /// A peer holds other bytes than `ours` under its identity (this node was down while they
+    /// were acknowledged, then a writer reused the identity here). Repair cannot
+    /// see this: the frontiers agree. If a strict majority of the nodes hold one other batch
+    /// there, that batch is logged as a replacement and takes ours' place.
+    /// ponytail: a majority of nodes, so an ack at `copies` > n/2 always wins (2 of 3); a crash
+    /// before this runs leaves the conflict, which a per-log content digest in repair would find.
+    async fn yield_to_majority(&self, ours: &Batch) -> Result<()> {
+        let ask = Control::Fetch {
+            ids: vec![ours.id.clone()],
+        };
+        let mut held: Vec<Batch> = vec![];
+        for p in &self.peers {
+            if let Ok(f) = self.peer_control(p, &ask).await
+                && f.kind == Kind::Batches
+                && !f.body.is_empty()
+            {
+                held.push(Batch::parse(f.body.slice(4..))?);
+            }
+        }
+        let n = self.peers.len() + 1;
+        let Some(theirs) = held
+            .iter()
+            .find(|b| 2 * held.iter().filter(|x| x.ident == b.ident).count() > n)
+        else {
+            bail!("no batch is held by a majority of {n} nodes");
+        };
+        anyhow::ensure!(
+            self.store.replaceable(theirs),
+            "the majority's batch has another range"
+        );
+        let lsn = self.wal.append_replacing(theirs.clone()).await?;
+        self.store.replace(theirs, lsn);
+        tracing::warn!(
+            "{:?}: replaced bytes a majority does not hold with theirs",
+            ours.id
+        );
+        Ok(())
     }
 
     /// Anti-entropy: pull every batch a peer made durable since our cursor that
