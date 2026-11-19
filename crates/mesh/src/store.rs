@@ -319,8 +319,11 @@ impl Inner {
             loop {
                 // the lower first sequence of the two (RAM's only in its own group: the last)
                 let next = match (cold.peek(), hot.peek().filter(|_| with_hot)) {
-                    (Some(c), Some(h)) if h.0 < c.0 => hot.next(),
-                    (Some(_), _) => cold.next(),
+                    (Some(c), Some(h)) => match c.0.cmp(&h.0) {
+                        std::cmp::Ordering::Less => cold.next(),
+                        _ => hot.next(),
+                    },
+                    (Some(_), None) => cold.next(),
                     (None, Some(_)) => hot.next(),
                     (None, None) => None,
                 };
@@ -554,7 +557,6 @@ impl Inner {
     /// the dead copies. Its index reads then need no lock.
     fn view(&self, stream: &str, hot: impl Fn(&Log) -> Vec<(u64, Entry)>) -> Inner {
         let mut v = Inner {
-            floor: self.floor,
             cold_end: self.cold_end,
             dead: self.dead.clone(),
             ..Default::default()
@@ -564,7 +566,8 @@ impl Inner {
         };
         let mut sl = StreamLog {
             cold: s.cold.clone(),
-            floor: s.floor,
+            // what `run` filters by: the store's floor and the stream's own
+            floor: s.floor.max(self.floor),
             ..Default::default()
         };
         for &ix in &s.logs {
@@ -1767,6 +1770,10 @@ mod tests {
         };
         check(&t.s, "replaced");
         check(&t.reload().unwrap(), "after a restart");
+        // the stream's bytes are exact: one byte under its total trims its oldest batch only
+        let one = xs[1].bytes.len() as u64;
+        assert_eq!(t.s.trim_stream("s", Some(before.2 - 1), None, 0), 1);
+        assert_eq!(t.s.totals(), (5, 5, before.2 - one));
         for i in 6..12 {
             let z = b("w", 1, i, &[(1, b"z")]);
             t.s.reserve(&z);
@@ -1774,8 +1781,14 @@ mod tests {
         }
         t.s.absorb();
         assert_eq!(t.s.trim_stream("s", Some(t.s.totals().2), None, 0), 0);
-        assert_eq!(drain(&t.s, "s", Cursor::new(), 1 << 20).0.len(), 12);
+        // (seq 1 forgotten: a cursor starts past it, so past seq 0 too)
+        assert_eq!(drain(&t.s, "s", Cursor::new(), 1 << 20).0.len(), 10);
         assert!(t.s.get(&x.id).is_some_and(|b| b.bytes == x.bytes));
+        // dropping the replaced batch's segment subtracts its segment's exact totals
+        let floor = t.log.retain(Some(1), None).unwrap();
+        assert!(floor > 1, "the replaced batch's segment dropped");
+        t.s.trim(floor);
+        assert_eq!(t.s.totals(), t.reload().unwrap().totals());
     }
 
     #[test]
