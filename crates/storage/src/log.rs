@@ -1428,8 +1428,6 @@ fn scan(
     let x = s.end;
     let window_end = x.saturating_add(SEARCH_WINDOW).min(len);
     let mut later = None;
-    // the end of the furthest record found past x
-    let mut furthest = x;
     let mut torn: Option<u64> = None;
     // a record of this generation was written at x but fails validation: damage, not a clean end
     let mut dirty = x + u64::from(stopped_on_written);
@@ -1440,23 +1438,28 @@ fn scan(
             // zeroing a record's header is enough to make it unreadable for good
             dirty = dirty.max(pos + record::HEADER as u64);
             if let Decoded::Record { header, next, .. } = record::decode(&w.buf, rel, generation) {
-                pos += (next - rel) as u64;
-                furthest = pos;
                 if header.group_start > x {
-                    later = later.or(Some(header.group_start));
-                    if unsynced.is_none() {
-                        break; // fails closed below: no need to look further
-                    }
-                } else {
-                    torn = Some(torn.map_or(header.group_start, |t| t.min(header.group_start)));
+                    later = Some(header.group_start);
+                    break;
                 }
+                torn = Some(torn.map_or(header.group_start, |t| t.min(header.group_start)));
+                pos += (next - rel) as u64;
                 continue;
             }
         }
         pos += 8;
     }
+    // With write caching, a later group may be part of the unsynced tail: everything written
+    // past x must then lie within the bound. `dirty` ends at or before the end of the furthest
+    // record (a record is at least its header).
+    let lost_tail = match (later, unsynced) {
+        (Some(_), Some(u)) => {
+            dirty = dirty.max(written_end(&mut w, pos, window_end, generation)?);
+            dirty <= x.saturating_add(u)
+        }
+        _ => false,
+    };
     s.scanned = w.scanned;
-    let lost_tail = unsynced.is_some_and(|u| furthest <= x.saturating_add(u));
     if let Some(g) = later.filter(|_| !lost_tail) {
         return Err(Error::Corrupt(format!(
             "damage at offset {x} of the active segment is followed by a later group at offset {g}"
@@ -1480,6 +1483,24 @@ fn scan(
         s.dirty_end = dirty.max(x + record::HEADER as u64).min(len);
     }
     Ok(s)
+}
+
+/// The end of the header of the last record of this generation written in `[pos, end)`
+/// (`pos` if none), skipping over the records that decode.
+fn written_end(w: &mut Window<'_>, mut pos: u64, end: u64, generation: u64) -> Result<u64> {
+    let mut last = pos;
+    while pos < end {
+        let rel = w.cover_ahead(pos, end)?;
+        if w.written_at(rel, generation) {
+            last = pos + record::HEADER as u64;
+            if let Decoded::Record { next, .. } = record::decode(&w.buf, rel, generation) {
+                pos += (next - rel) as u64;
+                continue;
+            }
+        }
+        pos += 8;
+    }
+    Ok(last)
 }
 
 /// How far past a torn write recovery looks for later records: a torn group spans at most
