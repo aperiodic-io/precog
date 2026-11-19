@@ -279,11 +279,47 @@ async fn restart_recovers_from_wal() {
     assert_eq!(node.store.frontiers(None)[0].contiguous, 5);
 }
 
+/// A live feed starts when `subscribe` returns, not whenever the node gets round to it: the
+/// node confirms the feed's starting point, so a batch written right after subscribing is never
+/// taken for history and skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_node_confirms_a_feed_before_it_carries_anything() {
+    let c = cluster(1, &["a"]);
+    start(&c, 0).await;
+    let t = Duration::from_secs(2);
+    let conn = precog_mesh::transport::connect(&c.addrs[0], t)
+        .await
+        .unwrap();
+    let hello = Hello {
+        token: "secret-token".into(),
+        node_id: None,
+    };
+    conn.call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
+        .await
+        .unwrap();
+    for from_start in [false, true] {
+        let sub = Subscribe {
+            stream: None,
+            from_start,
+        };
+        let mut rx = conn
+            .subscribe(Kind::Subscribe, serde_json::to_vec(&sub).unwrap().into(), 8)
+            .await
+            .unwrap();
+        let f = tokio::time::timeout(t, rx.recv())
+            .await
+            .expect("no confirmation with nothing written")
+            .unwrap();
+        assert!(f.body.is_empty(), "a start marker, not a batch");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn live_subscribers_receive_everything_in_writer_order() {
     let c = cluster(3, &["a", "b", "c"]);
+    let mut nodes = vec![];
     for i in 0..3 {
-        start(&c, i).await;
+        nodes.push(start(&c, i).await);
     }
     let mc = client(&c).await;
     // History written before anyone subscribes.
@@ -291,7 +327,11 @@ async fn live_subscribers_receive_everything_in_writer_order() {
     for i in 0..10u64 {
         w1.append(&[(i, b"old")]).await.unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(200)).await; // third copies land
+    // An ack needs 2 copies and the third can land after it: repair (off in these tests, every
+    // second in production) brings it in, so the subscribing nodes hold all the history.
+    for n in &nodes[1..] {
+        assert!(n.repair_pass().await.1.is_empty());
+    }
     let mut replay = mc.subscribe(2, Some("s"), true).await.unwrap();
     let mut live = mc.subscribe(1, Some("s"), false).await.unwrap();
     let mut other = mc.subscribe(1, Some("other-stream"), false).await.unwrap();
