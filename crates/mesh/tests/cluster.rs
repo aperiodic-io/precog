@@ -6,7 +6,9 @@ use precog_mesh::node::{Node, NodeConfig, PeerConfig};
 use precog_mesh::proto::*;
 use precog_mesh::transport::Addr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 struct Cluster {
     cfgs: Vec<NodeConfig>,
@@ -475,5 +477,101 @@ async fn a_cursor_read_over_rpc_answers_in_frames_that_fit() {
         f.body.len() <= MAX_FRAME_BYTES / 2 + (1 << 21),
         "{}",
         f.body.len()
+    );
+    // repair's FetchLog answers within a frame the same way
+    let fetch = Control::FetchLog {
+        log,
+        from_seq: 0,
+        max_bytes: u32::MAX,
+    };
+    let f = mc
+        .call(
+            0,
+            Kind::Control,
+            Bytes::from(serde_json::to_vec(&fetch).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.kind, Kind::Batches);
+    assert!(
+        (1..=MAX_FRAME_BYTES / 2 + (1 << 21)).contains(&f.body.len()),
+        "{}",
+        f.body.len()
+    );
+}
+
+/// Forwards connections to `to`, counting the FetchLog requests that pass through.
+async fn counting_proxy(to: std::net::SocketAddr) -> (String, Arc<AtomicU64>) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("tcp://{}", l.local_addr().unwrap());
+    let n = Arc::new(AtomicU64::new(0));
+    let count = n.clone();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = l.accept().await {
+            let out = tokio::net::TcpStream::connect(to).await.unwrap();
+            let (mut ir, mut iw) = inbound.into_split();
+            let (mut or, mut ow) = out.into_split();
+            tokio::spawn(async move { tokio::io::copy(&mut or, &mut iw).await });
+            let count = count.clone();
+            tokio::spawn(async move {
+                let mut buf = bytes::BytesMut::new();
+                while let Ok(Some(f)) = precog_mesh::rpc::read_frame(&mut ir, &mut buf).await {
+                    if f.kind == Kind::Control
+                        && matches!(
+                            serde_json::from_slice(&f.body),
+                            Ok(Control::FetchLog { .. })
+                        )
+                    {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let mut b = bytes::BytesMut::new();
+                    f.encode_into(&mut b);
+                    if ow.write_all(&b).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (addr, n)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repair_pulls_what_a_node_lacks_in_as_few_requests_as_it_takes() {
+    // anti-entropy runs on every node all the time: it pulls a lagging log in 4 MiB steps up to
+    // the peer's high, and asks nothing about a log the node already holds
+    let mut c = cluster(2, &["a", "b"]);
+    for cfg in &mut c.cfgs {
+        cfg.segment_size = 64 << 20;
+        cfg.target_copies = 1; // no replication: node 0 gets the log by repair only
+    }
+    let n1 = start(&c, 1).await;
+    let (proxy, fetches) = counting_proxy(c.cfgs[1].listen_tcp.unwrap()).await;
+    c.cfgs[0].peers[0].addr = proxy;
+    let n0 = start(&c, 0).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let big = vec![7u8; 1 << 20];
+    for seq in 0..6 {
+        let b = Batch::encode(&log, seq, &[(seq, &big[..])]).unwrap();
+        assert!(n1.append(1, b).await.is_success());
+    }
+    let (fetched, errors) = n0.repair_pass().await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(fetched, 6, "the whole log, not its first 4 MiB");
+    assert_eq!(
+        fetches.load(Ordering::Relaxed),
+        2,
+        "4 MiB, then the rest; none past the peer's high"
+    );
+    let (fetched, _) = n0.repair_pass().await;
+    assert_eq!(fetched, 0);
+    assert_eq!(
+        fetches.load(Ordering::Relaxed),
+        2,
+        "nothing asked for a log it holds"
     );
 }
