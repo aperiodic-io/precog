@@ -76,6 +76,11 @@ Each invariant has tests that fail if it breaks. Keep them failing for the right
 ## Pull requests
 
 - One logical change per commit. Messages: `area: what changed`, plus the test that failed first.
+- PR titles follow the [Angular commit convention](https://github.com/angular/angular/blob/main/contributing-docs/commit-message-guidelines.md):
+  `<type>(<scope>): <summary>`, type one of `feat`, `fix`, `perf`, `refactor`, `test`, `docs`,
+  `build`, `ci`, `chore`; scope the area (`storage`, `mesh`, `client`, `spec`, ...); summary in
+  the imperative, lower case, no final period. Example: `fix(storage): recover a write-caching
+  log whose unsynced tail reached disk out of order`.
 - CI must be green: lint, test, coverage, acceptance, mutants, bench gate, perf gate.
 - A deliberate performance regression needs a line in the PR saying why, plus the gate's numbers.
 
