@@ -281,6 +281,12 @@ impl Batch {
         })
     }
 
+    /// `(key, payload)` of every event but tombstones; an empty key for keyless events.
+    pub fn keyed(&self) -> impl Iterator<Item = (&[u8], Bytes)> + '_ {
+        self.raw()
+            .filter_map(|(_, e)| e.map(|(k, p)| (k, self.bytes.slice_ref(p))))
+    }
+
     /// Each event's dedup key; `None` for no key or a tombstone.
     pub fn keys(&self) -> impl Iterator<Item = Option<&[u8]>> + '_ {
         self.raw()

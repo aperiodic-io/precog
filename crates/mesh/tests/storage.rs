@@ -168,14 +168,14 @@ async fn each_declared_stream_keeps_its_own_retention() {
         "small".into(),
         precog_mesh::node::StreamConfig {
             retention_bytes: Some(5 * one),
-            retention_ms: None,
+            ..Default::default()
         },
     );
     c.streams.insert(
         "young".into(),
         precog_mesh::node::StreamConfig {
-            retention_bytes: None,
             retention_ms: Some(0),
+            ..Default::default()
         },
     );
     let node = Node::open(c).await.unwrap();

@@ -124,6 +124,10 @@ pub struct StreamConfig {
     /// Drop the stream's batches older than this.
     #[serde(default)]
     pub retention_ms: Option<u64>,
+    /// Keep the newest event of every key (`cleanup.policy=compact`), through retention and
+    /// restarts; the event key is the compaction key, and the stream is never deduplicated.
+    #[serde(default)]
+    pub compacted: bool,
 }
 
 fn dedup_window_ms() -> Option<u64> {
@@ -169,6 +173,65 @@ pub struct Node {
     /// claimed them (the log commits in order and fences on any write error).
     dedup: parking_lot::Mutex<Option<Dedup>>,
     dedup_dropped: AtomicU64,
+    /// Compacted streams: key -> (LSN, payload) of its newest event.
+    compact: parking_lot::Mutex<HashMap<String, Compacted>>,
+}
+
+type Compacted = BTreeMap<Vec<u8>, (u64, Bytes)>;
+
+const SNAP_MAGIC: &[u8; 4] = b"PCS1";
+
+/// A compacted stream's snapshot: magic, count, then (key len u16, key, lsn u64, payload len
+/// u32, payload) per key, then CRC-32C of everything before it.
+fn encode_snapshot(m: &Compacted) -> Vec<u8> {
+    let mut b = SNAP_MAGIC.to_vec();
+    b.extend_from_slice(&(m.len() as u64).to_le_bytes());
+    for (k, (lsn, p)) in m {
+        b.extend_from_slice(&(k.len() as u16).to_le_bytes());
+        b.extend_from_slice(k);
+        b.extend_from_slice(&lsn.to_le_bytes());
+        b.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        b.extend_from_slice(p);
+    }
+    let c = crc32c::crc32c(&b);
+    b.extend_from_slice(&c.to_le_bytes());
+    b
+}
+
+fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
+    let fail = || anyhow!("compacted-stream snapshot is damaged or of an unknown version");
+    let (body, crc) = b
+        .split_at_checked(b.len().checked_sub(4).ok_or_else(fail)?)
+        .ok_or_else(fail)?;
+    if crc32c::crc32c(body) != u32::from_le_bytes(crc.try_into()?)
+        || body.get(..4) != Some(&SNAP_MAGIC[..])
+    {
+        return Err(fail());
+    }
+    let mut c = &body[4..];
+    let mut take = |n: usize| -> Result<&[u8]> {
+        let (a, rest) = c.split_at_checked(n).ok_or_else(fail)?;
+        c = rest;
+        Ok(a)
+    };
+    let n = u64::from_le_bytes(take(8)?.try_into()?);
+    let mut m = Compacted::new();
+    for _ in 0..n {
+        let kl = u16::from_le_bytes(take(2)?.try_into()?) as usize;
+        let k = take(kl)?.to_vec();
+        let lsn = u64::from_le_bytes(take(8)?.try_into()?);
+        let pl = u32::from_le_bytes(take(4)?.try_into()?) as usize;
+        m.insert(k, (lsn, Bytes::copy_from_slice(take(pl)?)));
+    }
+    if !c.is_empty() {
+        return Err(fail());
+    }
+    Ok(m)
+}
+
+fn snapshot_path(dir: &std::path::Path, stream: &str) -> PathBuf {
+    dir.join("compact")
+        .join(format!("{}.snap", hex_encode(stream.as_bytes())))
 }
 
 /// The digests of a batch's keyed events, with their positions.
@@ -179,6 +242,15 @@ fn digests(batch: &Batch) -> Vec<(usize, u64)> {
         .enumerate()
         .filter_map(|(i, k)| Some((i, dedup::digest(seed, k?))))
         .collect()
+}
+
+/// Applies a durable batch at `lsn` to a compacted stream's newest values.
+fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
+    for (k, p) in batch.keyed() {
+        if m.get(k).is_none_or(|(l, _)| *l <= lsn) {
+            m.insert(k.to_vec(), (lsn, p));
+        }
+    }
 }
 
 fn now_s() -> u64 {
@@ -227,7 +299,31 @@ impl Node {
             }
             None => vec![],
         };
+        // compacted streams: their snapshots, then whatever the log holds that is newer
+        let mut compact: HashMap<String, Compacted> = HashMap::new();
+        let mut replay = vec![];
+        for (name, s) in cfg.streams.iter().filter(|(_, s)| s.compacted) {
+            let p = snapshot_path(&cfg.data_dir, name);
+            let m = match std::fs::read(&p) {
+                Ok(b) => decode_snapshot(&b).with_context(|| format!("{}", p.display()))?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Compacted::new(),
+                Err(e) => return Err(e.into()),
+            };
+            compact.insert(name.clone(), m);
+            let _ = s;
+        }
+        for e in &entries {
+            if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
+                replay.push(e.lsn);
+            }
+        }
         let store = Store::load(wal.reader.clone(), entries)?;
+        for lsn in replay {
+            if let Some(r) = wal.reader.read(lsn)? {
+                let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
+                apply_compacted(compact.get_mut(&b.id.log.stream).unwrap(), &b, lsn);
+            }
+        }
         if let Some(d) = dedup.as_mut() {
             for lsn in recent {
                 if let Some(r) = wal.reader.read(lsn)? {
@@ -260,6 +356,7 @@ impl Node {
             inflight: Semaphore::new(16_384),
             dedup: parking_lot::Mutex::new(dedup),
             dedup_dropped: AtomicU64::new(0),
+            compact: parking_lot::Mutex::new(compact),
         });
         Ok(node)
     }
@@ -331,7 +428,50 @@ impl Node {
     }
 
     /// Applies the configured retention to the log and forgets trimmed batches.
+    /// A compacted stream's newest value of every key, by key.
+    pub fn latest(&self, stream: &str) -> Vec<(Vec<u8>, Bytes)> {
+        self.compact.lock().get(stream).map_or(vec![], |m| {
+            m.iter().map(|(k, (_, p))| (k.clone(), p.clone())).collect()
+        })
+    }
+
+    fn compacted_durable(&self, batch: &Batch, lsn: u64) {
+        if let Some(m) = self.compact.lock().get_mut(&batch.id.log.stream) {
+            apply_compacted(m, batch, lsn);
+        }
+    }
+
+    /// Writes every compacted stream's snapshot durably (before retention frees segments).
+    fn write_snapshots(&self) -> Result<()> {
+        let snaps: Vec<(String, Vec<u8>)> = self
+            .compact
+            .lock()
+            .iter()
+            .map(|(s, m)| (s.clone(), encode_snapshot(m)))
+            .collect();
+        if snaps.is_empty() {
+            return Ok(());
+        }
+        let dir = self.cfg.data_dir.join("compact");
+        std::fs::create_dir_all(&dir)?;
+        for (stream, bytes) in snaps {
+            let p = snapshot_path(&self.cfg.data_dir, &stream);
+            let tmp = p.with_extension("tmp");
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&bytes)?;
+                f.sync_all()?;
+            }
+            std::fs::rename(&tmp, &p)?;
+        }
+        // the renames are durable only once the directory is
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    }
+
     pub async fn apply_retention(&self) -> Result<()> {
+        self.write_snapshots()?;
         let now = crate::store::now_ms();
         for (name, s) in &self.cfg.streams {
             self.store
@@ -627,7 +767,12 @@ impl Node {
         }
         let mut batch = batch;
         let mut claimed = false;
-        if let Some(d) = g.as_mut() {
+        let compacted = self
+            .cfg
+            .streams
+            .get(&batch.id.log.stream)
+            .is_some_and(|s| s.compacted);
+        if let Some(d) = g.as_mut().filter(|_| !compacted) {
             let ds = digests(&batch);
             if !ds.is_empty() {
                 let hs: Vec<u64> = ds.iter().map(|&(_, h)| h).collect();
@@ -666,6 +811,7 @@ impl Node {
         };
         match Wal::durable(rx).await {
             Ok(lsn) => {
+                self.compacted_durable(batch, lsn);
                 self.store.mark_durable(&batch.id, lsn);
                 Ok(Local::Stored)
             }
@@ -686,6 +832,7 @@ impl Node {
                 Reserve::New => {
                     return match self.wal.append(batch.clone()).await {
                         Ok(lsn) => {
+                            self.compacted_durable(batch, lsn);
                             self.store.mark_durable(&batch.id, lsn);
                             Ok(Local::Stored)
                         }
