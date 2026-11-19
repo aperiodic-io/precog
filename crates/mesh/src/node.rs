@@ -1390,11 +1390,8 @@ impl Node {
             .collect();
         let mut fetched = 0;
         for t in theirs.logs {
-            let (contiguous, high) = mine.get(&t.log).map_or((0, 0), |m| (m.contiguous, m.high));
-            if t.high <= contiguous || (contiguous == high && high >= t.high) {
-                continue; // nothing we lack
-            }
-            let mut from = contiguous;
+            // from the first sequence we lack up to the peer's high (nothing, if we lack none)
+            let mut from = mine.get(&t.log).map_or(0, |m| m.contiguous);
             while from < t.high {
                 let req = Control::FetchLog {
                     log: t.log.clone(),
