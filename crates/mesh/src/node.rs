@@ -1125,7 +1125,7 @@ impl Node {
         match Wal::durable(rx).await {
             Ok(lsn) => {
                 self.compacted_durable(batch, lsn);
-                self.store.mark_durable(&batch.id, lsn);
+                self.store.mark_durable(batch, lsn);
                 Ok(Local::Stored)
             }
             Err(e) => {
@@ -1146,7 +1146,7 @@ impl Node {
                     return match self.wal.append(batch.clone()).await {
                         Ok(lsn) => {
                             self.compacted_durable(batch, lsn);
-                            self.store.mark_durable(&batch.id, lsn);
+                            self.store.mark_durable(batch, lsn);
                             Ok(Local::Stored)
                         }
                         Err(e) => {

@@ -94,7 +94,7 @@ fn ram_per_retained_batch_stays_within_budget() {
         let first = log.append(&group).unwrap();
         let t2 = live();
         for (i, b) in chunk.iter().enumerate() {
-            store.mark_durable(&b.id, first + i as u64);
+            store.mark_durable(b, first + i as u64);
         }
         store_bytes += live() - t2 + (t1 - t0);
         log_bytes += t2 - t1;

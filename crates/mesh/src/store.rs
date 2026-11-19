@@ -631,7 +631,9 @@ impl Store {
         Reserve::New
     }
 
-    pub fn mark_durable(&self, id: &BatchId, lsn: Lsn) {
+    /// `b` as written to the log at `lsn` (its bytes may be fewer than reserved: dedup).
+    pub fn mark_durable(&self, b: &Batch, lsn: Lsn) {
+        let id = &b.id;
         let mut g = self.inner.lock();
         let inner = &mut *g;
         let Some(&ix) = inner.ix.get(&id.log) else {
@@ -645,6 +647,7 @@ impl Store {
             return;
         }
         e.lsn = lsn;
+        e.len = b.bytes.len() as u32;
         let e = *e;
         if let Some(tx) = inner.pending.remove(&(ix, first)) {
             tx.send_replace(State::Durable);
@@ -1136,7 +1139,7 @@ mod tests {
                 time_ms: now_ms(),
             };
             let lsn = self.log.append(&[(m, &b.bytes[..])]).unwrap();
-            self.s.mark_durable(&b.id, lsn);
+            self.s.mark_durable(b, lsn);
             if COLD.get() {
                 self.s.absorb();
             }
@@ -1319,15 +1322,15 @@ mod tests {
             };
             lsns.push(t.log.append(&[(m, &x.bytes[..])]).unwrap());
         }
-        t.s.mark_durable(&xs[0].id, lsns[0]);
-        t.s.mark_durable(&xs[2].id, lsns[2]); // lsn 2 before lsn 1
+        t.s.mark_durable(&xs[0], lsns[0]);
+        t.s.mark_durable(&xs[2], lsns[2]); // lsn 2 before lsn 1
         let (got, next) = t.s.tail(0, None, 1 << 20);
         assert_eq!(
             got.len(),
             1,
             "only the contiguous prefix is visible to subscribers"
         );
-        t.s.mark_durable(&xs[1].id, lsns[1]);
+        t.s.mark_durable(&xs[1], lsns[1]);
         let (got, next2) = t.s.tail(next, None, 1 << 20);
         assert_eq!(got.len(), 2);
         assert_eq!(next2, 3);
@@ -1354,7 +1357,7 @@ mod tests {
             lsns.push((i, t.log.append(&[(m, &x.bytes[..])]).unwrap()));
         }
         for &(i, lsn) in &lsns[..3] {
-            t.s.mark_durable(&xs[i].id, lsn); // seq 2 (lsn 3) is not durable yet
+            t.s.mark_durable(&xs[i], lsn); // seq 2 (lsn 3) is not durable yet
         }
         let (pos, next) = t.s.live_start(Some("s"));
         assert_eq!(pos, 3);
@@ -2160,6 +2163,24 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_rewritten_before_its_write_counts_the_bytes_it_logged() {
+        // Why: dedup drops events between reserve and write. The totals must be the logged
+        // bytes, what a restart and an absorbed batch's retention read back; else a stream's
+        // byte count drifts up and its retention by bytes forgets more than its budget
+        let mut t = store();
+        let full = b("w", 1, 0, &[(1, &[7; 300]), (2, &[8; 300])]);
+        let kept = Batch::parse(full.without(&[false, true]).unwrap()).unwrap();
+        assert!(matches!(t.s.reserve(&full), Reserve::New));
+        t.durable(&kept);
+        let one = kept.bytes.len() as u64;
+        assert_eq!(t.s.totals(), (1, 2, one));
+        assert_eq!(Store::load(t.log.reader()).unwrap().totals(), (1, 2, one));
+        assert_eq!(t.s.trim_stream("s", Some(one), None, 0), 0, "within budget");
+        assert_eq!(t.s.trim_stream("s", Some(0), None, 0), 1);
+        assert_eq!(t.s.totals(), (0, 0, 0));
+    }
+
+    #[test]
     fn a_segment_leaves_ram_once_every_batch_in_it_is_durable() {
         // absorbing a segment with a batch still being written would hide that batch from every
         // reader once it is durable; a segment whose batches all are durable goes, even while the
@@ -2182,7 +2203,7 @@ mod tests {
         assert!(sealed.len() >= 3);
         let edge = sealed[1].1; // the first LSN of the third segment
         for (x, &lsn) in xs.iter().zip(&lsns).filter(|p| *p.1 != 1 && *p.1 != edge) {
-            t.s.mark_durable(&x.id, lsn);
+            t.s.mark_durable(x, lsn);
         }
         t.s.absorb();
         assert_eq!(
@@ -2190,14 +2211,14 @@ mod tests {
             1,
             "nothing absorbed: lsn 1 is pending"
         );
-        t.s.mark_durable(&xs[1].id, 1);
+        t.s.mark_durable(&xs[1], 1);
         t.s.absorb();
         assert_eq!(
             t.s.inner.lock().order.range(..edge).count(),
             0,
             "the segments before the pending batch's"
         );
-        t.s.mark_durable(&xs[edge as usize].id, edge);
+        t.s.mark_durable(&xs[edge as usize], edge);
         let (got, _) = drain(&t.s, "s", Cursor::new(), 1 << 20);
         let seqs: Vec<u64> = got.iter().map(|i| i.first_seq).collect();
         assert_eq!(seqs, (0..12).collect::<Vec<_>>());
@@ -2217,6 +2238,7 @@ mod tests {
             )*};
         }
         cold!(
+            a_batch_rewritten_before_its_write_counts_the_bytes_it_logged,
             trimming_past_a_gap_moves_the_frontier_over_what_follows,
             duplicate_and_conflict,
             a_duplicate_of_a_pending_batch_learns_how_it_ends,
