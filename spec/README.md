@@ -106,7 +106,7 @@ or damaged record; the Kani proofs cover the decoder itself), and other segments
 |---|---|---|---|---|---|
 | `MC_sync` | 5 records | ≤ 2 | 2 | media faults, 1 failed fsync | 425,867 |
 | `MC_caching` | 6 | ≤ 2 | 1 | flush at 2, bound 6 (`2 × flush + group`), 1 failed fsync | 1,199,742 |
-| `Nightly_sync` | 6 | ≤ 3 | 2 | media faults | 1,502,239 |
+| `Nightly_sync` | 6 | ≤ 3 | 2 | media faults, 1 failed fsync | 3,959,473 |
 | `Nightly_caching` | 6 | ≤ 2 | 2 | flush at 2, bound 6, media faults (`Prefix`) | 33,850,249 |
 | `MC_caching_onebound` (expect) | 6 | ≤ 2 | 1 | bound 4 (`flush + group`, before #16): `NoFalseAlarm` fails | |
 | `MC_sync_retry` (expect) | 4 | ≤ 2 | 1 | a failed fsync retried instead of fatal: `AckedSurvive` fails | |
