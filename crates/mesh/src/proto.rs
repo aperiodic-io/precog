@@ -576,7 +576,36 @@ pub enum Control {
     },
     /// Run one anti-entropy pass against every peer now.
     Repair,
+    /// The stream's batches past `cursor`, answered as `Kind::Batches` (see `Store::read_cursor`).
+    ReadCursor {
+        stream: String,
+        cursor: WireCursor,
+        max_bytes: u32,
+    },
+    /// A cursor at the first batch logged at or after `time_ms` (`u64::MAX`: the end).
+    CursorAt {
+        stream: String,
+        time_ms: u64,
+    },
+    /// Store a reader group's position.
+    Commit {
+        group: String,
+        stream: String,
+        cursor: WireCursor,
+    },
+    /// A reader group's committed position.
+    Position {
+        group: String,
+        stream: String,
+    },
+    /// A compacted stream's newest value of every key.
+    Latest {
+        stream: String,
+    },
 }
+
+/// A cursor within one stream: (writer, epoch, next sequence) per writer log.
+pub type WireCursor = Vec<(String, u64, u64)>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -594,6 +623,13 @@ pub enum ControlResp {
     Repair {
         fetched: u64,
         errors: Vec<String>,
+    },
+    Cursor {
+        cursor: Option<WireCursor>,
+    },
+    Committed,
+    Latest {
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
     },
 }
 

@@ -91,6 +91,28 @@ struct StreamLog {
 /// read. A log missing from it is read from its start.
 pub type Cursor = BTreeMap<LogId, u64>;
 
+pub fn cursor_to_wire(c: &Cursor, stream: &str) -> crate::proto::WireCursor {
+    c.iter()
+        .filter(|(l, _)| l.stream == stream)
+        .map(|(l, s)| (l.writer.clone(), l.epoch, *s))
+        .collect()
+}
+
+pub fn cursor_from_wire(w: crate::proto::WireCursor, stream: &str) -> Cursor {
+    w.into_iter()
+        .map(|(writer, epoch, s)| {
+            (
+                LogId {
+                    stream: stream.into(),
+                    writer,
+                    epoch,
+                },
+                s,
+            )
+        })
+        .collect()
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

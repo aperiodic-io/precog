@@ -430,6 +430,112 @@ async fn a_position_committed_through_one_node_is_read_on_another() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_append_is_acknowledged_only_once_the_accepting_node_holds_it() {
+    // Two peers holding a batch is not enough: the accepting node's own copy must be durable
+    // (reads there right after the ack see it, and a batch whose duplicates were dropped is acked
+    // only after the batches that claimed them, which the accepting node's log orders).
+    let mut c = cluster(3, &["a", "b", "c"]);
+    c.cfgs[0].storage_failpoints.fail_data_sync_after = Some(0);
+    let _nodes: Vec<_> = futures::future::join_all((0..3).map(|i| start(&c, i))).await;
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let b = Batch::encode(&log, 0, &[(1, b"x")]).unwrap();
+    let ack = mc
+        .call(0, Kind::Append, encode_append(2, &b))
+        .await
+        .unwrap();
+    let ack = precog_mesh::node::parse_frame_ack(&ack).unwrap();
+    assert!(
+        !ack.is_success(),
+        "acknowledged without the accepting node's copy: {ack:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cursor_read_over_rpc_answers_in_frames_that_fit() {
+    // a reader asking for "everything" over a backlog larger than a frame gets it in steps:
+    // one oversized answer would be refused by its own transport, and the reader would stall
+    let mut c = cluster(1, &["a"]);
+    c.cfgs[0].segment_size = 64 << 20;
+    let _node = start(&c, 0).await;
+    let mc = client(&c).await;
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let big = vec![7u8; 1 << 20];
+    for seq in 0..20 {
+        let b = Batch::encode(&log, seq, &[(seq, &big[..])]).unwrap();
+        mc.append(0, &b, 1).await.unwrap();
+    }
+    let ControlResp::Cursor {
+        cursor: Some(start),
+    } = mc
+        .control(
+            0,
+            &Control::CursorAt {
+                stream: "s".into(),
+                time_ms: 0,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("no cursor")
+    };
+    assert_eq!(start, [("w".to_string(), 1, 0)], "the stream's start");
+    let read = Control::ReadCursor {
+        stream: "s".into(),
+        cursor: start,
+        max_bytes: u32::MAX,
+    };
+    let f = mc
+        .call(
+            0,
+            Kind::Control,
+            Bytes::from(serde_json::to_vec(&read).unwrap()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.kind, Kind::Batches);
+    let mut body = &f.body[..];
+    let mut n = 0;
+    while !body.is_empty() {
+        let len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+        body = &body[4 + len..];
+        n += 1;
+    }
+    assert!((1..20).contains(&n), "{n} of 20 batches in one answer");
+    assert!(
+        f.body.len() <= MAX_FRAME_BYTES / 2 + (1 << 21),
+        "{}",
+        f.body.len()
+    );
+    // a reader's cursor is honoured: from seq 19 only the last batch comes back
+    let read = Control::ReadCursor {
+        stream: "s".into(),
+        cursor: vec![("w".to_string(), 1, 19)],
+        max_bytes: u32::MAX,
+    };
+    let f = mc
+        .call(
+            0,
+            Kind::Control,
+            Bytes::from(serde_json::to_vec(&read).unwrap()),
+        )
+        .await
+        .unwrap();
+    let len = u32::from_le_bytes(f.body[..4].try_into().unwrap()) as usize;
+    assert_eq!(f.body.len(), 4 + len, "one batch");
+    assert_eq!(Batch::parse(f.body.slice(4..)).unwrap().id.first_seq, 19);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_live_subscriber_gets_a_logs_batches_that_land_out_of_order() {
     // A replica can store a log's seq 1 before seq 0 (its replicate requests run
     // concurrently). A subscriber that was already listening must still get seq 0: the feed

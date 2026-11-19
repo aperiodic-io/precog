@@ -8,3 +8,10 @@ description = "Proofs of concept compared before a design is settled (evidence; 
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hashbrown = "0.15"
+bytes = "1"
+crc32c = "0.6"
+libc = "0.2"
+lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+precog-mesh = { path = "../mesh" }

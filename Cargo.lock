@@ -2914,10 +2914,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "precog-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "precog-mesh",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "precog-lab"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "crc32c",
  "hashbrown 0.15.5",
+ "libc",
+ "lz4_flex",
+ "precog-mesh",
  "xxhash-rust",
 ]
 
