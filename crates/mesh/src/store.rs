@@ -116,7 +116,8 @@ struct Inner {
     /// Second copies of a batch logged twice (a repair raced a replicate), and absorbed batches
     /// a replacement took the place of: never served.
     dead: BTreeSet<Lsn>,
-    /// LSNs of replaced batches that were in RAM: durable, so `contiguous` steps over them.
+    /// LSNs of replaced batches that were in RAM, and of dead copies: durable, so `contiguous`
+    /// steps over them.
     superseded: BTreeSet<Lsn>,
     /// Batches copied forward (`Store::moved`) to LSNs at or past `contiguous`: not new, so a
     /// live feed starting now does not join their logs at them.
@@ -1091,6 +1092,7 @@ impl Store {
             });
             let (Some(ix), true) = (ix, live) else {
                 inner.dead.insert(lsn);
+                inner.superseded.insert(lsn); // in the log all the same: `contiguous` steps over it
                 continue;
             };
             inner.dead.insert(old);
@@ -1116,6 +1118,9 @@ impl Store {
         inner.advance_contiguous();
         let c = inner.contiguous;
         inner.copied.extend(new.into_iter().filter(|&l| l >= c));
+        drop(g);
+        // `contiguous` may have moved past batches logged after the copies
+        self.durable_notify.notify_waiters();
     }
 
     /// Before the log drops the absorbed segments at `bases`: a log keeps a segment's range only
@@ -3105,6 +3110,77 @@ mod tests {
         same(&plain, &moved, "each stream trimmed by its own retention");
         // (a stream's own retention is applied again after a restart: compare restarts)
         same(&reload(&plain), &reload(&moved), "trimmed, after a restart");
+    }
+
+    /// Logs a copy of each kept batch, as `Node::copy_forward` does, and hands them to `moved`.
+    fn copy(t: &mut T, kept: &[Kept]) {
+        for k in kept {
+            let r = t.log.reader().read(k.lsn).unwrap().unwrap();
+            let lsn = t.log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
+            t.s.moved([(k.lsn, lsn, &r.meta, r.payload.len() as u32)]);
+        }
+    }
+
+    #[test]
+    fn a_copy_of_a_batch_forgotten_meanwhile_does_not_hold_back_what_is_logged_after_it() {
+        // Why: the cleaner picks what streams retain, then copies it; the stream's retention can
+        // forget a batch in between. Its copy is dead, but its LSN is in the log: `contiguous`
+        // must step over it, or live feeds stall and nothing is absorbed again (so the node cap
+        // stops dropping segments).
+        let mut t = store_with(TINY);
+        for seq in 0..4 {
+            let x = on("s", "w", seq);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        let base = t.log.segments().0[0].base;
+        let kept: Vec<Kept> =
+            t.s.retained(&[base], |_| true, 0)
+                .into_values()
+                .flatten()
+                .collect();
+        assert!(!kept.is_empty());
+        assert_eq!(t.s.trim_stream("s", Some(0), None, 0), 4, "all forgotten");
+        copy(&mut t, &kept);
+        let x = on("s", "w", 4);
+        t.s.reserve(&x);
+        t.durable(&x);
+        assert_eq!(t.s.live_start(None).0, t.log.next_lsn(), "contiguous");
+        let (got, _) = t.s.tail(0, Some("s"), 1 << 20);
+        assert_eq!(got.iter().map(|b| b.id.first_seq).collect::<Vec<_>>(), [4]);
+    }
+
+    #[test]
+    fn a_copy_wakes_live_feeds_waiting_on_what_was_logged_after_it() {
+        // Why: a batch logged after a copy is marked durable while `contiguous` still waits at
+        // the copy, so its wake-up finds nothing to serve. Taking the copy in moves `contiguous`
+        // past it: feeds must be woken then, or a quiet stream's subscriber waits for the next
+        // unrelated append.
+        use futures::FutureExt;
+        let mut t = store_with(TINY);
+        for seq in 0..4 {
+            let x = on("s", "w", seq);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        let base = t.log.segments().0[0].base;
+        let kept: Vec<Kept> =
+            t.s.retained(&[base], |_| true, 0)
+                .into_values()
+                .flatten()
+                .collect();
+        let r = t.log.reader().read(kept[0].lsn).unwrap().unwrap();
+        let at = t.log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
+        let x = on("s", "other", 0);
+        t.s.reserve(&x);
+        t.durable(&x);
+        assert_eq!(t.s.live_start(None).0, at, "held at the copy");
+        let woke = t.s.durable_notify.notified();
+        t.s.moved([(kept[0].lsn, at, &r.meta, r.payload.len() as u32)]);
+        assert_eq!(t.s.live_start(None).0, t.log.next_lsn());
+        assert!(woke.now_or_never().is_some(), "feeds woken");
     }
 
     #[test]
