@@ -366,3 +366,33 @@ async fn a_replicas_dedup_index_is_warm_so_a_failover_still_drops_duplicates() {
     assert_eq!(got.len(), 3, "{got:?}");
     assert!(nodes[1].status().dedup_dropped >= 1);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_subscriber_gets_a_logs_batches_that_land_out_of_order() {
+    // A replica can store a log's seq 1 before seq 0 (its replicate requests run
+    // concurrently). A subscriber that was already listening must still get seq 0: the feed
+    // joins a log that is new to it at its start, not at the first batch that happens to land.
+    let c = cluster(1, &["a"]);
+    let n = start(&c, 0).await;
+    let mc = client(&c).await;
+    let mut live = mc.subscribe(0, Some("s"), false).await.unwrap();
+    let log = LogId {
+        stream: "s".into(),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    for seq in [1, 0, 2] {
+        let b = Batch::encode(&log, seq, &[(seq, b"x")]).unwrap();
+        assert!(n.append(1, b).await.is_success());
+    }
+    let mut got = vec![];
+    for _ in 0..3 {
+        let b = tokio::time::timeout(Duration::from_secs(5), live.next())
+            .await
+            .expect("feed stalled")
+            .unwrap()
+            .unwrap();
+        got.push(b.id.first_seq);
+    }
+    assert_eq!(got, [0, 1, 2]);
+}
