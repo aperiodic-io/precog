@@ -64,7 +64,7 @@ CPU_US_REC_GATEWAY = 1.75  # S2 REST/JSON gateway per record at 256 B, 100 per a
 CPU_US_PER_KIB = 1.0      # model: copies, CRCs and JSON per KiB beyond the measured size
 LINK_GBPS = 10            # with the 10G uplink add-on
 DISK_FILL = 0.8           # usable share of disks
-RAM_NODE_BYTES_PER_STREAM = 3_960  # per node holding the stream (results/s2-streams.jsonl, 1M streams)
+RAM_NODE_BYTES_PER_STREAM = 1_650  # per node holding the stream (results/s2-streams.jsonl, 1M streams, after main #25; 3,960 before)
 RAM_GW_BYTES_PER_STREAM = 8_800    # the owning gateway's streamer (500k streams, node subtracted)
 RAM_EUR_GB_MONTH = 259 / 128  # AX102: EUR 259 for 128 GB, all of it charged to RAM (an upper bound)
 # A proposed list: about half of s2.dev on bytes, streams priced at today's resident-RAM cost

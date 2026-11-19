@@ -27,8 +27,8 @@ s2.dev, and what margin does a realistic markup leave?
    $0.05. That is why S2 is built on S3. Precog's local-disk replication pays off only where
    internal traffic is free: bare metal, or one zone.
 3. **Stream count is the line where Precog loses today.** Every stream is resident on every node
-   (3.9 KB per copy, measured at 1M streams) plus ~8.8 KB in the owning gateway. That comes to
-   ~$0.045 per 1000 streams-month against s2.dev's $0.01. Off-heap dormant streams (C7 in the
+   (1.65 KB per copy at 1M streams after main's #25; 3.9 KB before) plus ~8.8 KB in the owning
+   gateway. That comes to ~$0.030 per 1000 streams-month against s2.dev's $0.01. Off-heap dormant streams (C7 in the
    plan) bring it to ~$0.013. s2-lite already holds only 44 MiB after a restart with 1M streams.
 4. **A realistic list price** is about half of s2.dev on bytes:
    - $0.02/GiB written;
@@ -110,7 +110,7 @@ USD per GiB-month and per TB-month of data stored, and the smallest cold tier ea
 | Owned 60-bay chassis in colo, EC 8+3, fully loaded (needs ~10 PB) | $0.0030 | $2.80 | none | 11 chassis at one site; ~10 PB minimum |
 | **s2.dev list** | $0.0500 | $46.57 | | multi-AZ object storage |
 
-Per 1000 streams-month: RAM for 3 copies of the per-stream state = $0.05 (3 node copies x 3,960 B + 8,800 B in the owner, every stream resident, all of the AX102's price charged to RAM); s2.dev charges $0.01. Stream operations: CPU is already in the per-GiB costs; s2.dev charges $0.001 per 1000.
+Per 1000 streams-month: RAM for 3 copies of the per-stream state = $0.03 (3 node copies x 1,650 B + 8,800 B in the owner, every stream resident, all of the AX102's price charged to RAM); s2.dev charges $0.01. Stream operations: CPU is already in the per-GiB costs; s2.dev charges $0.001 per 1000.
 
 ### 2. A price list at 75% gross margin on marginal cost, and at 30% under s2.dev
 
@@ -120,7 +120,7 @@ Per 1000 streams-month: RAM for 3 copies of the per-stream state = $0.05 (3 node
 | GiB read (private) | $0.0002 | $0.0009 | $0.0500 | -98% | 99% |
 | GiB read (internet) | $0.0014 | $0.0055 | $0.1000 | -94% | 98% |
 | GiB-month stored | $0.0032 | $0.0128 | $0.0500 | -74% | 91% |
-| 1000 streams-month | $0.0452 | $0.1808 | $0.0100 | +1708% | -546% |
+| 1000 streams-month | $0.0300 | $0.1202 | $0.0100 | +1102% | -329% |
 
 ### 2b. A proposed list price (about half of s2.dev on bytes) and its margin per line
 
@@ -130,7 +130,7 @@ Per 1000 streams-month: RAM for 3 copies of the per-stream state = $0.05 (3 node
 | GiB read (private) | $0.0100 | $0.0500 | $0.0002 | 98% |
 | GiB read (internet) | $0.0200 | $0.1000 | $0.0014 | 93% |
 | GiB-month stored | $0.0250 | $0.0500 | $0.0032 | 87% |
-| 1000 streams-month | $0.0500 | $0.0100 | $0.0452 | 10% |
+| 1000 streams-month | $0.0500 | $0.0100 | $0.0300 | 40% |
 | 1000 streams-month, dormant streams off-heap (~2 KB resident per copy, as s2-lite after a restart) | $0.0500 | $0.0100 | $0.0131 | 74% |
 
 ### 3. The fixed floor: the smallest production fleet, and staff
@@ -139,20 +139,20 @@ Smallest fleet (4 AX102 hot incl. one spare, 10G uplinks; 6 SX65 for EC 3+2 incl
 
 | fixed cost per month (fleet floor + staff) | revenue to break even at 75% contribution | at s2.dev -30% (blended contribution) |
 |---|---:|---:|
-| $1,871 (staff EUR 0) | $2,495 | $1,937 |
-| $18,071 (staff EUR 15,000) | $24,095 | $18,706 |
-| $34,271 (staff EUR 30,000) | $45,695 | $35,476 |
-| $50,471 (staff EUR 45,000) | $67,295 | $52,245 |
+| $1,871 (staff EUR 0) | $2,495 | $1,936 |
+| $18,071 (staff EUR 15,000) | $24,095 | $18,698 |
+| $34,271 (staff EUR 30,000) | $45,695 | $35,460 |
+| $50,471 (staff EUR 45,000) | $67,295 | $52,222 |
 
 ### 4. Customer bills: s2.dev list, our list at 75% GM, the proposed list
 
 | customer | s2.dev standard | our list (75% GM) | proposed list | proposed GM | our marginal cost | customer's AWS egress to reach us (if they run in AWS) |
 |---|---:|---:|---:|---:|---:|---:|
-| small: app events: 1 MiB/s, 7 d, reads 2x, 10,000 streams | $919 | $43.02 | $118 | 91% | $10.76 | $248 |
-| telemetry: 10 MiB/s, 7 d, reads 2x, 100,000 streams | $5,407 | $430 | $1,179 | 91% | $108 | $2,480 |
+| small: app events: 1 MiB/s, 7 d, reads 2x, 10,000 streams | $919 | $42.42 | $118 | 91% | $10.60 | $248 |
+| telemetry: 10 MiB/s, 7 d, reads 2x, 100,000 streams | $5,407 | $424 | $1,179 | 91% | $106 | $2,480 |
 | market-data ingest: 50 MiB/s, 3 d, reads 4x, 2,000 streams | $35,341 | $2,066 | $8,016 | 94% | $516 | $12,400 |
-| agent sessions (many streams): 2 MiB/s, 30 d, reads 1x, 1,000,000 streams | $3,467 | $309 | $331 | 77% | $77.16 | $496 |
-| archive-heavy: 20 MiB/s, 90 d, reads 0.5x, 10,000 streams | $11,759 | $2,559 | $5,081 | 87% | $640 | $4,960 |
+| agent sessions (many streams): 2 MiB/s, 30 d, reads 1x, 1,000,000 streams | $3,467 | $248 | $331 | 81% | $62.01 | $496 |
+| archive-heavy: 20 MiB/s, 90 d, reads 0.5x, 10,000 streams | $11,759 | $2,558 | $5,081 | 87% | $640 | $4,960 |
 
 ### 5. Monte Carlo (20,000 draws): net margin of a business priced at s2.dev -30%
 
