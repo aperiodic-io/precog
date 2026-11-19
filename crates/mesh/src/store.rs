@@ -1378,3 +1378,123 @@ mod tests {
         assert_eq!(got, [4]);
     }
 }
+
+/// Model-based test: random reserves (retries, overlaps, conflicting contents), durable marks
+/// and failures against a reference model of the per-node rules spec/mesh/Replication.tla
+/// assumes (identity, overlap = conflict, durable-only visibility) and of frontier arithmetic.
+#[cfg(test)]
+mod model {
+    use super::*;
+    use crate::proto::{batch_crc, encode_log_key};
+    use precog_storage::record::Meta;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// first_seq, count, content variant
+        Reserve(u64, u32, u8),
+        Durable(prop::sample::Index),
+        Fail(prop::sample::Index),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                3 => (0u64..8, 1u32..4, 0u8..2).prop_map(|(s, n, v)| Op::Reserve(s, n, v)),
+                2 => any::<prop::sample::Index>().prop_map(Op::Durable),
+                1 => any::<prop::sample::Index>().prop_map(Op::Fail),
+            ],
+            1..30,
+        )
+    }
+
+    /// The reference: first_seq -> (end, variant, count, durable).
+    type Ref = BTreeMap<u64, (u64, u8, u32, bool)>;
+
+    fn batch(seq: u64, n: u32, v: u8) -> Batch {
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let p = [v];
+        let evs: Vec<(u64, &[u8])> = (0..n).map(|_| (0, &p[..])).collect();
+        Batch::parse(Batch::encode(&log, seq, &evs).unwrap()).unwrap()
+    }
+
+    proptest! {
+        // each case opens a log: 64 cases of up to 30 operations
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn the_store_follows_the_identity_rules_and_frontier_arithmetic(ops in ops()) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = precog_storage::Config::new(dir.path());
+            c.segment_size = 1 << 20;
+            let mut log = precog_storage::Log::open(c).unwrap();
+            let s = Store::load(log.reader(), vec![]).unwrap();
+            let mut r = Ref::new();
+            let mut pending: Vec<Batch> = vec![];
+            for op in ops {
+                match op {
+                    Op::Reserve(seq, n, v) => {
+                        let b = batch(seq, n, v);
+                        let end = seq + n as u64;
+                        let overlap = r.iter().find(|&(&f, &(e, ..))| f < end && seq < e);
+                        let want = match overlap {
+                            None => "new",
+                            Some((&f, &(_, rv, rn, _))) if f == seq && rv == v && rn == n => "dup",
+                            Some(_) => "conflict",
+                        };
+                        let got = match s.reserve(&b) {
+                            Reserve::New => "new",
+                            Reserve::Duplicate(_) => "dup",
+                            Reserve::Conflict(_) => "conflict",
+                            Reserve::Expired => "expired",
+                        };
+                        prop_assert_eq!(got, want, "reserve {}..{} variant {}", seq, end, v);
+                        if want == "new" {
+                            r.insert(seq, (end, v, n, false));
+                            pending.push(b);
+                        }
+                    }
+                    Op::Durable(i) if !pending.is_empty() => {
+                        let b = pending.remove(i.index(pending.len()));
+                        let m = Meta {
+                            key: encode_log_key(&b.id.log),
+                            first_seq: b.id.first_seq,
+                            count: b.count,
+                            tag: batch_crc(&b.bytes),
+                            time_ms: 0,
+                        };
+                        let lsn = log.append(&[(m, &b.bytes[..])]).unwrap();
+                        s.mark_durable(&b.id, lsn);
+                        r.get_mut(&b.id.first_seq).unwrap().3 = true;
+                    }
+                    Op::Fail(i) if !pending.is_empty() => {
+                        let b = pending.remove(i.index(pending.len()));
+                        s.mark_failed(&b.id);
+                        r.remove(&b.id.first_seq);
+                    }
+                    _ => {}
+                }
+                // frontiers: the durable prefix from 0, and one past the highest durable sequence
+                let mut contiguous = 0;
+                while let Some(&(e, .., true)) = r.get(&contiguous) {
+                    contiguous = e;
+                }
+                let high = r.values().filter(|x| x.3).map(|x| x.0).max().unwrap_or(0).max(contiguous);
+                let f = s.frontiers(None);
+                if high == 0 {
+                    prop_assert!(f.is_empty());
+                } else {
+                    prop_assert_eq!((f[0].contiguous, f[0].high), (contiguous, high));
+                }
+                // durable-only visibility: exactly the durable batches are served
+                let durable = r.values().filter(|x| x.3).count();
+                prop_assert_eq!(s.totals().0 as usize, durable);
+            }
+        }
+    }
+}

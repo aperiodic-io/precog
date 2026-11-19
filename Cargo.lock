@@ -2954,6 +2954,7 @@ dependencies = [
  "lz4_flex",
  "parking_lot",
  "precog-storage",
+ "proptest",
  "rand 0.9.5",
  "serde",
  "serde_json",

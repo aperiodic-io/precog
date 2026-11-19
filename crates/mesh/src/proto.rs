@@ -1114,3 +1114,174 @@ mod tests {
         assert_eq!(Ack::decode(a.encode()).unwrap(), a);
     }
 }
+
+/// Property tests of the codecs a node runs on untrusted bytes: they never panic, a parsed batch
+/// can be walked by every accessor (each `expect`s what `parse` validated), and what the encoders
+/// write parses back. Mutated batches get their CRC recomputed, so inputs reach the structural
+/// checks behind the checksum. (Kani does not finish these in CI time: `Bytes` and anyhow's
+/// errors are too much for its solver. See spec/README.md.)
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn with_crc(mut body: Vec<u8>) -> Bytes {
+        let c = crc32c::crc32c(&body);
+        body.extend_from_slice(&c.to_le_bytes());
+        Bytes::from(body)
+    }
+
+    /// Every accessor of a parsed batch; returns the events it yields.
+    fn walk(b: &Batch) -> usize {
+        assert!(b.count >= 1 && b.count <= MAX_EVENTS_PER_BATCH);
+        assert!(b.end_seq() > b.id.first_seq);
+        let keys: Vec<_> = b.keys().collect();
+        assert_eq!(keys.len(), b.count as usize);
+        assert!(
+            keys.iter()
+                .flatten()
+                .all(|k| !k.is_empty() && k.len() <= MAX_KEY)
+        );
+        match b.try_events() {
+            Ok(evs) => {
+                assert!(evs.len() <= b.count as usize);
+                assert!(
+                    evs.iter()
+                        .all(|e| e.seq >= b.id.first_seq && e.seq < b.end_seq())
+                );
+                assert_eq!(b.keyed().unwrap().len(), evs.len());
+                let drop: Vec<bool> = (0..b.count).map(|i| i % 2 == 0).collect();
+                let w = Batch::parse(b.without(&drop).unwrap()).unwrap();
+                assert_eq!((&w.id, w.count, w.ident), (&b.id, b.count, b.ident));
+                evs.len()
+            }
+            Err(_) => {
+                assert!(b.z.is_some(), "only a damaged lz4 block fails to walk");
+                0
+            }
+        }
+    }
+
+    type Ev = (u64, Vec<u8>, Vec<u8>);
+
+    fn events() -> impl Strategy<Value = Vec<Ev>> {
+        prop::collection::vec(
+            (
+                any::<u64>(),
+                prop::collection::vec(any::<u8>(), 0..4),
+                prop::collection::vec(any::<u8>(), 0..6),
+            ),
+            1..5,
+        )
+    }
+
+    fn log() -> impl Strategy<Value = LogId> {
+        ("[a-z]{1,4}", "[a-z0-9]{1,4}", any::<u64>()).prop_map(|(stream, writer, epoch)| LogId {
+            stream,
+            writer,
+            epoch,
+        })
+    }
+
+    /// A batch in format `fmt`: 0 = PCB1, 1 = PCB2, 2 = PCZ2.
+    fn encode(log: &LogId, seq: u64, evs: &[Ev], fmt: u8) -> Bytes {
+        let keyed: Vec<(u64, &[u8], &[u8])> =
+            evs.iter().map(|(t, k, p)| (*t, &k[..], &p[..])).collect();
+        match fmt {
+            0 => {
+                let plain: Vec<(u64, &[u8])> = evs.iter().map(|(t, _, p)| (*t, &p[..])).collect();
+                Batch::encode(log, seq, &plain).unwrap()
+            }
+            1 => Batch::encode_keyed(log, seq, &keyed).unwrap(),
+            _ => Batch::encode_compressed(log, seq, &keyed).unwrap(),
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn encoded_batches_parse_back_in_every_format(
+            log in log(), seq in 0u64..1 << 40, evs in events(), fmt in 0u8..3,
+        ) {
+            let b = Batch::parse(encode(&log, seq, &evs, fmt)).unwrap();
+            prop_assert_eq!(&b.id, &BatchId { log: log.clone(), first_seq: seq });
+            prop_assert_eq!(b.count as usize, evs.len());
+            prop_assert_eq!(walk(&b), evs.len());
+            let got: Vec<(u64, u64, Vec<u8>)> =
+                b.events().map(|e| (e.seq, e.event_time_us, e.payload.to_vec())).collect();
+            let want: Vec<(u64, u64, Vec<u8>)> = evs
+                .iter()
+                .enumerate()
+                .map(|(i, (t, _, p))| (seq + i as u64, *t, p.clone()))
+                .collect();
+            prop_assert_eq!(got, want);
+        }
+
+        #[test]
+        fn a_mutated_batch_with_a_matching_checksum_never_panics(
+            log in log(), evs in events(), fmt in 0u8..3,
+            edits in prop::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..4),
+            cut in any::<prop::sample::Index>(), truncate in any::<bool>(),
+        ) {
+            let b = encode(&log, 7, &evs, fmt);
+            let mut body = b[..b.len() - 4].to_vec();
+            for (at, v) in edits {
+                let i = at.index(body.len());
+                body[i] = v;
+            }
+            if truncate {
+                body.truncate(cut.index(body.len() + 1));
+            }
+            if let Ok(p) = Batch::parse(with_crc(body)) {
+                walk(&p);
+            }
+        }
+
+        #[test]
+        fn arbitrary_bytes_with_a_matching_checksum_never_panic(
+            body in prop::collection::vec(any::<u8>(), 0..120), magic in 0usize..4,
+        ) {
+            let mut body = body;
+            let m: [&[u8; 4]; 4] = [BATCH_MAGIC_V1, BATCH_MAGIC, BATCH_MAGIC_Z, b"XXXX"];
+            if body.len() >= 4 {
+                body[..4].copy_from_slice(m[magic]);
+            }
+            if let Ok(p) = Batch::parse(with_crc(body)) {
+                walk(&p);
+            }
+        }
+
+        #[test]
+        fn acks_round_trip_and_any_body_decodes_or_is_refused(
+            status in 0u8..5, copies: u8, nodes: u32, crc: u32,
+            junk in prop::collection::vec(any::<u8>(), 0..14),
+        ) {
+            let mut b = vec![status, copies];
+            b.extend_from_slice(&nodes.to_le_bytes());
+            b.extend_from_slice(&crc.to_le_bytes());
+            let a = Ack::decode(Bytes::from(b.clone())).unwrap();
+            prop_assert_eq!(&a.encode()[..], &b[..]);
+            if let Ok(a) = Ack::decode(Bytes::from(junk.clone())) {
+                prop_assert_eq!(&a.encode()[..], &junk[..]);
+            }
+        }
+
+        #[test]
+        fn append_replicate_and_log_keys_round_trip(
+            log in log(), copies: u8, origin: u32,
+            batch in prop::collection::vec(any::<u8>(), 0..8),
+            junk in prop::collection::vec(any::<u8>(), 0..24),
+        ) {
+            let batch = Bytes::from(batch);
+            prop_assert_eq!(decode_append(encode_append(copies, &batch)).unwrap(), (copies, batch.clone()));
+            prop_assert_eq!(decode_replicate(encode_replicate(origin, &batch)).unwrap(), (origin, batch));
+            prop_assert_eq!(decode_log_key(&encode_log_key(&log)).unwrap(), log);
+            let _ = decode_append(Bytes::from(junk.clone()));
+            let _ = decode_replicate(Bytes::from(junk.clone()));
+            if let Ok(l) = decode_log_key(&junk) {
+                prop_assert_eq!(encode_log_key(&l), junk);
+            }
+        }
+    }
+}
