@@ -116,8 +116,8 @@ struct Inner {
     /// Second copies of a batch logged twice (a repair raced a replicate), and absorbed batches
     /// a replacement took the place of: never served.
     dead: BTreeSet<Lsn>,
-    /// LSNs of replaced batches that were in RAM, and of dead copies: durable, so `contiguous`
-    /// steps over them.
+    /// LSNs past `contiguous` of batches replaced or forgotten in RAM, and of dead copies:
+    /// durable, so `contiguous` steps over them.
     superseded: BTreeSet<Lsn>,
     /// Batches copied forward (`Store::moved`) to LSNs at or past `contiguous`: not new, so a
     /// live feed starting now does not join their logs at them.
@@ -137,9 +137,8 @@ struct StreamLog {
     order: BTreeMap<Lsn, u64>,
     /// Its batches per absorbed segment.
     cold: BTreeMap<Lsn, ColdStream>,
-    /// Its own retention forgot every one of its batches below this (append time, LSN): it
-    /// trims oldest first in that order, which a copy forward keeps (a copy keeps its time).
-    floor: (u64, Lsn),
+    /// Its own retention forgot every one of its batches below this: it trims oldest first.
+    floor: Age,
     bytes: u64,
 }
 
@@ -151,9 +150,14 @@ struct ColdStream {
     events: u64,
     bytes: u64,
     max_time: u64,
-    /// At most the (append time, LSN) of its oldest batch (exact when absorbed).
-    min: (u64, Lsn),
+    /// At most the age of its oldest batch (exact when absorbed).
+    min: Age,
 }
+
+/// The order a stream trims in, oldest first: (append time, first sequence, LSN). A copy forward
+/// keeps its time and sequence; append times tie (milliseconds), and the sequence then keeps a
+/// log's batches in order where the copy's later LSN would not. The LSN only orders other logs.
+type Age = (u64, u64, Lsn);
 
 /// A batch the cleaner may copy forward (`Store::retained`): where it is, its append time and
 /// at most the bytes it adds to the log.
@@ -277,7 +281,9 @@ impl Inner {
         v.extend(r.by_key(base, &encode_replacing_key(&l.id))?);
         Ok(v.into_iter()
             .filter(|e| {
-                e.lsn >= self.floor && (e.meta.time_ms, e.lsn) >= own && !self.dead.contains(&e.lsn)
+                e.lsn >= self.floor
+                    && (e.meta.time_ms, e.meta.first_seq, e.lsn) >= own
+                    && !self.dead.contains(&e.lsn)
             })
             .map(|e| Rec {
                 lsn: e.lsn,
@@ -526,6 +532,9 @@ impl Inner {
         let Some((ix, len, first)) = self.order.remove(&lsn) else {
             return;
         };
+        if lsn >= self.contiguous {
+            self.superseded.insert(lsn); // in the log all the same: `contiguous` steps over it
+        }
         let l = &mut self.logs[ix as usize];
         let count = l.batches.remove(&first).map_or(0, |e| e.count);
         self.batches -= 1;
@@ -536,7 +545,7 @@ impl Inner {
         {
             s.bytes -= len as u64;
             if own {
-                s.floor = s.floor.max((time, lsn + 1));
+                s.floor = s.floor.max((time, first, lsn + 1));
             }
         }
         self.trim_log(r, ix, first + count as u64);
@@ -549,7 +558,7 @@ impl Inner {
             .get_mut(&self.logs[x.ix as usize].id.stream)
             .unwrap();
         if own {
-            s.floor = s.floor.max((x.time, x.lsn + 1));
+            s.floor = s.floor.max((x.time, x.first, x.lsn + 1));
         }
         s.bytes -= x.e.len as u64;
         if let Some((_, cs)) = s.cold.range_mut(..=x.lsn).next_back() {
@@ -646,21 +655,21 @@ impl Inner {
                 let time = s.order.remove(&lsn).unwrap_or(0);
                 let cs = s.cold.entry(base).or_insert(ColdStream {
                     end,
-                    min: (u64::MAX, Lsn::MAX),
+                    min: (u64::MAX, u64::MAX, Lsn::MAX),
                     ..Default::default()
                 });
                 cs.batches += 1;
                 cs.events += e.count as u64;
                 cs.bytes += len as u64;
                 cs.max_time = cs.max_time.max(time);
-                cs.min = cs.min.min((time, lsn));
+                cs.min = cs.min.min((time, first, lsn));
             }
             self.cold_end = end;
         }
     }
 
     /// Forgets the stream's oldest batches while `over` (its bytes, the batch) says so, oldest
-    /// first by (append time, LSN): a batch copied forward keeps its append time, so it still
+    /// first by `Age`: a batch copied forward keeps its append time, so it still
     /// goes first. Returns how many. Reads one absorbed segment's runs at a time: the one whose
     /// oldest may be the oldest (`ColdStream::min`), as long as it is.
     /// ponytail: scans the stream's RAM batches per segment visited; keep them by time if a
@@ -677,8 +686,12 @@ impl Inner {
                 return n;
             };
             // by the oldest each may hold: RAM (exact; None) and the absorbed segments
-            let ram = s.order.iter().map(|(&lsn, &time)| (time, lsn)).min();
-            let mut parts: Vec<((u64, Lsn), Option<Lsn>)> = s
+            let ram = s
+                .order
+                .iter()
+                .map(|(&lsn, &time)| (time, self.order[&lsn].2, lsn))
+                .min();
+            let mut parts: Vec<(Age, Option<Lsn>)> = s
                 .cold
                 .iter()
                 .filter(|(_, cs)| cs.batches > 0)
@@ -715,14 +728,14 @@ impl Inner {
                     })
                     .collect(),
             };
-            recs.sort_unstable_by_key(|x| (x.time, x.lsn));
+            recs.sort_unstable_by_key(|x| (x.time, x.first, x.lsn));
             let before = n;
             let mut raised = false;
             for x in recs {
-                if bound.is_some_and(|b| (x.time, x.lsn) >= b) {
+                if bound.is_some_and(|b| (x.time, x.first, x.lsn) >= b) {
                     if let Some(base) = base {
                         let s = self.streams.get_mut(stream).unwrap();
-                        s.cold.get_mut(&base).unwrap().min = (x.time, x.lsn);
+                        s.cold.get_mut(&base).unwrap().min = (x.time, x.first, x.lsn);
                         raised = true;
                     }
                     break;
@@ -1087,7 +1100,7 @@ impl Store {
                 .and_then(|(l, _)| inner.ix.get(&l).copied());
             let live = ix.is_some_and(|ix| {
                 old >= inner.floor
-                    && (m.time_ms, old) >= inner.stream_of(ix).floor
+                    && (m.time_ms, m.first_seq, old) >= inner.stream_of(ix).floor
                     && !inner.dead.contains(&old)
             });
             let (Some(ix), true) = (ix, live) else {
@@ -1218,7 +1231,7 @@ impl Store {
                 let log = decode_log_key(&e.meta.key).ok();
                 let want = log.and_then(|l| g.log(&l)).is_some_and(|(ix, l)| {
                     e.lsn >= g.floor
-                        && (e.meta.time_ms, e.lsn) >= g.stream_of(ix).floor
+                        && (e.meta.time_ms, e.meta.first_seq, e.lsn) >= g.stream_of(ix).floor
                         && !g.dead.contains(&e.lsn)
                         && stream.is_none_or(|s| l.id.stream == s)
                 });
@@ -2689,13 +2702,14 @@ mod tests {
 
     #[test]
     fn trimming_past_a_gap_moves_the_frontier_over_what_follows() {
-        // retention may forget a batch above a gap (it trims by LSN): the sequences below its end
-        // count as present, so the contiguous run continues over the durable batches after it
+        // retention may forget a batch above a gap (it trims by append time): the sequences below
+        // its end count as present, so the contiguous run continues over the durable batches
+        // after it
         let mut t = store();
-        for seq in [6, 0, 1, 2, 3, 4, 7, 8, 9] {
+        for (i, seq) in [6, 0, 1, 2, 3, 4, 7, 8, 9].into_iter().enumerate() {
             let x = on("g", "w", seq);
             t.s.reserve(&x);
-            t.durable(&x);
+            t.durable_at(&x, 1_000 + i as u64);
         }
         let f = t.s.frontiers(Some("g"));
         assert_eq!((f[0].contiguous, f[0].high), (5, 10), "a gap at 5");
@@ -3181,6 +3195,70 @@ mod tests {
         t.s.moved([(kept[0].lsn, at, &r.meta, r.payload.len() as u32)]);
         assert_eq!(t.s.live_start(None).0, t.log.next_lsn());
         assert!(woke.now_or_never().is_some(), "feeds woken");
+    }
+
+    #[test]
+    fn a_stream_trims_a_log_in_sequence_order_when_a_copy_ties_on_append_time() {
+        // Why: append times are milliseconds, so batches tie, and a copy forward keeps its time
+        // but takes a later LSN. Ordered by (time, LSN), a log's copied batch would sort after
+        // its next one, and the stream would forget the next one first: a hole, hidden while
+        // its trimmed floor lasts and visible after a restart. A log trims in sequence order.
+        let mut t = store_with(TINY);
+        for seq in 0..6 {
+            let x = on("s", "w", seq);
+            t.s.reserve(&x);
+            t.durable_at(&x, 1_000);
+        }
+        t.s.absorb();
+        let base = t.log.segments().0[0].base;
+        let kept: Vec<Kept> =
+            t.s.retained(&[base], |_| true, 0)
+                .into_values()
+                .flatten()
+                .collect();
+        let n = kept.len() as u64;
+        assert!(n > 0 && n < 6);
+        copy(&mut t, &kept);
+        let one = on("s", "w", 0).bytes.len() as u64;
+        assert_eq!(
+            t.s.trim_stream("s", Some((6 - n) * one), None, 0),
+            n as usize
+        );
+        let (got, _) = drain(&t.s, "s", Cursor::new(), 1 << 20);
+        let seqs: Vec<u64> = got.iter().map(|b| b.first_seq).collect();
+        assert_eq!(seqs, (n..6).collect::<Vec<_>>(), "the oldest went");
+        let reloaded = Store::load(t.log.reader()).unwrap();
+        for seq in n..6 {
+            let id = BatchId {
+                log: w("s", "w"),
+                first_seq: seq,
+            };
+            assert!(reloaded.get(&id).is_some(), "{seq} is on disk");
+        }
+    }
+
+    #[test]
+    fn a_batch_retention_forgets_past_contiguous_does_not_hold_it_back() {
+        // Why: a stream's own retention may forget a batch logged after one not marked durable
+        // yet. Its LSN is in the log all the same: once the earlier one is marked, `contiguous`
+        // must step over it, or live feeds stall and nothing is absorbed again.
+        let mut t = store();
+        let slow = on("t", "w", 0);
+        t.s.reserve(&slow);
+        let m = Meta {
+            key: encode_log_key(&slow.id.log),
+            first_seq: 0,
+            count: 1,
+            tag: batch_crc(&slow.bytes),
+            time_ms: now_ms(),
+        };
+        let at = t.log.append(&[(m, &slow.bytes[..])]).unwrap();
+        let x = on("s", "w", 0);
+        t.s.reserve(&x);
+        t.durable(&x);
+        assert_eq!(t.s.trim_stream("s", Some(0), None, 0), 1);
+        t.s.mark_durable(&slow, at);
+        assert_eq!(t.s.live_start(None).0, t.log.next_lsn(), "contiguous");
     }
 
     #[test]

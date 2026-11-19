@@ -72,7 +72,7 @@ fn now_ms() -> u64 {
 }
 
 /// The append time for a new record: now, but never before one already given (the wall clock
-/// can step back), so a stream's trim order (append time, LSN) is the log's order for new records.
+/// can step back), so a stream's trim order (`store::Age`) is the log's order for new records.
 fn stamp(stats: &WalStats) -> u64 {
     let t = now_ms();
     stats.newest_ms.fetch_max(t, Ordering::Relaxed).max(t)
@@ -371,7 +371,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_times_never_go_back_when_the_clock_does() {
-        // Why: a stream trims oldest first by (append time, LSN) and forgets everything below
+        // Why: a stream trims oldest first by append time (`store::Age`) and forgets everything below
         // the last batch it trimmed in that order. A batch stamped earlier than one already in
         // the log (the wall clock stepped back, here an hour, across a restart) would sort below
         // that floor: hidden from readers as soon as it is written.
