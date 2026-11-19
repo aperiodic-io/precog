@@ -19,6 +19,10 @@ enum Cmd {
     Serve {
         #[arg(long)]
         config: PathBuf,
+        /// The config lists every node in `peers`; this node is the one whose id is the
+        /// hostname's ordinal (a StatefulSet pod `precog-2` is node 2).
+        #[arg(long)]
+        member_from_hostname: bool,
         /// Tokio worker threads (default: all cores).
         #[arg(long)]
         threads: Option<usize>,
@@ -119,9 +123,17 @@ fn main() -> Result<()> {
 
 async fn run(cmd: Cmd) -> Result<()> {
     match cmd {
-        Cmd::Serve { config, .. } => {
-            let cfg: NodeConfig =
+        Cmd::Serve {
+            config,
+            member_from_hostname,
+            ..
+        } => {
+            let mut cfg: NodeConfig =
                 serde_json::from_slice(&std::fs::read(&config).context("read config")?)?;
+            if member_from_hostname {
+                let host = std::env::var("HOSTNAME").context("HOSTNAME")?;
+                cfg = cfg.for_member(precog_mesh::node::ordinal(&host)?)?;
+            }
             Node::run(cfg).await
         }
         Cmd::Init {

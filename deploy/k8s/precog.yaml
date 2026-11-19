@@ -1,0 +1,104 @@
+# Precog in place of live-ingestion's redpanda-raw-internal: 3 nodes, 3 copies of every batch
+# (acknowledged at 2, as Redpanda acks=all acknowledges at a raft majority), node-local disk.
+# Every pod reads the same cluster config and takes its own id from its ordinal
+# (`--member-from-hostname`). Pods start in parallel: there is no leader to elect.
+# Streams (retention, compaction) are generated from live-ingestion's topic list at cutover.
+apiVersion: v1
+kind: Service
+metadata:
+  name: precog
+  namespace: live-ingestion
+  labels: {app.kubernetes.io/name: precog}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app.kubernetes.io/name: precog}
+  ports:
+    - {name: rpc, port: 7000}
+    - {name: metrics, port: 9464}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: precog-config
+  namespace: live-ingestion
+data:
+  cluster.json: |
+    {
+      "id": 0,
+      "domain": "",
+      "data_dir": "/var/lib/precog",
+      "token": "in-cluster",
+      "listen_tcp": "0.0.0.0:7000",
+      "listen_metrics": "0.0.0.0:9464",
+      "target_copies": 3,
+      "segment_size": 1073741824,
+      "retention_bytes": 140000000000,
+      "dedup_window_ms": 300000,
+      "dedup_max_entries": 16000000,
+      "streams": {},
+      "peers": [
+        {"id": 0, "domain": "precog-0", "addr": "tcp://precog-0.precog.live-ingestion.svc.cluster.local:7000"},
+        {"id": 1, "domain": "precog-1", "addr": "tcp://precog-1.precog.live-ingestion.svc.cluster.local:7000"},
+        {"id": 2, "domain": "precog-2", "addr": "tcp://precog-2.precog.live-ingestion.svc.cluster.local:7000"}
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: precog
+  namespace: live-ingestion
+spec:
+  serviceName: precog
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app.kubernetes.io/name: precog}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: precog}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: /metrics
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app.kubernetes.io/name: precog}
+              topologyKey: kubernetes.io/hostname
+      securityContext: {runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532}
+      # a fenced node (storage fault) exits 70 and is restarted; recovery is the active segment only
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: precog
+          image: ghcr.io/aperiodic-io/precog:latest
+          args: [serve, --config, /etc/precog/cluster.json, --member-from-hostname]
+          ports:
+            - {name: rpc, containerPort: 7000}
+            - {name: metrics, containerPort: 9464}
+          resources:
+            requests: {cpu: "1", memory: 4000Mi}
+            limits: {cpu: "1", memory: 4000Mi}
+          readinessProbe:
+            httpGet: {path: /health, port: metrics}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: metrics}
+            periodSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - {name: config, mountPath: /etc/precog}
+            - {name: data, mountPath: /var/lib/precog}
+      volumes:
+        - name: config
+          configMap: {name: precog-config}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources:
+          requests: {storage: 150Gi}

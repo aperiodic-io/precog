@@ -197,3 +197,22 @@ async fn each_declared_stream_keeps_its_own_retention() {
     assert_eq!(count("young"), 0);
     assert_eq!(count("other"), 20);
 }
+
+#[test]
+fn one_cluster_config_serves_every_statefulset_member() {
+    // a ConfigMap lists every node; each pod takes its own id (from its hostname's ordinal)
+    let mut c = NodeConfig::single(0, "unused", "/var/lib/precog".into(), "tok".into());
+    c.peers = (0..3)
+        .map(|i| precog_mesh::node::PeerConfig {
+            id: i,
+            domain: format!("zone-{i}"),
+            addr: format!("tcp://precog-{i}.precog:7000"),
+        })
+        .collect();
+    let m = c.clone().for_member(1).unwrap();
+    assert_eq!((m.id, m.domain.as_str()), (1, "zone-1"));
+    assert_eq!(m.peers.iter().map(|p| p.id).collect::<Vec<_>>(), [0, 2]);
+    assert!(c.clone().for_member(7).is_err(), "not a member");
+    assert_eq!(precog_mesh::node::ordinal("precog-12").unwrap(), 12);
+    assert!(precog_mesh::node::ordinal("precog").is_err());
+}
