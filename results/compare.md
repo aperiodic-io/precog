@@ -111,6 +111,49 @@ the deferred fsync on another thread (~10% at `FLUSH_MS=100`; it touches the dur
 would block the worker); coalescing sends at some latency cost; a prefetching dedup table (results/dedup.md found
 little over SwissTable).
 
+### Appends written on the worker under write caching (2026-11-19, later)
+
+Under write caching (`flush_delay_ms > 0`) the network worker now writes its batch into the segment under the log's
+lock and has its LSN at once; the WAL thread only runs the deferred fsync (taken out of the log with
+`begin_flush`/`end_flush`, so writers go on during it), retention, and is woken only when the flush deadline moves (the
+first unsynced write, or `flush_bytes` crossed), not per batch. Rolls happen on the worker under the lock (spares are
+recycled, so a roll is renames, a header and the manifest). `flush_delay_ms = 0` keeps the queue to the WAL thread
+and its group commit.
+
+The disk had ~3 GB free this session (the 600 MB retention filled it and fenced the run), so these runs use
+`SEGMENT=128 MiB RETENTION=256000000` (a scratch copy of run.sh with the segment size as a variable), otherwise
+`WARMUP=20 BATCH=250`, 20% resends, 2,000 in flight. That rolls each node every ~1.5 s (4x as often as 256 MiB
+segments), and absolute numbers are higher than the earlier sections' (this session's VM also ran the same binary at
+~430k records/s where the earlier ones saw ~650k); compare A and B only. Base (A) is d89bfc5, alternating with the
+candidate (B), 5 runs each (records/s, p50 ms, p99 ms, us/record):
+
+| | records/s | p50 ack | p99 ack | broker CPU per record |
+|---|---:|---:|---:|---:|
+| A, `FLUSH_MS=100` | 426,400 | 4.21 ms | 10.30 ms | 1.372 us |
+| B, `FLUSH_MS=100` | 446,500 | 4.04 ms | 9.33 ms | 1.278 us (-6.9%) |
+| A, `FLUSH_MS=0` | 444,000 | 4.21 ms | 9.15 ms | 1.756 us |
+| B, `FLUSH_MS=0` | 443,800 | 4.19 ms | 9.22 ms | 1.758 us |
+
+- A, 100: 428.2k/4.21/10.50/1.421, 423.6k/4.21/9.30/1.371, 441.4k/4.18/9.48/1.397, 412.7k/4.35/10.99/1.372,
+  426.4k/4.24/10.30/1.342
+- B, 100: 446.5k/3.96/9.33/1.278, 438.0k/4.09/9.66/1.269, 452.3k/4.04/9.05/1.305, 426.4k/4.12/10.27/1.222,
+  465.4k/3.93/8.35/1.309
+- A, 0: 389.4k/4.63/11.84/1.713, 444.0k/4.21/9.15/1.805, 457.4k/4.14/8.69/1.742, 441.6k/4.22/9.44/1.785,
+  449.6k/4.15/9.10/1.756
+- B, 0: 370.8k/4.73/15.03/1.683, 436.3k/4.22/9.64/1.812, 443.8k/4.19/8.91/1.761, 455.4k/4.12/8.94/1.758,
+  449.3k/4.15/9.22/1.755
+
+At `FLUSH_MS=100` every candidate run is below every base run; throughput is +4.7% and p99 lower, so the
+rolls on the worker did not show up as stalls. At `FLUSH_MS=0` nothing moved, as expected.
+Profile of one replica-and-acceptor node (perf, 12 s at steady state, `FLUSH_MS=100`): the `precog-wal` thread fell
+from 21.3% to 4.7% of the node's samples, futex syscalls from 6.9% to 1.0%, context switches (`finish_task_switch`)
+from 7.2% to 5.2%, and the node took 9% fewer samples while moving 5% more records. What remains: dedup lookups
+(16.6%, memory-bound probes), socket sends (16%), pwrite (7.9%), recv (6.6%), `epoll_wait` (5.8%), fsync (3.6%).
+
+The target (<= ~1.0 us) is not reached on this VM: -7% at write caching. Ack coalescing per read was not attempted:
+the RPC writer task already coalesces every queued frame into one write, and with the append inline a replica's ack is
+ready in the same poll as its request.
+
 ## How Precog got here (same harness, 250-record batches unless noted)
 
 | change | CPU/record |
