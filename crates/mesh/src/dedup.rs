@@ -10,7 +10,7 @@
 //! `max_entries` the oldest quarter goes: the window shortens instead of memory growing
 //! (`effective_window_s` reports it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// The digest is already xxh3: hash it no further.
@@ -34,8 +34,9 @@ pub struct Dedup {
     max_entries: usize,
     /// digest -> the second it was last seen, plus one; an entry past the window counts as absent
     seen: HashMap<u64, u32, BuildHasherDefault<Pass>>,
-    /// recorded (replicated) digests not yet indexed
-    pending: Vec<(u64, u32)>,
+    /// recorded (replicated) digests not yet indexed (a deque: dropping its oldest quarter at the
+    /// cap moves nothing)
+    pending: VecDeque<(u64, u32)>,
     swept_s: u64,
     /// the oldest second any kept entry may carry (the window, or less after the cap bit)
     oldest_s: u64,
@@ -117,7 +118,7 @@ impl Dedup {
             window_s,
             max_entries,
             seen: HashMap::default(),
-            pending: vec![],
+            pending: VecDeque::new(),
             swept_s: 0,
             oldest_s: 0,
             started_s: None,

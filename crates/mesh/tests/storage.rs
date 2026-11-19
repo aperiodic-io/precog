@@ -255,3 +255,89 @@ async fn write_caching_acks_before_the_fsync_and_flushes_an_idle_node_within_the
     }
     assert!(t.elapsed() >= std::time::Duration::from_millis(100));
 }
+
+#[test]
+fn under_write_caching_an_append_is_written_by_its_caller_not_the_wal_thread() {
+    // Why: handing each batch to the WAL thread and back (a futex wake, its sleep, its wake of the
+    // worker) was ~10% of a node's CPU under write caching, where nothing in an append waits for
+    // the disk. The caller writes it and has the LSN as soon as `submit` returns.
+    use precog_mesh::wal::Wal;
+    let d = tempfile::tempdir().unwrap();
+    let mut c = precog_storage::Config::new(d.path());
+    c.segment_size = 1 << 20;
+    c.flush_delay_ms = 100;
+    let (wal, _) = Wal::open(c).unwrap();
+    for seq in 0..100 {
+        let mut rx = wal
+            .submit(Batch::parse(batch("w", seq, 100)).unwrap())
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap().unwrap(),
+            seq,
+            "written when submit returns"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_write_caching_past_flush_bytes_the_fsync_runs_without_waiting_out_the_delay() {
+    // Why: flush_bytes bounds how much an acknowledged but unsynced tail can hold; appends no longer
+    // fsync themselves, so crossing it must wake the flusher instead of waiting for the delay.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    c.segment_size = 1 << 20;
+    c.flush_delay_ms = 60_000;
+    c.flush_bytes = 4 << 10;
+    let node = Node::open(c).await.unwrap();
+    append_n(&node, "w", 1, 5000).await; // the first and only append crosses it
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while node.status().fsyncs == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no fsync past flush_bytes"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn under_write_caching_a_failed_deferred_fsync_fences_the_node() {
+    // Why: the acks given before it rest on the replicas; once the node knows its disk lost data it
+    // must acknowledge nothing more until it restarts and recovers.
+    let d = tempfile::tempdir().unwrap();
+    let mut c = config(d.path());
+    c.segment_size = 1 << 20;
+    c.flush_delay_ms = 20;
+    c.storage_failpoints.fail_data_sync_after = Some(0);
+    let node = Node::open(c).await.unwrap();
+    append_n(&node, "w", 3, 100).await; // acknowledged before the fsync
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !node.is_fatal() {
+        assert!(std::time::Instant::now() < deadline, "never fenced");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let ack = node.append(1, batch("other", 0, 100)).await;
+    assert!(!ack.is_success(), "a fenced node acknowledges nothing");
+}
+
+#[test]
+fn without_write_caching_batches_queued_during_an_fsync_share_the_next_one() {
+    // Why: group commit: fsyncs per second are bounded by the disk, not by the request rate, so the
+    // per-ack fsync stays on the WAL thread, not on each caller.
+    use precog_mesh::wal::Wal;
+    let d = tempfile::tempdir().unwrap();
+    let mut c = precog_storage::Config::new(d.path());
+    c.segment_size = 1 << 20;
+    let (wal, _) = Wal::open(c).unwrap();
+    let rxs: Vec<_> = (0..200)
+        .map(|seq| {
+            wal.submit(Batch::parse(batch("w", seq, 100)).unwrap())
+                .unwrap()
+        })
+        .collect();
+    for (seq, rx) in rxs.into_iter().enumerate() {
+        assert_eq!(rx.blocking_recv().unwrap().unwrap(), seq as u64);
+    }
+    let syncs = wal.stats.syncs.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(syncs < 100, "{syncs} fsyncs for 200 batches");
+}
