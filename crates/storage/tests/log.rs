@@ -1511,3 +1511,30 @@ fn a_roll_that_finds_no_spare_fills_one_at_full_speed() {
         t.elapsed()
     );
 }
+
+#[test]
+fn a_spare_of_the_right_size_is_reused_after_a_restart() {
+    // a restart must not throw away a ready spare and zero-fill another
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 1 << 20);
+    c.prealloc_bytes_per_s = 0;
+    let names = || -> Vec<String> {
+        std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("spare-0"))
+            .collect()
+    };
+    {
+        let _log = Log::open(c.clone()).unwrap();
+        let t = std::time::Instant::now();
+        while names().is_empty() && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    let before = names();
+    assert_eq!(before.len(), 1);
+    let _log = Log::open(c).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(names(), before, "the same spare, not a new one");
+}
