@@ -8,6 +8,8 @@ the `formal` job on each pull request, bigger bounds in `nightly.yml`.
 | Crash recovery of one segment, group commit, write caching | TLA+ / TLC | Exhaustive interleavings of writes, writeback in any order, power loss and media damage; small state spaces, no infrastructure | `spec/storage/SegmentLog.tla` |
 | Segment roll, directory fsyncs, the two-slot manifest | TLA+ / TLC | A power loss between any two steps of a multi-file protocol | `spec/storage/SegmentRoll.tla` |
 | Decoders of records, manifest slots and index files | Kani | Bounded proofs over every byte pattern, at the code itself | `#[cfg(kani)] mod proofs` in `crates/storage/src/{record,log}.rs` |
+| Leaderless appends at k of n, failure domains, retries, conflicts, repair, dedup, write caching, `Client::end` | TLA+ / TLC | The protocol's failure modes are interleavings of messages, power losses and disk losses across nodes | `spec/mesh/Replication.tla` |
+| Wire codecs: batches (every format), acks, append and replicate bodies, log keys, compacted-stream snapshots | proptest | The bytes come from the network or the disk; Kani does not finish them (below) | `mod props` in `crates/mesh/src/{proto,node}.rs` |
 
 Run them:
 
@@ -110,6 +112,107 @@ is shorter than its fixed fields under a matching checksum panicked the open ins
 back to the other slot (`manifest_decode_never_panics`; test
 `a_manifest_body_too_short_for_its_fields_is_refused_not_a_panic`).
 
+## Replication and dedup: `spec/mesh/Replication.tla`
+
+**Models.** `Node::append` on any node: `begin_local` (a new batch's keyed events checked
+against the node's dedup index and the batch queued to the log under one lock; a retry or a
+conflict goes to `store_local`), the WAL thread committing in queue order (fsync, or with write
+caching a write), replication of the kept bytes to one peer per other failure domain, the
+replica's `store_local` (Ok/Duplicate once durable, Conflict, recording the origin's kept keys),
+lost requests and replies, the ack once `copies` distinct domains confirmed with the origin's
+own durable copy among them, client retries of the same bytes on any node, repair copying a
+durable batch a peer lacks, the deferred fsync, power losses (losing what was not durable, with
+write caching what was not fsynced; the dedup index rebuilt from the log on restart), and disks
+lost for good (the node comes back empty).
+
+**Abstracts away.** Batch contents (an identity, the dedup keys of its events, a content
+variant for a conflicting reuse), sequence ranges and partial overlaps (the store's overlap
+rules are unit-tested), the dedup window and its cap (keys are remembered for the whole run:
+expiry only weakens dedup, never durability), event payloads, retention, live subscriptions.
+Storing at a replica and replying are one step; a power loss between them is a lost reply.
+
+**Properties.**
+- `AckedSurvive`: with at most `copies - 1` faults (disk losses, and power losses under write
+  caching), every acknowledged batch has a durable copy.
+- `AckedInCopiesDomains`: without faults, an acknowledged batch is durable in `copies` domains.
+- `NoConflictingAcks`: a conflicting reuse of an identity is never acknowledged next to the
+  original while no node has lost a copy (two ack sets of `copies > n/2` nodes share a node,
+  and it refuses the second variant). After a lost disk the empty node can accept the second
+  variant, and both can be acknowledged (`MC_conflict` without the premise). Identity reuse is
+  a writer bug; a node that later finds itself in the minority gives its bytes up
+  (`yield_to_majority`, #19, not modelled), but an ack already given stands.
+- `OneCopyPerKey`: two producer replicas whose batches all reach one node (the stream's
+  preferred node) store each key once.
+- `DedupLosesNothing`: every key of an acknowledged batch is kept (not a tombstone) in some
+  durable copy.
+- `Converge` (liveness, under weak fairness of commit, flush, restart and repair): every node
+  ends up with every batch some node holds durably.
+- `EndCoversAcked`: the ends of any `EndNeed` nodes, merged per log, cover every acknowledged
+  batch, while no node has lost a copy.
+
+**Bounds.** Three nodes in three domains (four for `MC_end4*`), `copies = 2`, two producer
+replicas sending the same key, one attempt per batch plus repair.
+
+| Config | Faults | Checks | Distinct states |
+|---|---|---|---|
+| `MC_append` | 1 power loss, 1 lost disk | `AckedSurvive`, `AckedInCopiesDomains`, `NoConflictingAcks`, `EndCoversAcked` | 1,423,165 |
+| `MC_dedup` | 2 power losses | `AckedSurvive`, `DedupLosesNothing` | 570,582 |
+| `MC_one_index` | none, one entry node | `OneCopyPerKey`, `DedupLosesNothing` | 527,893 |
+| `MC_conflict` | 1 power loss, 1 lost disk; two variants of one identity | `AckedSurvive`, `NoConflictingAcks` | 91,985 |
+| `MC_converge` | write caching, 1 power loss | `Converge` | 6,967 |
+| `MC_end4_fixed` | none, four nodes, 3 ends | `EndCoversAcked`, `AckedInCopiesDomains` | 880 |
+| `MC_end4` (expect) | none, four nodes, 2 ends | `EndCoversAcked` fails | |
+| `MC_dedup_caching` (expect) | write caching, 1 power loss | `DedupLosesNothing` fails: open finding below | |
+
+**Found and fixed.** `Client::end` merged the ends of `min(n, 2)` nodes. An acked batch is on
+`copies` nodes, so only `n - copies + 1` ends are sure to include one: on four nodes with 2
+copies two ends can both miss an acked batch, and a reader starting at the end reads acked
+events as new (`MC_end4`). Now `n - copies + 1`. Test:
+`the_end_of_a_stream_on_four_nodes_merges_enough_ends_to_meet_every_acked_copy` (failed first:
+`end` was empty).
+
+**Found, open: dedup can lose an acknowledged event.** Batch `a` keeps event key `k`; batch `b`
+(the other producer replica) arrives at the same node, its `k` is dropped as a duplicate, and
+`b` is acknowledged once it is durable on 2 domains. Nothing waits for `a` to be: if `a` is
+still only on the accepting node and that node loses `a` (a power loss before the deferred
+fsync under write caching, live-ingestion's setting; or a lost disk), `k` is gone although `b`
+was acknowledged (`MC_dedup_caching`: 8 steps; with a lost disk, `MC_append` with
+`DedupLosesNothing` added). Without write caching and without a lost disk it holds
+(`MC_dedup`). If `a`'s producer keeps retrying `a`, the retry restores `k`; if it crashed too,
+`k` is lost. Fixing it is a design choice, left to the owner:
+1. hold `b`'s ack until every batch that claimed one of its dropped keys is acknowledged (or
+   durable on `copies` domains): no extra copies, a little ack latency for the second replica,
+   and the accepting node has to drive a claimer it could not replicate (today only repair
+   does);
+2. drop a duplicate only once its claimer is acknowledged: no latency, but replicas sending
+   within an ack round trip of each other (the common case) keep both copies;
+3. accept it and document it next to the failover limit (§7.4 of `docs/PLAN.md`).
+
+Also visible, not bugs: after a lost disk `Client::end` can be short until repair (a reader at
+the end re-reads a little), and repair does not record dedup keys (a node that got a batch only
+by repair keeps a later duplicate of it).
+
+### Wire codecs: property tests in `crates/mesh`
+
+`proto::props` (2,000 cases each, in the `test` job): batches of every format (PCB1, PCB2,
+PCZ2) parse back to what was encoded, events, sequence numbers and times included; a valid
+batch with up to three bytes changed or cut short, its CRC recomputed so it reaches the
+structural checks, never panics `parse`, and a batch `parse` accepts is walked by every accessor
+(`keys`, `try_events`, `keyed`, `without`, each `expect`ing what `parse` validated) without a
+panic; arbitrary bytes under a matching CRC behind each magic never panic; acks, append and
+replicate bodies and log keys round-trip and any bytes decode or are refused.
+`node::props`: compacted-stream snapshots round-trip and damaged ones (CRC recomputed) are
+refused. No bug found.
+
+### The store against a reference model: `store::model`
+
+A state-machine property test of `Store` (64 runs of up to 30 operations, in the `test` job):
+reserves of random ranges (exact retries, partial overlaps, conflicting contents), durable marks
+in any order and failed writes, checked after every step against a reference of the per-node
+rules `Replication.tla` assumes (an exact retry is a duplicate, any other overlap a conflict, a
+failed write frees its range, only durable batches are served) and of frontier arithmetic (the
+durable prefix from 0, and one past the highest durable sequence). No discrepancy found.
+
 ## Not verified, and why
 
 - **Loom for the storage write path.** One OS thread owns the `Log`; other threads only read
@@ -117,5 +220,12 @@ back to the other slot (`manifest_decode_never_panics`; test
   There is no lock-free protocol for Loom to explore, and the publication order (`next_lsn`
   stored after the entries) is a single release store, covered by
   `readers_see_appends_concurrently_and_hit_the_tail_cache`.
+- **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
+  10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
+  Property tests above cover them instead, at much larger sizes.
+- **P or Stateright for the protocol.** TLC finds the counterexamples above in seconds on
+  models a page long; a second model closer to the Rust code would mean keeping two models in
+  step with no new class of bug in reach. Apalache: the state spaces are small enough for
+  explicit checking, so symbolic checking buys nothing yet.
 - **Index and segment header round trips under Kani.** They need a `File`; their decoders are
   proved panic-free above and the round trips are unit-tested.

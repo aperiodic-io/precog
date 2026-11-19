@@ -1539,3 +1539,34 @@ pub fn parse_frame_ack(f: &Frame) -> Result<Ack> {
     }
     Ack::decode(f.body.clone())
 }
+
+#[cfg(test)]
+mod props {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A compacted-stream snapshot (read at every start) round-trips, and any bytes under a
+        /// matching checksum decode or are refused, never a panic.
+        #[test]
+        fn snapshots_round_trip_and_damaged_ones_are_refused(
+            m in prop::collection::btree_map(
+                prop::collection::vec(any::<u8>(), 0..4),
+                (any::<u64>(), prop::collection::vec(any::<u8>(), 0..4)),
+                0..4,
+            ),
+            at in any::<prop::sample::Index>(), v: u8, cut in any::<prop::sample::Index>(),
+        ) {
+            let m: Compacted = m.into_iter().map(|(k, (l, p))| (k, (l, Bytes::from(p)))).collect();
+            let b = encode_snapshot(&m);
+            prop_assert_eq!(decode_snapshot(&b).unwrap(), m);
+            let mut body = b[..b.len() - 4].to_vec();
+            let i = at.index(body.len());
+            body[i] = v;
+            body.truncate(cut.index(body.len() + 1));
+            let c = crc32c::crc32c(&body);
+            body.extend_from_slice(&c.to_le_bytes());
+            let _ = decode_snapshot(&body);
+        }
+    }
+}
