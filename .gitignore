@@ -6,3 +6,4 @@
 # TLC run files
 states/
 *_TTrace_*
+/crates/s2-lab/target
