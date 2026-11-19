@@ -2055,6 +2055,97 @@ fn under_write_caching_the_unsynced_bound_is_exact_to_the_last_record_written() 
     }
 }
 
+#[test]
+fn retention_names_the_segments_it_would_drop_and_drops_up_to_a_boundary() {
+    // Why: a node copies forward what its streams still retain from exactly the segments the
+    // cap drops, then drops those and no more: what it is told must be what retention does.
+    let d = tempfile::tempdir().unwrap();
+    let seg = 64 * KB;
+    let mut log = Log::open(cfg(d.path(), seg)).unwrap();
+    fill(&mut log, 0, 150, 2, 1000);
+    let total = log.stats().log_bytes;
+    let (segs, t) = log.segments();
+    assert_eq!(t, total);
+    assert_eq!(
+        segs.len() + 1,
+        log.stats().segments,
+        "all but the active one"
+    );
+    let gone = &segs[..log.retirable(Some(3 * seg), None)];
+    assert!(gone.len() >= 2, "{gone:?}");
+    let freed: u64 = gone.iter().map(|s| s.bytes).sum();
+    assert!(total - freed <= 3 * seg && total - freed + gone.last().unwrap().bytes > 3 * seg);
+    let sealed = log.reader().sealed();
+    assert_eq!(sealed.len(), segs.len());
+    for (s, (base, end)) in segs.iter().zip(&sealed) {
+        assert_eq!((s.base, s.end), (*base, *end));
+        assert_eq!(s.max_time, 1_000 + end - 1, "time_ms of its newest record");
+    }
+    // age: only segments whose newest record is older than the limit
+    assert_eq!(log.retirable(None, Some(1_000 + sealed[1].1)), 2);
+    assert_eq!(log.retirable(None, None), 0);
+    // the first one only, whatever the cap says
+    let floor = log.drop_until(gone[0].end).unwrap();
+    assert_eq!(floor, gone[0].end);
+    assert_eq!(log.stats().log_bytes, total - gone[0].bytes);
+    assert!(log.reader().read(floor - 1).unwrap().is_none());
+    check_all(&log, floor, 300, 1000);
+    assert_eq!(
+        log.drop_until(floor).unwrap(),
+        floor,
+        "nothing below it is left"
+    );
+    assert_eq!(
+        log.retain(Some(3 * seg), None).unwrap(),
+        gone.last().unwrap().end
+    );
+    // the active segment is never dropped
+    let next = log.next_lsn();
+    let floor = log.drop_until(next).unwrap();
+    assert!(floor < next && log.reader().read(next - 1).unwrap().is_some());
+}
+
+#[test]
+fn a_crash_while_retention_drops_segments_keeps_the_log_consistent() {
+    // Why: the cleaner deletes a segment only after copying what streams retain from it; a
+    // crash before the manifest names the drop keeps the old copy, one after keeps the new.
+    for (step, dropped) in [
+        ("retain:before_manifest", false),
+        ("retain:after_manifest", true),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let mut c = cfg(d.path(), 64 * KB);
+        c.failpoints.fail_at = Some(step);
+        let mut log = Log::open(c).unwrap();
+        fill(&mut log, 0, 150, 2, 1000);
+        let end = log.reader().sealed()[0].1;
+        assert!(
+            matches!(log.drop_until(end), Err(Error::Fatal(_))),
+            "{step}"
+        );
+        assert!(log.is_fenced(), "{step}");
+        drop(log);
+        let log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+        let first = if dropped { end } else { 0 };
+        assert_eq!(log.first_lsn(), first, "{step}");
+        check_all(&log, first, 300, 1000);
+    }
+}
+
+#[test]
+fn a_record_s_append_time_is_read_from_its_index() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = Log::open(cfg(d.path(), 64 * KB)).unwrap();
+    fill(&mut log, 0, 150, 2, 1000);
+    let r = log.reader();
+    for lsn in [0, 1, 150, 299] {
+        assert_eq!(r.time_ms(lsn).unwrap(), Some(1_000 + lsn), "lsn {lsn}");
+    }
+    assert_eq!(r.time_ms(300).unwrap(), None, "not written");
+    log.retain(Some(3 * 64 * KB), None).unwrap();
+    assert_eq!(r.time_ms(0).unwrap(), None, "dropped");
+}
+
 /// Model-based test: random appends, flushes, retention by size and age, cache drops, lost
 /// index files and reopens against a list of records. After every step every read API
 /// (`read`, `entries`, `sealed`, `by_key`) agrees with the model.
@@ -2101,12 +2192,21 @@ mod model {
         let r = log.reader();
         prop_assert_eq!(log.next_lsn(), m.recs.len() as u64);
         prop_assert_eq!(log.first_lsn(), m.first);
+        let newest = m.recs[m.first as usize..].iter().map(|r| r.0.time_ms).max();
+        prop_assert_eq!(
+            log.max_time(),
+            newest.unwrap_or(0),
+            "the newest append time in the log"
+        );
         for (l, (meta, p)) in m.recs.iter().enumerate() {
             let got = r.read(l as u64).unwrap();
+            let time = r.time_ms(l as u64).unwrap();
             if (l as u64) < m.first {
                 prop_assert!(got.is_none(), "lsn {} below the floor", l);
+                prop_assert_eq!(time, None);
                 continue;
             }
+            prop_assert_eq!(time, Some(meta.time_ms));
             let got = got.unwrap();
             prop_assert_eq!(&got.meta, meta);
             prop_assert_eq!(&got.payload[..], &p[..]);

@@ -4,7 +4,8 @@
 //! `fdatasync` runs joins the next group, so syncs per second are bounded by the disk, not
 //! by the request rate. With write caching (`Config::flush_delay_ms`) the caller writes its batch
 //! under the log's lock and has its LSN at once; the thread only runs the deferred fsync when it
-//! falls due (idle or not), without the lock. Retention runs on the same thread. A storage fault
+//! falls due (idle or not), without the lock. Retention (the cleaner's copies and the drop of
+//! old segments) runs on the same thread. A storage fault
 //! (`precog_storage::Error::Fatal`) sets `fatal`: every later append fails, and the node
 //! must restart and recover.
 
@@ -12,7 +13,7 @@ use crate::proto::{Batch, encode_log_key, encode_replacing_key};
 use anyhow::{Result, bail};
 use parking_lot::Mutex;
 use precog_storage::record::Meta;
-use precog_storage::{Config, Lsn, Reader};
+use precog_storage::{Config, Lsn, Reader, Sealed};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::oneshot;
@@ -26,6 +27,10 @@ pub struct WalStats {
     pub syncs: AtomicU64,
     pub segments: AtomicU64,
     pub recovery_scanned_bytes: AtomicU64,
+    /// Bytes of records in the log now (what the node cap bounds).
+    pub log_bytes: AtomicU64,
+    /// The newest append time given (ms): no record is stamped before it.
+    pub newest_ms: AtomicU64,
 }
 
 type Done = oneshot::Sender<Result<Lsn, String>>;
@@ -37,13 +42,17 @@ enum Req {
         replaces: bool,
         done: Done,
     },
-    Retain {
-        max_bytes: Option<u64>,
-        max_age_ms: Option<u64>,
-        done: oneshot::Sender<Result<Lsn, String>>,
-    },
+    /// The cleaner's steps, on this thread between groups.
+    Retain { job: Job, done: Done },
     /// Write caching: the flush deadline moved (`Log::flush_due`).
     Wake,
+}
+
+enum Job {
+    /// Records copied forward as they are (one group), synced as appends are.
+    Copy(Vec<(Meta, Arc<[u8]>)>),
+    /// `Log::drop_until`: syncs what is unsynced (the copies), then drops.
+    Drop(Lsn),
 }
 
 #[derive(Clone)]
@@ -63,6 +72,13 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The append time for a new record: now, but never before one already given (the wall clock
+/// can step back), so a stream's trim order (`store::Age`) is the log's order for new records.
+fn stamp(stats: &WalStats) -> u64 {
+    let t = now_ms();
+    stats.newest_ms.fetch_max(t, Ordering::Relaxed).max(t)
+}
+
 impl Wal {
     /// Opens (and recovers) the segment log and starts the writer thread.
     pub fn open(cfg: Config) -> Result<Wal> {
@@ -73,6 +89,8 @@ impl Wal {
         let stats = Arc::new(WalStats::default());
         let s = log.stats();
         stats.segments.store(s.segments as u64, Ordering::Relaxed);
+        stats.log_bytes.store(s.log_bytes, Ordering::Relaxed);
+        stats.newest_ms.store(log.max_time(), Ordering::Relaxed);
         stats
             .recovery_scanned_bytes
             .store(s.recovery_scanned_bytes, Ordering::Relaxed);
@@ -139,7 +157,7 @@ impl Wal {
     fn write(&self, batch: &Batch, replaces: bool) -> Result<Lsn, String> {
         let mut log = self.log.lock();
         let due = log.flush_due();
-        let r = log.append(&[(meta(batch, replaces, now_ms()), &batch.bytes[..])]);
+        let r = log.append(&[(meta(batch, replaces, stamp(&self.stats)), &batch.bytes[..])]);
         publish(&log, &self.stats, &self.fatal);
         let wake = log.flush_due() != due;
         drop(log);
@@ -161,21 +179,36 @@ impl Wal {
         }
     }
 
-    /// Applies retention; returns the new first LSN.
-    pub async fn retain(&self, max_bytes: Option<u64>, max_age_ms: Option<u64>) -> Result<Lsn> {
+    /// The sealed segments, oldest first, how many of them these bounds drop (`max_age_ms`
+    /// before now), and the log's bytes.
+    pub fn retirable(
+        &self,
+        max_bytes: Option<u64>,
+        max_age_ms: Option<u64>,
+    ) -> (Vec<Sealed>, usize, u64) {
+        let cutoff = max_age_ms.map(|a| now_ms().saturating_sub(a));
+        let log = self.log.lock();
+        let (segs, total) = log.segments();
+        (segs, log.retirable(max_bytes, cutoff), total)
+    }
+
+    /// Logs `records` again, unchanged, as one group; resolves with the first one's new LSN.
+    pub async fn copy(&self, records: Vec<(Meta, Arc<[u8]>)>) -> Result<Lsn> {
+        self.request(Job::Copy(records)).await
+    }
+
+    /// Makes everything written durable, then drops the sealed segments that end at or below
+    /// `end`; returns the new first LSN.
+    pub async fn drop_until(&self, end: Lsn) -> Result<Lsn> {
+        self.request(Job::Drop(end)).await
+    }
+
+    async fn request(&self, job: Job) -> Result<Lsn> {
         let (done, rx) = oneshot::channel();
         self.tx
-            .send(Req::Retain {
-                max_bytes,
-                max_age_ms,
-                done,
-            })
+            .send(Req::Retain { job, done })
             .map_err(|_| anyhow::anyhow!("wal writer stopped"))?;
-        match rx.await {
-            Ok(Ok(lsn)) => Ok(lsn),
-            Ok(Err(e)) => bail!("storage: {e}"),
-            Err(_) => bail!("wal writer dropped request"),
-        }
+        Self::durable(rx).await
     }
 }
 
@@ -200,6 +233,7 @@ fn publish(log: &precog_storage::Log, stats: &WalStats, fatal: &AtomicBool) {
     stats.syncs.store(s.syncs, Ordering::Relaxed);
     stats.bytes.store(s.bytes, Ordering::Relaxed);
     stats.segments.store(s.segments as u64, Ordering::Relaxed);
+    stats.log_bytes.store(s.log_bytes, Ordering::Relaxed);
 }
 
 /// Runs the due deferred fsync without holding the log, so writers go on meanwhile.
@@ -254,19 +288,18 @@ fn writer(
             }
         };
         match first {
-            Req::Retain {
-                max_bytes,
-                max_age_ms,
-                done,
-            } => {
-                let cutoff = max_age_ms.map(|a| now_ms().saturating_sub(a));
+            Req::Retain { job, done } => {
                 let mut log = log.lock();
-                let r = log.retain(max_bytes, cutoff).map_err(|e| e.to_string());
-                stats
-                    .segments
-                    .store(log.stats().segments as u64, Ordering::Relaxed);
-                fatal.store(log.is_fenced(), Ordering::Release);
-                let _ = done.send(r);
+                let r = match job {
+                    Job::Copy(records) => {
+                        let items: Vec<(Meta, &[u8])> =
+                            records.iter().map(|(m, p)| (m.clone(), &p[..])).collect();
+                        log.append(&items)
+                    }
+                    Job::Drop(end) => log.drop_until(end),
+                };
+                publish(&log, &stats, &fatal);
+                let _ = done.send(r.map_err(|e| e.to_string()));
                 continue;
             }
             Req::Append {
@@ -294,7 +327,7 @@ fn writer(
                 Ok(Req::Wake) | Err(_) => break,
             }
         }
-        let t = now_ms();
+        let t = stamp(&stats);
         let items: Vec<(Meta, &[u8])> = group
             .iter()
             .map(|(b, replaces, _)| (meta(b, *replaces, t), &b.bytes[..]))
@@ -332,6 +365,36 @@ mod tests {
         // through the WAL thread (fsync per ack) and on the caller (write caching)
         for flush_delay_ms in [0, 100] {
             replacing_key(flush_delay_ms).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn append_times_never_go_back_when_the_clock_does() {
+        // Why: a stream trims oldest first by append time (`store::Age`) and forgets everything below
+        // the last batch it trimmed in that order. A batch stamped earlier than one already in
+        // the log (the wall clock stepped back, here an hour, across a restart) would sort below
+        // that floor: hidden from readers as soon as it is written.
+        for flush_delay_ms in [0, 100] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = Config::new(dir.path());
+            c.flush_delay_ms = flush_delay_ms;
+            let log = LogId {
+                stream: "s".into(),
+                writer: "w".into(),
+                epoch: 1,
+            };
+            let at = |seq| Batch::parse(Batch::encode(&log, seq, &[(1, b"e")]).unwrap()).unwrap();
+            let ahead = now_ms() + 3_600_000;
+            {
+                let mut l = precog_storage::Log::open(c.clone()).unwrap();
+                let b = at(0);
+                l.append(&[(meta(&b, false, ahead), &b.bytes[..])]).unwrap();
+                l.flush().unwrap();
+            }
+            let wal = Wal::open(c).unwrap();
+            let lsn = wal.append(at(1)).await.unwrap();
+            let t = wal.reader.time_ms(lsn).unwrap().unwrap();
+            assert!(t >= ahead, "flush_delay_ms {flush_delay_ms}: {t} < {ahead}");
         }
     }
 
@@ -462,7 +525,9 @@ mod model {
                     }
                     Op::Retain(max) => {
                         failed |= wal.fatal.load(Ordering::Acquire);
-                        match wal.retain(Some(max), None).await {
+                        let (segs, n, _) = wal.retirable(Some(max), None);
+                        let end = segs[..n].last().map_or(0, |s| s.end);
+                        match wal.drop_until(end).await {
                             Ok(f) => {
                                 prop_assert!(!failed && f >= first);
                                 first = f;

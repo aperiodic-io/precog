@@ -10,7 +10,7 @@
 use crate::dedup::{self, Streams};
 use crate::proto::*;
 use crate::rpc::{BoxRead, BoxWrite, RpcClient, read_frame, write_loop};
-use crate::store::{Cursor, Reserve, State, Store};
+use crate::store::{Cursor, Kept, Reserve, State, Store};
 use crate::transport::Addr;
 use crate::wal::Wal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -224,6 +224,46 @@ pub struct Node {
     pos_seq: AtomicU64,
     /// The event time (us) of this node's last position commit: it never goes back.
     pos_time: AtomicU64,
+    /// Held while the cleaner copies batches forward and while a replacement takes a batch's
+    /// place, so a copy never carries bytes a replacement superseded.
+    clean: tokio::sync::Mutex<()>,
+    copied_bytes: AtomicU64,
+    copied_batches: AtomicU64,
+    /// Batches the node cap cut from streams that still retained them, by stream.
+    forced: parking_lot::Mutex<BTreeMap<String, u64>>,
+}
+
+/// Most bytes the cleaner copies forward in one group (one write to the log, as a client group).
+const COPY_CHUNK: u64 = 4 << 20;
+
+/// What copying `cost` bytes of records in groups of at most `limit` adds to the log at most: a
+/// new segment's header for each group (`groups`: any two groups in a row hold more than
+/// `limit`).
+fn copy_bytes(cost: u64, limit: u64) -> u64 {
+    if cost == 0 {
+        return 0;
+    }
+    cost + precog_storage::SEG_HEADER * (2 * cost / limit + 1)
+}
+
+/// Whether copying `cost` bytes in groups of at most `limit` fits in `room` bytes.
+fn fits(cost: u64, limit: u64, room: u64) -> bool {
+    copy_bytes(cost, limit) <= room
+}
+
+/// The kept batches, in order, in groups of at most `limit` bytes (a larger one alone).
+fn groups(kept: &[Kept], limit: u64) -> Vec<Vec<u64>> {
+    let mut out: Vec<(u64, Vec<u64>)> = vec![];
+    for k in kept {
+        match out.last_mut() {
+            Some((size, g)) if *size + k.cost <= limit => {
+                *size += k.cost;
+                g.push(k.lsn);
+            }
+            _ => out.push((k.cost, vec![k.lsn])),
+        }
+    }
+    out.into_iter().map(|g| g.1).collect()
 }
 
 /// The internal compacted stream of consumer positions, keyed by group and stream.
@@ -308,6 +348,76 @@ fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
         return Err(fail());
     }
     Ok(m)
+}
+
+const FLOORS_MAGIC: &[u8; 4] = b"PCF1";
+
+/// Each stream's own retention floor: magic, count, then (name len u16, name, append time u64,
+/// first sequence u64, LSN u64) per stream, then CRC-32C of everything before it.
+fn encode_floors(m: &BTreeMap<String, crate::store::Age>) -> Vec<u8> {
+    let mut b = FLOORS_MAGIC.to_vec();
+    b.extend_from_slice(&(m.len() as u64).to_le_bytes());
+    for (name, &(time, seq, lsn)) in m {
+        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        b.extend_from_slice(name.as_bytes());
+        for v in [time, seq, lsn] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let c = crc32c::crc32c(&b);
+    b.extend_from_slice(&c.to_le_bytes());
+    b
+}
+
+fn decode_floors(b: &[u8]) -> Result<BTreeMap<String, crate::store::Age>> {
+    let fail = || anyhow!("retention floors are damaged or of an unknown version");
+    let (body, crc) = b
+        .split_at_checked(b.len().checked_sub(4).ok_or_else(fail)?)
+        .ok_or_else(fail)?;
+    if crc32c::crc32c(body) != u32::from_le_bytes(crc.try_into()?)
+        || body.get(..4) != Some(&FLOORS_MAGIC[..])
+    {
+        return Err(fail());
+    }
+    let mut c = &body[4..];
+    let mut take = |n: usize| -> Result<&[u8]> {
+        let (a, rest) = c.split_at_checked(n).ok_or_else(fail)?;
+        c = rest;
+        Ok(a)
+    };
+    let n = u64::from_le_bytes(take(8)?.try_into()?);
+    let mut m = BTreeMap::new();
+    for _ in 0..n {
+        let nl = u16::from_le_bytes(take(2)?.try_into()?) as usize;
+        let name = String::from_utf8(take(nl)?.to_vec()).map_err(|_| fail())?;
+        let mut age = [0u64; 3];
+        for v in &mut age {
+            *v = u64::from_le_bytes(take(8)?.try_into()?);
+        }
+        m.insert(name, (age[0], age[1], age[2]));
+    }
+    if !c.is_empty() {
+        return Err(fail());
+    }
+    Ok(m)
+}
+
+/// Writes each file in `dir` durably: a temporary file, fsynced, renamed, then the directory.
+fn write_durably(dir: &std::path::Path, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for (p, bytes) in files {
+        let tmp = p.with_extension("tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &p)?;
+    }
+    // the renames are durable only once the directory is
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 fn snapshot_path(dir: &std::path::Path, stream: &str) -> PathBuf {
@@ -411,6 +521,11 @@ impl Node {
                 replay.push(e.lsn);
             }
         })?;
+        let p = cfg.data_dir.join("floors"); // none until a pass dropped segments
+        if p.exists() {
+            let floors = decode_floors(&std::fs::read(&p)?);
+            store.restore_floors(&floors.with_context(|| format!("{}", p.display()))?);
+        }
         let n = store.totals().0;
         for lsn in replay {
             if let Some(r) = wal.reader.read(lsn)? {
@@ -460,6 +575,10 @@ impl Node {
             },
             pos_seq: AtomicU64::new(0),
             pos_time: AtomicU64::new(0),
+            clean: Default::default(),
+            copied_bytes: AtomicU64::new(0),
+            copied_batches: AtomicU64::new(0),
+            forced: Default::default(),
         });
         Ok(node)
     }
@@ -605,33 +724,21 @@ impl Node {
 
     /// Writes every compacted stream's snapshot durably (before retention frees segments).
     fn write_snapshots(&self) -> Result<()> {
-        let snaps: Vec<(String, Vec<u8>)> = self
+        let snaps: Vec<(PathBuf, Vec<u8>)> = self
             .compact
             .lock()
             .iter()
-            .map(|(s, m)| (s.clone(), encode_snapshot(m)))
+            .map(|(s, m)| (snapshot_path(&self.cfg.data_dir, s), encode_snapshot(m)))
             .collect();
         if snaps.is_empty() {
             return Ok(());
         }
-        let dir = self.cfg.data_dir.join("compact");
-        std::fs::create_dir_all(&dir)?;
-        for (stream, bytes) in snaps {
-            let p = snapshot_path(&self.cfg.data_dir, &stream);
-            let tmp = p.with_extension("tmp");
-            {
-                use std::io::Write;
-                let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(&bytes)?;
-                f.sync_all()?;
-            }
-            std::fs::rename(&tmp, &p)?;
-        }
-        // the renames are durable only once the directory is
-        std::fs::File::open(&dir)?.sync_all()?;
-        Ok(())
+        write_durably(&self.cfg.data_dir.join("compact"), snaps)
     }
 
+    /// Applies each stream's own retention, then the node's bounds. Before the node drops its
+    /// oldest segments, the cleaner copies forward the batches in them that streams still retain
+    /// under their own retention (docs/ARCHITECTURE.md, "The segment cleaner").
     pub async fn apply_retention(&self) -> Result<()> {
         // sealed segments' batches leave RAM (their index is on disk)
         self.store.absorb();
@@ -644,18 +751,159 @@ impl Node {
         if self.cfg.retention_bytes.is_none() && self.cfg.retention_ms.is_none() {
             return Ok(());
         }
-        let floor = self
+        let (segs, want, total) = self
             .wal
-            .retain(self.cfg.retention_bytes, self.cfg.retention_ms)
-            .await?;
+            .retirable(self.cfg.retention_bytes, self.cfg.retention_ms);
+        // absorbed ones only: a segment with a batch not marked durable yet waits for a pass
+        let absorbed = self.store.absorbed_end();
+        let n = segs.iter().take_while(|s| s.end <= absorbed).count();
+        // the later ones' bytes take no room from the copies, or a segment waiting a pass would
+        // force a cut of what streams retain; the log can be over the cap by them for that pass
+        let waiting: u64 = segs[n..].iter().map(|s| s.bytes).sum();
+        let segs = &segs[..n];
+        // the node's age limit is a ceiling: nothing older than it is copied
+        let min_time = self.cfg.retention_ms.map_or(0, |a| now.saturating_sub(a));
+        let cap = self.cfg.retention_bytes.unwrap_or(u64::MAX);
+        let limit = self.copy_limit();
+        // the segments the bounds drop, and as many more as the copies of what streams retain in
+        // them need room for
+        let (mut n, mut left, mut keep) = (0, total - waiting, HashMap::<String, Vec<Kept>>::new());
+        let mut cost = 0;
+        while let Some(s) = segs.get(n)
+            && (n < want || !fits(cost, limit, cap.saturating_sub(left)))
+        {
+            for (stream, v) in self
+                .store
+                .retained(&[s.base], |s| self.retains(s), min_time)
+            {
+                cost += v.iter().map(|k| k.cost).sum::<u64>();
+                keep.entry(stream).or_default().extend(v);
+            }
+            left -= s.bytes;
+            n += 1;
+        }
+        let Some(end) = segs[..n].last().map(|s| s.end) else {
+            return Ok(());
+        };
+        let bases: Vec<u64> = segs[..n].iter().map(|s| s.base).collect();
+        let budget = cap.saturating_sub(left);
+        self.fit(&mut keep, budget);
+        // what streams forgot stays forgotten across a restart, though copies of it outlive the
+        // segments about to be dropped
+        let floors = (
+            self.cfg.data_dir.join("floors"),
+            encode_floors(&self.store.floors()),
+        );
+        write_durably(&self.cfg.data_dir, vec![floors])?;
+        self.copy_forward(keep).await?;
+        self.store.vacate(&bases);
+        let floor = self.wal.drop_until(end).await?;
         self.store.trim(floor);
+        Ok(())
+    }
+
+    /// The stream has a retention of its own, kept through the node cap (a compacted stream
+    /// keeps its newest values in its snapshot instead).
+    fn retains(&self, stream: &str) -> bool {
+        self.cfg.streams.get(stream).is_some_and(|c| {
+            !c.compacted && (c.retention_bytes.is_some() || c.retention_ms.is_some())
+        })
+    }
+
+    fn copy_limit(&self) -> u64 {
+        COPY_CHUNK.min(self.cfg.segment_size - precog_storage::SEG_HEADER)
+    }
+
+    /// The node cap wins over what streams retain: while copying `keep` would take the log past
+    /// `budget` bytes, cuts the oldest batches of the stream furthest over its share of the cap.
+    /// Every stream with a retention of its own has an equal share, so that is the one
+    /// retaining the most bytes; cut it down to the next one, then both, and so on. Counts them.
+    fn fit(&self, keep: &mut HashMap<String, Vec<Kept>>, budget: u64) {
+        let limit = self.copy_limit();
+        let mut cost: u64 = keep.values().flatten().map(|k| k.cost).sum();
+        while !fits(cost, limit, budget) {
+            let mut most: Vec<(u64, String)> = keep
+                .iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(s, _)| (self.store.stream_bytes(s), s.clone()))
+                .collect();
+            most.sort_unstable_by(|a, b| b.cmp(a));
+            let next = most.get(1).map_or(0, |x| x.0);
+            // cost counts only what `keep` holds, so while it does not fit something is kept
+            let (_, stream) = most.swap_remove(0);
+            let mut kept: HashMap<u64, Kept> = keep[&stream].iter().map(|k| (k.lsn, *k)).collect();
+            let cut = self.store.cut(&stream, |bytes, lsn| {
+                if fits(cost, limit, budget) || bytes < next {
+                    return false;
+                }
+                if let Some(k) = kept.remove(&lsn) {
+                    cost -= k.cost;
+                }
+                true
+            });
+            keep.insert(stream.clone(), kept.into_values().collect());
+            if cut == 0 {
+                tracing::error!("retention: stream {stream} could not be cut");
+                break;
+            }
+            *self.forced.lock().entry(stream).or_default() += cut as u64;
+        }
+    }
+
+    /// Logs the kept batches again, oldest first, in groups of at most `copy_limit` bytes, each
+    /// its own write to the log (appends go on between them) and each taking its batches'
+    /// place in the store once written.
+    async fn copy_forward(&self, keep: HashMap<String, Vec<Kept>>) -> Result<()> {
+        let mut all: Vec<Kept> = keep.into_values().flatten().collect();
+        all.sort_unstable_by_key(|k| (k.time, k.lsn));
+        for lsns in groups(&all, self.copy_limit()) {
+            let _g = self.clean.lock().await;
+            // a record that does not read back goes with its segment, as before copying: failing
+            // the pass would fail every later one at it, and the cap would drop nothing again
+            let recs: Vec<_> = lsns
+                .iter()
+                .filter_map(|&l| match self.wal.reader.read(l) {
+                    Ok(Some(r)) => Some(r),
+                    r => {
+                        tracing::error!("retention: lsn {l} to copy does not read: {:?}", r.err());
+                        None
+                    }
+                })
+                // a replacement may have superseded it since it was picked (the lock keeps
+                // replacements out from here to `moved`)
+                .filter(|r| self.store.retains(r.lsn, &r.meta))
+                .collect();
+            if !recs.is_empty() {
+                let first = self
+                    .wal
+                    .copy(
+                        recs.iter()
+                            .map(|r| (r.meta.clone(), r.payload.clone()))
+                            .collect(),
+                    )
+                    .await?;
+                self.store.moved(
+                    recs.iter()
+                        .zip(first..)
+                        .map(|(r, lsn)| (r.lsn, lsn, &r.meta, r.payload.len() as u32)),
+                );
+                let bytes: usize = recs
+                    .iter()
+                    .map(|r| precog_storage::record::encoded_len(r.meta.key.len(), r.payload.len()))
+                    .sum();
+                self.copied_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+                self.copied_batches
+                    .fetch_add(recs.len() as u64, Ordering::Relaxed);
+            }
+        }
         Ok(())
     }
 
     /// Prometheus text exposition of `status()`.
     pub fn metrics(&self) -> String {
         let s = self.status();
-        let rows: [(&str, &str, u64); 11] = [
+        let w = &self.wal.stats;
+        let rows: [(&str, &str, u64); 14] = [
             ("precog_batches", "gauge", s.batches),
             ("precog_events", "gauge", s.events),
             ("precog_bytes", "gauge", s.bytes),
@@ -671,10 +919,31 @@ impl Node {
             ("precog_dedup_entries", "gauge", s.dedup_entries),
             ("precog_dedup_window_seconds", "gauge", s.dedup_window_s),
             ("precog_fatal", "gauge", self.is_fatal() as u64),
+            (
+                "precog_log_bytes",
+                "gauge",
+                w.log_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "precog_retention_copied_bytes_total",
+                "counter",
+                self.copied_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "precog_retention_copied_batches_total",
+                "counter",
+                self.copied_batches.load(Ordering::Relaxed),
+            ),
         ];
         let mut out = String::new();
         for (name, kind, v) in rows {
             out.push_str(&format!("# TYPE {name} {kind}\n{name} {v}\n"));
+        }
+        out.push_str("# TYPE precog_retention_forced_total counter\n");
+        for (stream, n) in self.forced.lock().iter() {
+            out.push_str(&format!(
+                "precog_retention_forced_total{{stream=\"{stream}\"}} {n}\n"
+            ));
         }
         // per reader group and stream: events not yet covered by its committed position, and how
         // long ago it committed (what kafka-exporter gives live-ingestion's alerts)
@@ -1493,16 +1762,24 @@ impl Node {
         else {
             bail!("no batch is held by a majority of {n} nodes");
         };
+        self.replace_with(theirs).await?;
+        tracing::warn!(
+            "{:?}: replaced bytes a majority does not hold with theirs",
+            ours.id
+        );
+        Ok(())
+    }
+
+    /// Logs `theirs` in place of the batch this node holds under its identity (other bytes over
+    /// the same range).
+    async fn replace_with(&self, theirs: &Batch) -> Result<()> {
+        let _g = self.clean.lock().await;
         anyhow::ensure!(
             self.store.replaceable(theirs),
             "the majority's batch has another range"
         );
         let lsn = self.wal.append_replacing(theirs.clone()).await?;
         self.store.replace(theirs, lsn);
-        tracing::warn!(
-            "{:?}: replaced bytes a majority does not hold with theirs",
-            ours.id
-        );
         Ok(())
     }
 
@@ -1594,6 +1871,659 @@ pub fn parse_frame_ack(f: &Frame) -> Result<Ack> {
 }
 
 #[cfg(test)]
+mod props_cleaner {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// batches of (stream, writer, payload bytes) appended in this order
+        Write(Vec<(usize, usize, usize)>),
+        /// a batch logged but not marked durable until the next `Retain`: absorption waits
+        Slow,
+        /// a held batch of (stream, writer, which) replaced by other bytes (a majority's)
+        Replace(usize, usize, prop::sample::Index),
+        Retain,
+        Reopen,
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                6 => prop::collection::vec((0usize..4, 0usize..2, 200usize..3000), 1..40)
+                    .prop_map(Op::Write),
+                1 => Just(Op::Slow),
+                1 => (0usize..4, 0usize..2, any::<prop::sample::Index>())
+                    .prop_map(|(s, w, i)| Op::Replace(s, w, i)),
+                3 => Just(Op::Retain),
+                1 => Just(Op::Reopen),
+            ],
+            1..16,
+        )
+    }
+
+    const STREAMS: [&str; 4] = ["low", "mid", "high", "bare"];
+
+    fn log(stream: usize, writer: usize) -> LogId {
+        LogId {
+            stream: STREAMS[stream].into(),
+            writer: ["w1", "w2"][writer].into(),
+            epoch: 1,
+        }
+    }
+
+    /// The stream's batches a cursor from its oldest (a seek to time 0) reads, per log, by
+    /// sequence. Not from an empty cursor: after a restart a log whose first batches went with
+    /// dropped segments starts at sequence 0 and reads as a gap there (as on main: the store's
+    /// trimmed floors are not kept on disk).
+    fn cursor(node: &Node, stream: &str) -> BTreeMap<LogId, Vec<u64>> {
+        let (mut c, mut out) = (
+            node.store.cursor_at(stream, 0),
+            BTreeMap::<LogId, Vec<u64>>::new(),
+        );
+        loop {
+            let (bs, next) = node.store.read_cursor(stream, &c, 16 << 10);
+            if bs.is_empty() {
+                return out;
+            }
+            for b in bs {
+                let b = Batch::parse(b).unwrap();
+                out.entry(b.id.log).or_default().push(b.id.first_seq);
+            }
+            c = next;
+        }
+    }
+
+    /// Why: the cleaner is what keeps each stream's own retention under the node cap. Whatever
+    /// the writes, passes, batches slow to be marked and restarts: after a pass the log is within
+    /// the cap, every stream holds the newest suffix of what was written to each of its logs
+    /// (no holes, each batch once and byte for byte), and a stream with a retention of its own
+    /// that the cap did not cut holds all of its retention.
+    fn run(caching: bool, ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 16 << 10;
+        let cap = 6 * (16 << 10);
+        c.retention_bytes = Some(cap);
+        if caching {
+            c.flush_delay_ms = 60_000;
+        }
+        let own = [20_000u64, 50_000];
+        for (s, m) in own.iter().enumerate() {
+            c.streams.insert(
+                STREAMS[s].into(),
+                StreamConfig {
+                    retention_bytes: Some(*m),
+                    ..Default::default()
+                },
+            );
+        }
+        c.streams.insert("bare".into(), Default::default());
+        rt.block_on(async {
+            let mut node = Node::open(c.clone()).await.unwrap();
+            // per stream, what was written in order: (log, seq, bytes)
+            let mut written: Vec<Vec<(LogId, u64, Bytes)>> = vec![vec![]; 4];
+            let mut next: BTreeMap<LogId, u64> = BTreeMap::new();
+            let mut slow: Option<(Batch, u64)> = None;
+            let mut slow_seq = 0;
+            let mut cut = std::collections::BTreeSet::new();
+            // logs with a replacement: its record is later than its neighbours' and so is its
+            // append time, so it may outlive them (ponytail: a replacement does not keep the
+            // batch's age); for those, only that what is served is what was written last
+            let mut replaced = std::collections::BTreeSet::new();
+            for op in ops {
+                let pass = match op {
+                    Op::Write(bs) => {
+                        for (s, w, size) in bs {
+                            let l = log(s, w);
+                            let seq = next.get(&l).copied().unwrap_or(0);
+                            next.insert(l.clone(), seq + 1);
+                            let b = Batch::encode(&l, seq, &[(seq, &vec![seq as u8; size][..])])
+                                .unwrap();
+                            let ack = node.append(1, b.clone()).await;
+                            prop_assert!(ack.is_success(), "{:?} {:?} {}", ack, l, seq);
+                            written[s].push((l, seq, b));
+                        }
+                        false
+                    }
+                    Op::Slow => {
+                        if slow.is_none() {
+                            let l = LogId {
+                                stream: "slow".into(),
+                                writer: "w".into(),
+                                epoch: 1,
+                            };
+                            let b = Batch::parse(
+                                Batch::encode(&l, slow_seq, &[(slow_seq, b"x")]).unwrap(),
+                            )
+                            .unwrap();
+                            slow_seq += 1;
+                            prop_assert!(matches!(node.store.reserve(&b), Reserve::New));
+                            let lsn = node.wal.append(b.clone()).await.unwrap();
+                            slow = Some((b, lsn));
+                        }
+                        false
+                    }
+                    Op::Replace(s, w, i) => {
+                        let l = log(s, w);
+                        let of: Vec<usize> = (0..written[s].len())
+                            .filter(|&j| written[s][j].0 == l)
+                            .collect();
+                        if !of.is_empty() {
+                            let j = of[i.index(of.len())];
+                            let (seq, old) = (written[s][j].1, written[s][j].2.len());
+                            // other bytes, as many of them
+                            let size =
+                                old - Batch::encode(&l, seq, &[(seq, &[][..])]).unwrap().len();
+                            let theirs =
+                                Batch::encode(&l, seq, &[(seq, &vec![!(seq as u8); size][..])])
+                                    .unwrap();
+                            if node
+                                .replace_with(&Batch::parse(theirs.clone()).unwrap())
+                                .await
+                                .is_ok()
+                            {
+                                written[s][j].2 = theirs;
+                                replaced.insert(l);
+                            }
+                        }
+                        false
+                    }
+                    Op::Retain => true,
+                    Op::Reopen => {
+                        slow = None; // logged: recovery finds it
+                        drop(node);
+                        node = Node::open(c.clone()).await.unwrap();
+                        true
+                    }
+                };
+                if !pass {
+                    continue;
+                }
+                let waiting = slow.is_some();
+                node.apply_retention().await.unwrap();
+                if let Some((b, lsn)) = slow.take() {
+                    node.store.mark_durable(&b, lsn);
+                    node.apply_retention().await.unwrap();
+                }
+                let bytes = node.wal.stats.log_bytes.load(Ordering::Relaxed);
+                // a segment waiting to be absorbed may keep the log over the cap for a pass
+                prop_assert!(waiting || bytes <= cap, "log {bytes} over the cap {cap}");
+                let metrics = node.metrics();
+                prop_assert!(metrics.contains("precog_retention_copied_batches_total"));
+                // (the metric starts again with the process)
+                cut.extend(node.forced.lock().keys().cloned());
+                for (s, w) in written.iter().enumerate() {
+                    let got = cursor(&node, STREAMS[s]);
+                    let (mut held, mut held_bytes) = (0, 0u64);
+                    let whole = !replaced.iter().any(|l: &LogId| l.stream == STREAMS[s]);
+                    for (l, seqs) in &got {
+                        if replaced.contains(l) {
+                            for &seq in seqs {
+                                let id = BatchId {
+                                    log: l.clone(),
+                                    first_seq: seq,
+                                };
+                                let x = w
+                                    .iter()
+                                    .find(|x| &x.0 == l && x.1 == seq)
+                                    .map(|x| x.2.clone());
+                                prop_assert_eq!(node.store.get(&id).map(|x| x.bytes), x);
+                            }
+                            continue;
+                        }
+                        let all = next[l];
+                        let first = all - seqs.len() as u64;
+                        prop_assert_eq!(
+                            seqs,
+                            &(first..all).collect::<Vec<_>>(),
+                            "{:?}: the newest, no hole",
+                            l
+                        );
+                        for (wl, seq, b) in w.iter().filter(|x| &x.0 == l && x.1 >= first) {
+                            let id = BatchId {
+                                log: wl.clone(),
+                                first_seq: *seq,
+                            };
+                            prop_assert_eq!(node.store.get(&id).map(|x| x.bytes), Some(b.clone()));
+                        }
+                        held += seqs.len();
+                        held_bytes += w
+                            .iter()
+                            .filter(|x| &x.0 == l && x.1 >= first)
+                            .map(|x| x.2.len() as u64)
+                            .sum::<u64>();
+                    }
+                    if !whole {
+                        continue;
+                    }
+                    prop_assert_eq!(
+                        node.store.read(STREAMS[s], 0, 1 << 20).0.len(),
+                        held,
+                        "once each"
+                    );
+                    if s < 2 {
+                        // within the stream's own retention, and (unless the cap ever cut it)
+                        // within one batch of it: it forgets oldest first only while over
+                        let total: u64 = w.iter().map(|x| x.2.len() as u64).sum();
+                        let most = w.iter().map(|x| x.2.len() as u64).max().unwrap_or(0);
+                        prop_assert!(
+                            held_bytes <= own[s].max(total.min(own[s])),
+                            "{} over its own",
+                            STREAMS[s]
+                        );
+                        if !cut.contains(STREAMS[s]) {
+                            if total <= own[s] {
+                                prop_assert_eq!(held, w.len(), "{} keeps all", STREAMS[s]);
+                            } else {
+                                prop_assert!(
+                                    held_bytes + most > own[s],
+                                    "{} keeps its own retention",
+                                    STREAMS[s]
+                                );
+                            }
+                        }
+                    }
+                }
+                for (s, w) in written.iter().enumerate() {
+                    // a live feed from the start: what it is served is what was written
+                    let (bs, _) = node.store.tail(0, Some(STREAMS[s]), 1 << 20);
+                    for b in bs {
+                        let x = w.iter().find(|x| x.0 == b.id.log && x.1 == b.id.first_seq);
+                        prop_assert_eq!(x.map(|x| &x.2), Some(&b.bytes), "{:?}", b.id);
+                    }
+                }
+                let (_, live) = node.store.live_start(None);
+                // (a log reading as a gap at its start after a restart joins at the gap, as above)
+                let whole: Vec<LogId> = node
+                    .store
+                    .frontiers(None)
+                    .into_iter()
+                    .filter(|f| f.contiguous == f.high)
+                    .map(|f| f.log)
+                    .collect();
+                for (l, n) in &next {
+                    if live.contains_key(l) && whole.contains(l) {
+                        prop_assert_eq!(live[l], *n, "a feed joins {:?} after its last batch", l);
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    enum Hurt {
+        /// batches of 1000 bytes appended to a stream
+        Write(usize, usize),
+        /// a sealed segment's index file cut short, or one byte of its records flipped
+        Damage(bool, prop::sample::Index, prop::sample::Index),
+        Retain,
+    }
+
+    /// Why: the cap protects the disk. Damage to sealed segments (a bad sector, a stray write)
+    /// makes reads of them fail; that must not stop the cap: every pass succeeds, the log stays
+    /// within the cap, and readers get errors or less, never a panic.
+    fn hurt(ops: Vec<Hurt>) -> Result<(), TestCaseError> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 16 << 10;
+        c.tail_cache_bytes = 0; // reads go to the disk
+        let cap = 6 * (16 << 10);
+        c.retention_bytes = Some(cap);
+        for (s, m) in [(0, 20_000u64), (1, 50_000)] {
+            c.streams.insert(
+                STREAMS[s].into(),
+                StreamConfig {
+                    retention_bytes: Some(m),
+                    ..Default::default()
+                },
+            );
+        }
+        rt.block_on(async {
+            let node = Node::open(c.clone()).await.unwrap();
+            let mut next = [0u64; 4];
+            let mut damaged: Vec<PathBuf> = vec![];
+            for op in ops {
+                match op {
+                    Hurt::Write(s, n) => {
+                        for _ in 0..n {
+                            let seq = next[s];
+                            next[s] += 1;
+                            let b =
+                                Batch::encode(&log(s, 0), seq, &[(seq, &[7u8; 1000][..])]).unwrap();
+                            let ack = node.append(1, b).await;
+                            prop_assert!(ack.is_success(), "{:?} fatal {}", ack, node.is_fatal());
+                        }
+                    }
+                    Hurt::Damage(index, file, at) => {
+                        let ext = if index { "idx" } else { "log" };
+                        let mut fs: Vec<_> = std::fs::read_dir(d.path().join("log"))
+                            .unwrap()
+                            .map(|e| e.unwrap().path())
+                            .filter(|p| p.extension().is_some_and(|x| x == ext))
+                            .collect();
+                        fs.sort();
+                        if !index {
+                            fs.pop(); // the active segment's: appends go on there
+                        }
+                        if fs.is_empty() {
+                            continue;
+                        }
+                        let p = &fs[file.index(fs.len())];
+                        damaged.push(p.clone());
+                        let f = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(p)
+                            .unwrap();
+                        let len = f.metadata().unwrap().len();
+                        if len == 0 {
+                            continue;
+                        }
+                        let off = at.index(len as usize) as u64;
+                        if index {
+                            // cut short: its reads fail (ponytail: an index file has no checksum
+                            // of its entries, so a flipped byte there reads as wrong entries)
+                            f.set_len(off).unwrap();
+                        } else {
+                            use std::os::unix::fs::FileExt;
+                            let mut b = [0u8];
+                            f.read_exact_at(&mut b, off).unwrap();
+                            f.write_all_at(&[!b[0]], off).unwrap();
+                        }
+                    }
+                    Hurt::Retain => {
+                        let r = node.apply_retention().await;
+                        prop_assert!(r.is_ok(), "a pass fails: {:?}", r);
+                        // a damaged segment can keep the cap from cutting what it holds until it
+                        // goes itself (the oldest go first): then the next pass is within it
+                        damaged.retain(|p| p.exists());
+                        if damaged.is_empty() {
+                            prop_assert!(node.apply_retention().await.is_ok());
+                            let bytes = node.wal.stats.log_bytes.load(Ordering::Relaxed);
+                            prop_assert!(bytes <= cap, "log {} over the cap {}", bytes, cap);
+                        }
+                    }
+                }
+                for s in STREAMS {
+                    let mut cur = node.store.cursor_at(s, 0);
+                    for _ in 0..64 {
+                        let (bs, n) = node.store.read_cursor(s, &cur, 16 << 10);
+                        if bs.is_empty() {
+                            break;
+                        }
+                        cur = n;
+                    }
+                    node.store.tail(0, Some(s), 1 << 20);
+                    node.store.read(s, 0, 1 << 20);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn the_cleaner_keeps_each_stream_s_retention_within_the_cap(caching: bool, ops in ops()) {
+            run(caching, ops)?;
+        }
+
+        #[test]
+        fn the_cap_holds_whatever_damage_sealed_segments_take(ops in prop::collection::vec(
+            prop_oneof![
+                // mostly streams the cleaner copies: damage then hits what it reads
+                3 => (0usize..2, 1usize..40).prop_map(|(s, n)| Hurt::Write(s, n)),
+                1 => (1usize..40).prop_map(|n| Hurt::Write(2, n)),
+                2 => (any::<bool>(), any::<prop::sample::Index>(), any::<prop::sample::Index>())
+                    .prop_map(|(i, f, a)| Hurt::Damage(i, f, a)),
+                3 => Just(Hurt::Retain),
+            ],
+            1..24,
+        )) {
+            hurt(ops)?;
+        }
+    }
+
+    proptest! {
+        /// Why: the node never exceeds its cap because of copying, so what it reserves for a
+        /// copy must cover what the copy adds: its records and a segment header for each group
+        /// (each may roll the log). Records of just over half a group are the worst case.
+        #[test]
+        fn what_a_copy_reserves_covers_its_records_and_a_header_per_group(
+            costs in prop::collection::vec(1u64..3000, 0..40), limit in 1000u64..4000,
+        ) {
+            let kept: Vec<Kept> = costs.iter().zip(0..).map(|(&cost, lsn)| Kept { lsn, time: 0, cost }).collect();
+            let gs = groups(&kept, limit);
+            prop_assert_eq!(gs.concat(), (0..kept.len() as u64).collect::<Vec<_>>(), "all, in order");
+            let size = |g: &Vec<u64>| g.iter().map(|&l| costs[l as usize]).sum::<u64>();
+            for g in &gs {
+                prop_assert!(g.len() == 1 || size(g) <= limit, "a group holds at most `limit`");
+            }
+            for w in gs.windows(2) {
+                let next = costs[w[1][0] as usize];
+                prop_assert!(size(&w[0]) + next > limit, "as few groups as fit: the next did not");
+            }
+            let cost: u64 = costs.iter().sum();
+            prop_assert!(copy_bytes(cost, limit) >= cost + precog_storage::SEG_HEADER * gs.len() as u64);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restart_does_not_bring_back_what_a_stream_s_retention_forgot() {
+        // Why: a copy forward puts a stream's older batches in a newer segment than its next
+        // ones. When its own retention then forgets both and the cap drops the older segment,
+        // only the copies are left on disk. Unless the stream's retention floor survives a
+        // restart, they come back below a hole, and a reader from the stream's start stops there.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 64 << 10;
+        c.retention_bytes = Some(4 * (64 << 10));
+        let at = |stream: &str, seq: u64| {
+            let log = LogId {
+                stream: stream.into(),
+                writer: "w".into(),
+                epoch: 1,
+            };
+            Batch::encode(&log, seq, &[(seq, &[1u8; 1000][..])]).unwrap()
+        };
+        let one = at("low", 0).len() as u64;
+        c.streams.insert(
+            "low".into(),
+            StreamConfig {
+                retention_bytes: Some(10 * one),
+                ..Default::default()
+            },
+        );
+        let node = Node::open(c.clone()).await.unwrap();
+        let mut hs = 0..;
+        let mut low = 0..;
+        let mut write = async |stream: &str, n: usize| {
+            for _ in 0..n {
+                let seq = if stream == "low" {
+                    low.next()
+                } else {
+                    hs.next()
+                }
+                .unwrap();
+                assert!(node.append(1, at(stream, seq)).await.is_success());
+            }
+        };
+        write("low", 5).await;
+        write("high", 70).await; // low 0..5 in the oldest segment
+        write("low", 5).await;
+        write("high", 150).await;
+        node.apply_retention().await.unwrap(); // copies low 0..5 forward, past low 5..10
+        write("low", 8).await;
+        for _ in 0..2 {
+            write("high", 60).await;
+            // low forgets 0..8; the cap drops the segment of 5..10 (copying 8 and 9)
+            node.apply_retention().await.unwrap();
+        }
+        let read = |node: &Node| {
+            let (mut c, mut seqs) = (node.store.cursor_at("low", 0), vec![]);
+            loop {
+                let (bs, next) = node.store.read_cursor("low", &c, 1 << 20);
+                if bs.is_empty() {
+                    return seqs;
+                }
+                seqs.extend(
+                    bs.into_iter()
+                        .map(|b| Batch::parse(b).unwrap().id.first_seq),
+                );
+                c = next;
+            }
+        };
+        assert_eq!(read(&node), (8..18).collect::<Vec<_>>());
+        drop(node);
+        let node = Node::open(c).await.unwrap();
+        assert_eq!(read(&node), (8..18).collect::<Vec<_>>(), "after a restart");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_replaced_after_the_cleaner_picked_it_is_not_copied() {
+        // Why: a replacement can land between the cleaner picking a batch and copying it. A copy
+        // of the superseded bytes logged after the replacement would conflict with it on disk:
+        // the next start refuses the log. The copy must take only what is still retained.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 64 << 10;
+        c.retention_bytes = Some(4 * (64 << 10));
+        c.streams.insert(
+            "low".into(),
+            StreamConfig {
+                retention_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+        );
+        let node = Node::open(c.clone()).await.unwrap();
+        let log = |stream: &str| LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let at = |stream: &str, seq: u64, v: u8| {
+            Batch::encode(&log(stream), seq, &[(seq, &[v; 1000][..])]).unwrap()
+        };
+        for seq in 0..5 {
+            assert!(node.append(1, at("low", seq, 1)).await.is_success());
+        }
+        for seq in 0..300 {
+            assert!(node.append(1, at("high", seq, 1)).await.is_success());
+        }
+        node.store.absorb();
+        let base = node.wal.retirable(None, None).0[0].base;
+        let keep = node.store.retained(&[base], |s| node.retains(s), 0);
+        assert!(!keep.is_empty());
+        let theirs = Batch::parse(at("low", 0, 2)).unwrap();
+        node.replace_with(&theirs).await.unwrap();
+        node.copy_forward(keep).await.unwrap();
+        let id = BatchId {
+            log: log("low"),
+            first_seq: 0,
+        };
+        assert_eq!(
+            node.store.get(&id).map(|b| b.bytes),
+            Some(theirs.bytes.clone())
+        );
+        drop(node);
+        let node = Node::open(c).await.expect("the log reopens");
+        assert_eq!(node.store.get(&id).map(|b| b.bytes), Some(theirs.bytes));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_segment_waiting_to_be_absorbed_does_not_force_a_cut() {
+        // Why: the cleaner drops only absorbed segments; a sealed one holding a batch not marked
+        // durable yet waits a pass. Its bytes are not what streams retain: counting them against
+        // the copies' room cut a stream within its retention, the loss the cleaner prevents.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 64 << 10;
+        let cap = 4 * (64 << 10);
+        c.retention_bytes = Some(cap);
+        c.streams.insert(
+            "low".into(),
+            StreamConfig {
+                retention_bytes: Some(1 << 20),
+                ..Default::default()
+            },
+        );
+        let node = Node::open(c).await.unwrap();
+        let at = |stream: &str, seq: u64| {
+            let log = LogId {
+                stream: stream.into(),
+                writer: "w".into(),
+                epoch: 1,
+            };
+            Batch::encode(&log, seq, &[(seq, &[1u8; 1000][..])]).unwrap()
+        };
+        for seq in 0..20 {
+            assert!(node.append(1, at("low", seq)).await.is_success());
+        }
+        for seq in 0..150 {
+            assert!(node.append(1, at("high", seq)).await.is_success());
+        }
+        // written to the log, not marked durable yet: absorption waits for it
+        let slow = Batch::parse(at("slow", 0)).unwrap();
+        assert!(matches!(node.store.reserve(&slow), Reserve::New));
+        let lsn = node.wal.append(slow.clone()).await.unwrap();
+        for seq in 150..450 {
+            assert!(node.append(1, at("high", seq)).await.is_success());
+        }
+        node.apply_retention().await.unwrap();
+        assert!(node.forced.lock().is_empty(), "{:?}", node.forced.lock());
+        node.store.mark_durable(&slow, lsn);
+        node.apply_retention().await.unwrap();
+        assert!(node.forced.lock().is_empty(), "{:?}", node.forced.lock());
+        assert!(node.wal.stats.log_bytes.load(Ordering::Relaxed) <= cap);
+        for seq in 0..20 {
+            let id = BatchId {
+                log: LogId {
+                    stream: "low".into(),
+                    writer: "w".into(),
+                    epoch: 1,
+                },
+                first_seq: seq,
+            };
+            assert!(node.store.get(&id).is_some(), "low {seq}");
+        }
+    }
+
+    #[test]
+    fn copies_of_just_over_half_a_group_each_take_a_group_and_the_reserve_holds() {
+        let kept: Vec<Kept> = (0..10)
+            .map(|lsn| Kept {
+                lsn,
+                time: 0,
+                cost: 501,
+            })
+            .collect();
+        assert_eq!(groups(&kept, 1000).len(), 10);
+        assert_eq!(
+            copy_bytes(5010, 1000),
+            5010 + precog_storage::SEG_HEADER * 11
+        );
+        assert_eq!(copy_bytes(0, 1000), 0, "nothing to copy reserves nothing");
+        assert_eq!(copy_bytes(1, 1000), 1 + precog_storage::SEG_HEADER);
+        // a copy fits exactly when the room is what it reserves
+        assert!(fits(1, 1000, 1 + precog_storage::SEG_HEADER));
+        assert!(!fits(1, 1000, precog_storage::SEG_HEADER));
+    }
+}
+
+#[cfg(test)]
 mod snapshot_tests {
     use super::*;
 
@@ -1638,6 +2568,30 @@ mod props {
     use proptest::prelude::*;
 
     proptest! {
+        /// The streams' retention floors (read at every start) round-trip, and any bytes under a
+        /// matching checksum decode or are refused, never a panic.
+        #[test]
+        fn retention_floors_round_trip_and_damaged_ones_are_refused(
+            m in prop::collection::btree_map("[a-z0-9_-]{0,8}", any::<(u64, u64, u64)>(), 0..5),
+            at in any::<prop::sample::Index>(), v: u8, cut in any::<prop::sample::Index>(),
+        ) {
+            let b = encode_floors(&m);
+            prop_assert_eq!(decode_floors(&b).unwrap(), m);
+            prop_assert!(decode_floors(&b[..b.len() - 1]).is_err(), "a short file");
+            let mut more = b[..b.len() - 4].to_vec();
+            more.push(0);
+            let c = crc32c::crc32c(&more);
+            more.extend_from_slice(&c.to_le_bytes());
+            prop_assert!(decode_floors(&more).is_err(), "bytes past its entries");
+            let mut body = b[..b.len() - 4].to_vec();
+            let i = at.index(body.len());
+            body[i] = v;
+            body.truncate(cut.index(body.len() + 1));
+            let c = crc32c::crc32c(&body);
+            body.extend_from_slice(&c.to_le_bytes());
+            let _ = decode_floors(&body);
+        }
+
         /// A compacted-stream snapshot (read at every start) round-trips, and any bytes under a
         /// matching checksum decode or are refused, never a panic.
         #[test]

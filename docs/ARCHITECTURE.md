@@ -59,7 +59,7 @@ whether it fits its pod. `crates/mesh/tests/memory.rs` measures it and fails pas
 | Kept in RAM | Why |
 |---|---|
 | Per writer log: its id (once, interned), `trimmed`, `contiguous`, `high`, and per sealed segment holding its batches their sequence range | Frontiers, repair and `Expired` answer from these alone; the ranges say which segment indexes a lookup must read |
-| Per stream: its logs, its own retention floor, and per sealed segment its bytes, batches, events and newest append time | Per-stream retention (bytes and age) and the totals without reading the log |
+| Per stream: its logs, its own retention floor, and per sealed segment its bytes, batches, events, newest append time and (a lower bound of) its oldest | Per-stream retention (bytes and age, oldest first) and the totals without reading the log |
 | Batches of the active segment, pending batches and their waiters | Appends, duplicate checks of recent retries and live subscribers touch only these |
 | The segment log's index of the active segment | Appends and the tail |
 
@@ -78,6 +78,76 @@ Measured (`tests/memory.rs`, 200k batches, heap per retained batch): 1092 B befo
 layout, 338 B with interned logs and waiters only while pending, 6 B with sealed segments on
 disk. The active segment's batches still cost ~340 B each: with 1 GiB segments and 2 KiB
 batches that is ~170 MB, independent of retention.
+
+## The segment cleaner: each stream keeps its own retention
+
+A node keeps every stream in one segment log, and its byte cap (`retention_bytes`) drops the
+oldest sealed segments. Without more, a stream far below its own budget (topicsync's
+`retention.bytes` / `retention.ms`, `StreamConfig`) loses its history at the node's time horizon
+(cap / total ingest rate), which high-volume streams set. A Redpanda topic keeps its own
+retention whatever the others write. So before the node drops segments, it copies forward what
+streams still retain in them (`Node::apply_retention`):
+
+1. Each stream's own retention runs first: it forgets the stream's oldest batches, oldest first
+   by (append time, sequence, LSN), logically (`Store::trim_stream`).
+2. The node takes the segments its cap (and age limit) drops, absorbed ones only, and as many
+   more as the copies need room for: after the copy and the drop the log is within the cap.
+3. What a stream with a retention of its own still retains in those segments is copied: read
+   from the old segment, appended at the head as it was (`Wal::copy`: key, sequence range,
+   checksum, append time and payload unchanged, so only the LSN changes), in groups of at most
+   4 MiB, each its own write to the log. Appends go on between the groups.
+4. The store takes each copy in place of its batch (`Store::moved`): the old record is never
+   served again, and the copy is in RAM until its segment is sealed and absorbed.
+5. The node syncs the log (write caching: the copies were not synced yet) and only then drops
+   the segments, and the store forgets what went with them.
+
+Streams without a retention of their own keep what the node cap leaves, as before. A compacted
+stream is not copied: it keeps its newest value per key in its snapshot, as before. The node's
+age limit (`retention_ms`) stays a ceiling: nothing older is copied.
+
+**Identity.** A copy is the same batch: identity `(stream, writer, epoch, first_seq)`, bytes and
+append time. Cursors, `read_cursor`, `cursor_at`, the event-time read, `has`/`get`, frontiers and
+repair key on identity and sequence and answer as before (`store::tests::a_batch_copied_forward_answers_every_query_as_before`).
+Peers see the same frontiers and bytes, so repair fetches nothing. A live feed drops a batch below
+its log's next sequence, so it never pushes a copy again; a replay delivers each batch once
+(`a_batch_copied_forward_is_not_new_to_feeds_or_peers`). A stream trims oldest first by append
+time, which a copy keeps, so a copy does not outlive the batches logged after it. Append times
+never go back (the WAL stamps the later of now and the newest time it gave, seeded from the log),
+so a clock stepped back does not put a new batch below a stream's trim floor. A cursor read
+holds a log's batches that a copy put ahead of their predecessor, and a seek by time takes each
+log's lowest sequence logged at or after the time.
+
+**Crash safety.** The old record stays until the copy is on stable storage: the copy is appended
+through the log like any group (fsynced, or under write caching synced before the drop), and the
+segment is dropped only after that. A crash before the sync leaves the old record (and maybe the
+copy); one after the manifest names the drop leaves the copy. Recovery keeps the first of two
+records of one identity with the same checksum, so a batch logged twice is kept once, and the
+next pass copies it again and drops the old segment. What a stream's own retention forgot stays
+forgotten across a restart: a copy of it can outlive the segments of its next batches, so each
+stream's floor (append time, sequence, LSN) is written to `<data_dir>/floors` (format `PCF1`,
+CRC-32C; a temporary file, fsynced, renamed, then the directory) before a pass drops segments,
+and restored when the node opens (`a_restart_does_not_bring_back_what_a_stream_s_retention_forgot`). Tests: `a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`
+(storage failpoints at the copy's fsync, the sync before the drop, before and after the manifest
+write).
+
+**Bounds.** Copying never takes the log past the cap: the node drops as many segments as the
+copies need room for (a group's bytes plus a segment header per group, at most). If what streams
+retain exceeds the cap, the cap wins: it cuts the oldest batches of the stream furthest over its
+share (the cap divided equally among the streams with a retention of their own: the one retaining
+the most bytes, down to the next one, then both), counted in
+`precog_retention_forced_total{stream}`. A sealed segment not absorbed yet (it holds a batch not
+marked durable yet) waits a pass; its bytes take no room from the copies, so the log can be over
+the cap by them for that pass, but nothing retained is cut for them. A retained record that does
+not read back (a checksum failure) goes with its segment, logged, as before copying: the pass
+goes on and the cap keeps dropping. Copy volume per pass is at most what streams retain in
+the dropped segments, written in groups of at most 4 MiB, so no write holds the log longer than
+an ordinary group. Steady state, a retained batch is copied once per turnover of the log: copy
+volume is about what streams retain beyond the newest segments per cap's worth written. Metrics:
+`precog_retention_copied_bytes_total`, `precog_retention_copied_batches_total`,
+`precog_log_bytes`.
+
+RAM: the copies of a pass stay in RAM as the active segment's batches do, until absorbed; the
+old records' LSNs are held until their segment is dropped (the same pass).
 
 ## Guarantees (and what is traded away)
 
@@ -109,9 +179,11 @@ What Iggy's VSR provides and the mesh deliberately does not:
 
 ## Not implemented (POC limits)
 
-* Data is also held in RAM. There is no segment engine, retention, compaction or
-  erasure-coded cold tier. The production plan keeps the WAL as the only
-  synchronous write and builds segments and indexes off the ack path.
+* Storage is one segment log per node (`crates/storage`): segments, index files, a
+  manifest, recovery, the node cap and each stream's own retention (the segment cleaner
+  above). A compacted stream keeps each key's newest value in a snapshot; segments are not
+  rewritten by key. There is no cold tier (erasure-coded or object store): a node keeps what
+  it retains on its own disk.
 * Placement is static: every node targets 3 copies, chosen as the first peer per
   distinct domain. There is no controller, membership changes, rebalancing or
   rack/zone awareness beyond labels.

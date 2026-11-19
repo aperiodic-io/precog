@@ -18,6 +18,7 @@ property or model test runs (below).
 | The segment log's read APIs through appends, rolls, retention, lost index files and reopens | proptest, model-based | The code against a list of records, after every step | `model` in `crates/storage/tests/log.rs` |
 | The store's identity and frontier rules | proptest, model-based | | `store::model` |
 | The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
+| The segment cleaner: each stream's own retention under the node cap, through slow batches and restarts | proptest | After every pass: the log within the cap, every log the newest suffix of what was written to it (no hole, once, byte for byte), a stream within its own retention (and within one batch of it unless the cap cut it) | `node::props_cleaner` |
 | The dedup window and its cap | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
 
@@ -262,6 +263,7 @@ structural checks, never panics `parse`, and a batch `parse` accepts is walked b
 (`keys`, `try_events`, `keyed`, `without`, each `expect`ing what `parse` validated) without a
 panic; arbitrary bytes under a matching CRC behind each magic never panic; acks, append and
 replicate bodies and log keys round-trip and any bytes decode or are refused.
+`node::props`: the streams' retention floors (PCF1) round-trip and damaged ones are refused.
 `node::props`: compacted-stream snapshots round-trip and damaged ones (CRC recomputed) are
 refused. No bug found.
 
@@ -412,6 +414,15 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   checks the store, the documented no-lost-wakeup pattern) and re-reads the store from its
   position on every wake-up; Loom does not model tokio's primitives, and the model above covers
   what the feed computes from the store, at every interleaving of appends with it.
+- **The segment cleaner in TLA+** (#28: copy forward, drop, a replacement in between, a crash
+  anywhere). Its steps run on one task and the WAL thread; the only concurrent writer of the
+  batches it moves is a replacement, and the two are serialised by `Node::clean`, with each
+  copy group re-checking what is still retained under it. What it must keep is checked at the
+  code instead: `node::props_cleaner` (writes, slow batches, replacements, passes, restarts,
+  damaged segments), the failpoint test at every step between copy and drop
+  (`a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`) and
+  `props_majority` in `crates/mesh/tests/cluster.rs`. A model of copy, replacement and crash
+  interleavings is the next extension of `SegmentLog.tla`.
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.
