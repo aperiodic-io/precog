@@ -92,7 +92,7 @@ The plan's gap table (§2) lists them feature by feature.
    stream resident and restarts in 8.9 s. s2-lite holds 44 MiB after a restart, because it loads
    streams lazily.
 5. **Unit economics** ([`S2 bare-metal economics.md`](S2%20bare-metal%20economics.md)). On
-   Hetzner a GiB costs Precog about $0.003 written, under $0.001 read and $0.007 stored-month,
+   Hetzner a GiB costs Precog about $0.003 written, under $0.001 read and $0.003 stored-month (HDD boxes with erasure coding; ~$0.007 on object storage),
    against s2.dev's $0.05 each. The edge needs free internal traffic, which AWS does not offer:
    there, inter-AZ copies alone cost ~$0.048/GiB written.
 

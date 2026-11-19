@@ -25,7 +25,8 @@ workspace).
 3. **Object storage should be a tier, not the ack path, by default.** Local-disk quorum acks are
    26x faster at p50 than s2-lite on S3 at its default flush (1.98 against 51.2 ms at 10k records/s; 3x against a 5 ms flush), and they don't pay per-PUT
    charges, which force object-storage WALs to batch across streams. Long retention, though, is
-   where S2's design wins on cost: $0.023/GB-month on S3, against ~$0.24 for three gp3 copies.
+   where S2's design wins on AWS: $0.023/GB-month on S3, against ~$0.24 for three gp3 copies. On
+   rented HDD boxes with erasure coding the tier costs ~$3/TB-month (`reports/S2 cold storage.md`).
    Recommendation: tier sealed segments to S3 (M8 already plans a cold tier). Offer an opt-in
    "standard" class that acks after a PUT, for users who want S2's no-local-state property. The
    POC's S3 group commit acks at 4.5 ms p50 on local Silo.
@@ -39,7 +40,7 @@ workspace).
 
 6. **Unit economics on bare metal (asked for; `reports/S2 bare-metal economics.md`).** On
    Hetzner, a GiB written costs Precog about $0.003, a GiB read under $0.001 and a GiB-month
-   stored about $0.007, against s2.dev's list of $0.05 each. The reasons are free internal
+   stored about $0.003 (HDD boxes, erasure coded; ~$0.007 on object storage), against s2.dev's list of $0.05 each. The reasons are free internal
    traffic and cheap NVMe and HDD capacity. Priced at about half of s2.dev on bytes, the gross
    margin is 71–98% per line. Two things stand in the way. A stream costs more than s2.dev charges
    until dormant streams leave RAM (C7). And the fixed floor (a minimal fleet plus on-call staff)
@@ -207,7 +208,7 @@ a Porcupine-style linearizability check of owned streams against the gateway.
 |---|---|---|
 | Write latency | Express ≤ 40 ms, Standard ≤ 400 ms (SLO); s2-lite on Silo 51 ms p50 at its default 50 ms flush, 6.2 ms at 5 ms (10k records/s) | 1.98 ms p50, 5.0 ms p99 for 2-of-3 through the same gateway and client (10k records/s) |
 | Durability domain | multi-AZ object storage (11 nines) | k nodes in distinct failure domains; losing k disks loses data |
-| Cost per GB stored | S2 list price $0.05/GiB-month (S3 raw ~$0.023) | AWS: 3 × gp3 ≈ $0.24/GB-month. Hetzner: ~$0.007/GiB-month on erasure-coded SX295 HDDs or Hetzner Object Storage |
+| Cost per GB stored | S2 list price $0.05/GiB-month (S3 raw ~$0.023) | AWS: 3 × gp3 ≈ $0.24/GB-month. Hetzner: ~$0.003/GiB-month on SX65 HDD boxes, erasure coded 3+2; ~$0.007 on Hetzner Object Storage, iDrive e2 or B2 (`reports/S2 cold storage.md`) |
 | Cost per GB written | $0.05–0.075/GiB list; S3 PUTs amortized across streams | AWS: ~$0.048/GiB, almost all inter-AZ copies. Hetzner: ~$0.003/GiB (internal traffic free) |
 | Request cost | PUT-bound: 200 PUT/s per writer node ≈ $2,600/month on S3 Standard at $0.005/1000 | none |
 | Stream count | unlimited; dormant streams cost metadata only | bounded by RAM per node (3.8 GiB per million streams per node, all resident) |
