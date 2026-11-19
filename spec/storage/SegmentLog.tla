@@ -23,7 +23,9 @@ CONSTANTS
                    \* 2 * flush_bytes + MAX_GROUP), in slots
     Fixed,         \* recovery uses Bound under write caching (the fix); FALSE: the old scan
     MediaFaults,   \* allow damage to persisted records
-    MaxCrashes
+    MaxCrashes,
+    SyncFaults,    \* allow an fsync to fail (EIO)
+    FsyncFatal     \* a failed fsync refuses all further writes (Error::Fatal); FALSE: retry it
 
 Slots == 0 .. N - 1
 Gen == 1                       \* the segment's generation; stale records carry 0
@@ -51,10 +53,12 @@ VARIABLES
     failed,    \* recovery refused to open (fail closed)
     damaged,   \* a media fault hit a persisted record
     crashes,
-    flushTo    \* the end an outstanding deferred flush covers (-1: none)
+    flushTo,   \* the end an outstanding deferred flush covers (-1: none)
+    fatal,     \* an fsync failed: the log refuses writes until a restart recovers it
+    syncFails  \* fsync failures so far
 
 vars == <<disk, mem, dirty, end, synced, acked, last, newest, forgiven, hist, nextId, up, failed,
-          damaged, crashes, flushTo>>
+          damaged, crashes, flushTo, fatal, syncFails>>
 
 Valid(c, i) == c.k = "rec" /\ c.lsn = i      \* decodes, and is LSN i
 WrittenAt(c) == c.k \in {"rec", "torn"}      \* `Window::written_at`: this generation's magic
@@ -76,6 +80,8 @@ Init ==
     /\ damaged = FALSE
     /\ crashes = 0
     /\ flushTo = -1
+    /\ fatal = FALSE
+    /\ syncFails = 0
 
 \* `Log::append`: one pwrite of the whole group at the end. Without write caching the
 \* group is acked only after its fsync (Sync), and the next group waits for that
@@ -84,7 +90,7 @@ Init ==
 \* (BeginFlush, EndFlush), and once unsynced plus in-flight bytes reach twice
 \* flush_bytes the next append first syncs inline (Sync).
 Write(n) ==
-    /\ up
+    /\ up /\ ~fatal
     /\ end + n <= N
     /\ ~WriteCaching => synced = end
     /\ WriteCaching => end - synced < 2 * FlushSlots
@@ -98,38 +104,38 @@ Write(n) ==
           /\ newest' = IF WriteCaching THEN {id(i) : i \in new} ELSE newest
     /\ end' = end + n
     /\ nextId' = nextId + n
-    /\ UNCHANGED <<disk, synced, up, failed, damaged, crashes, forgiven, flushTo>>
+    /\ UNCHANGED <<disk, synced, up, failed, damaged, crashes, forgiven, flushTo, fatal, syncFails>>
 
 \* fdatasync of the active segment (per group, deferred, or at a roll); without write
 \* caching the group it covers is acknowledged now.
 Sync ==
-    /\ up
+    /\ up /\ ~fatal
     /\ synced < end
     /\ disk' = [i \in Slots |-> IF i \in dirty THEN mem[i] ELSE disk[i]]
     /\ dirty' = {}
     /\ synced' = end
     /\ acked' = IF WriteCaching THEN acked ELSE acked \cup last
     /\ newest' = IF WriteCaching THEN newest ELSE last
-    /\ UNCHANGED <<mem, end, last, forgiven, hist, nextId, up, failed, damaged, crashes, flushTo>>
+    /\ UNCHANGED <<mem, end, last, forgiven, hist, nextId, up, failed, damaged, crashes, flushTo, fatal, syncFails>>
 
 \* `Log::begin_flush`: a deferred flush takes what is written so far; `Flush::sync`
 \* then fsyncs outside the lock while appends go on, and `Log::end_flush` records it.
 BeginFlush ==
-    /\ up /\ WriteCaching
+    /\ up /\ ~fatal /\ WriteCaching
     /\ flushTo = -1
     /\ synced < end
     /\ flushTo' = end
     /\ UNCHANGED <<disk, mem, dirty, end, synced, acked, last, newest, forgiven, hist, nextId, up,
-                   failed, damaged, crashes>>
+                   failed, damaged, crashes, fatal, syncFails>>
 
 EndFlush ==
-    /\ up
+    /\ up /\ ~fatal
     /\ flushTo >= 0
     /\ disk' = [i \in Slots |-> IF i \in dirty /\ i < flushTo THEN mem[i] ELSE disk[i]]
     /\ dirty' = {i \in dirty : i >= flushTo}
     /\ synced' = IF flushTo > synced THEN flushTo ELSE synced
     /\ flushTo' = -1
-    /\ UNCHANGED <<mem, end, acked, last, newest, forgiven, hist, nextId, up, failed, damaged, crashes>>
+    /\ UNCHANGED <<mem, end, acked, last, newest, forgiven, hist, nextId, up, failed, damaged, crashes, fatal, syncFails>>
 
 \* The kernel writes one dirty page back, in any order.
 Writeback(i) ==
@@ -137,7 +143,7 @@ Writeback(i) ==
     /\ i \in dirty
     /\ disk' = [disk EXCEPT ![i] = mem[i]]
     /\ dirty' = dirty \ {i}
-    /\ UNCHANGED <<mem, end, synced, acked, last, newest, forgiven, hist, nextId, up, failed, damaged, crashes, flushTo>>
+    /\ UNCHANGED <<mem, end, synced, acked, last, newest, forgiven, hist, nextId, up, failed, damaged, crashes, flushTo, fatal, syncFails>>
 
 \* Power loss: each slot still dirty reaches disk whole, torn, or not at all.
 Crash ==
@@ -153,7 +159,7 @@ Crash ==
     /\ up' = FALSE
     /\ crashes' = crashes + 1
     /\ flushTo' = -1
-    /\ UNCHANGED <<mem, end, synced, acked, last, newest, forgiven, hist, nextId, failed, damaged>>
+    /\ UNCHANGED <<mem, end, synced, acked, last, newest, forgiven, hist, nextId, failed, damaged, fatal, syncFails>>
 
 \* A persisted record goes bad on the medium.
 Damage(i) ==
@@ -164,7 +170,25 @@ Damage(i) ==
     /\ disk' = [disk EXCEPT ![i] = Torn]
     /\ mem' = [mem EXCEPT ![i] = Torn]
     /\ damaged' = TRUE
-    /\ UNCHANGED <<dirty, end, synced, acked, last, newest, forgiven, hist, nextId, up, failed, crashes, flushTo>>
+    /\ UNCHANGED <<dirty, end, synced, acked, last, newest, forgiven, hist, nextId, up, failed, crashes, flushTo, fatal, syncFails>>
+
+\* An fsync (inline or deferred) fails. Linux may drop the dirty pages it could not write
+\* and mark them clean: each reaches disk or is lost, and a later fsync reports success
+\* without them. With FsyncFatal the log refuses everything until a restart recovers it;
+\* nothing it covered was acknowledged on its fsync.
+SyncFail ==
+    /\ SyncFaults
+    /\ up /\ ~fatal
+    /\ syncFails < 1
+    /\ dirty # {}
+    /\ \E w \in SUBSET dirty :
+          disk' = [i \in Slots |-> IF i \in w THEN mem[i] ELSE disk[i]]
+    /\ dirty' = {}
+    /\ fatal' = FsyncFatal
+    /\ syncFails' = syncFails + 1
+    /\ flushTo' = -1
+    /\ UNCHANGED <<mem, end, synced, acked, last, newest, forgiven, hist, nextId, up, failed,
+                   damaged, crashes>>
 
 -----------------------------------------------------------------------------
 (* Recovery: `scan(file, generation, base, None)` on the active segment.   *)
@@ -206,11 +230,12 @@ Recover ==
                /\ up' = TRUE
                /\ forgiven' = forgiven \cup newest
                /\ UNCHANGED failed
-    /\ UNCHANGED <<dirty, acked, last, newest, hist, nextId, damaged, crashes, flushTo>>
+    /\ fatal' = FALSE
+    /\ UNCHANGED <<dirty, acked, last, newest, hist, nextId, damaged, crashes, flushTo, syncFails>>
 
 Next ==
     \/ \E n \in 1 .. MaxGroup : Write(n)
-    \/ Sync \/ BeginFlush \/ EndFlush
+    \/ Sync \/ BeginFlush \/ EndFlush \/ SyncFail
     \/ \E i \in Slots : Writeback(i) \/ Damage(i)
     \/ Crash
     \/ Recover
