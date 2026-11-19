@@ -1792,6 +1792,30 @@ mod tests {
     }
 
     #[test]
+    fn a_seek_finds_a_batch_logged_at_exactly_the_time_asked() {
+        // Why: a seek skips an absorbed segment whose newest batch is older than the time asked;
+        // a batch logged at exactly that time (its segment's newest) is where the cursor starts
+        let mut t = store_with(TINY);
+        let xs: Vec<Batch> = (0..8).map(|i| on("s", "w", i)).collect();
+        for (i, x) in xs.iter().enumerate() {
+            let m = Meta {
+                key: encode_log_key(&x.id.log),
+                first_seq: x.id.first_seq,
+                count: 1,
+                tag: batch_crc(&x.bytes),
+                time_ms: 1000 * (i as u64 + 1),
+            };
+            t.log.append(&[(m, &x.bytes[..])]).unwrap();
+        }
+        let s = t.reload().unwrap();
+        assert!(s.inner.lock().order.len() < xs.len(), "mostly absorbed");
+        for (i, x) in xs.iter().enumerate() {
+            let c = s.cursor_at("s", 1000 * (i as u64 + 1));
+            assert_eq!(c[&x.id.log], x.id.first_seq, "seek to batch {i}'s time");
+        }
+    }
+
+    #[test]
     fn trim_keeps_totals_and_the_boundary_batch_exact() {
         let mut t = store();
         let xs: Vec<Batch> = (0..6).map(|i| b("w", 1, i, &[(i, b"xyz")])).collect();
