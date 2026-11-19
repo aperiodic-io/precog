@@ -2068,18 +2068,36 @@ mod proofs {
         let _ = Manifest::decode(&b[..n]);
     }
 
-    /// An index file never panics the decoder, whatever its bytes and length (up to one entry
-    /// with an 8-byte key, or two with empty keys), and an accepted one has exactly the entries
-    /// it declares.
+    /// A version-2 index file of `N` bytes, at most `k` keys declared, never panics the decoder,
+    /// and an accepted one declares what it holds and its key runs cover its by-key section:
+    /// what `DiskIdx::read` and `Reader::by_key` index by (key order: the unit tests).
+    fn index_decodes<const N: usize>(k: u32) {
+        let b: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= b.len());
+        kani::assume(u32_at(&b, 36) <= k);
+        if let Some((n, keys)) = decode_index(&b[..len], kani::any(), kani::any(), kani::any()) {
+            assert_eq!(n, u32_at(&b, 32));
+            assert_eq!(keys.len(), u32_at(&b, 36) as usize);
+            // the runs cover the by-key section: the first starts at 0, together they hold n
+            assert!(keys.first().is_none_or(|k| k.1 == 0));
+            assert_eq!(keys.iter().map(|k| k.2).sum::<u32>(), n);
+        }
+    }
+
+    /// No records, up to two keys of up to 2 bytes.
     #[kani::proof]
     #[kani::stub(crc32c::crc32c, crc)]
     #[kani::unwind(3)]
-    fn index_decode_never_panics() {
-        let b: [u8; 36 + 2 * 38 + 4] = kani::any();
-        let n: usize = kani::any();
-        kani::assume(n <= b.len());
-        if let Some(v) = decode_index(&b[..n], kani::any(), kani::any(), kani::any()) {
-            assert_eq!(v.len(), u32_at(&b, 32) as usize);
-        }
+    fn index_decode_two_keys() {
+        index_decodes::<{ IDX_HEADER + 2 * (10 + 2) + 4 }>(2);
+    }
+
+    /// Up to one record in both sections and one key of up to 4 bytes: its run covers it.
+    #[kani::proof]
+    #[kani::stub(crc32c::crc32c, crc)]
+    #[kani::unwind(3)]
+    fn index_decode_covers_records() {
+        index_decodes::<{ IDX_HEADER + 2 * IDX_ENTRY + 10 + 4 + 4 }>(1);
     }
 }
