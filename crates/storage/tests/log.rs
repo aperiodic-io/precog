@@ -1916,3 +1916,33 @@ fn an_index_file_of_the_old_format_is_rebuilt() {
     let base = log.reader().sealed()[0].0;
     assert_eq!(log.reader().by_key(base, b"log-1").unwrap()[0].lsn, 1);
 }
+
+#[test]
+fn a_record_stays_readable_while_its_segment_is_sealed() {
+    // Why: a roll seals the previous segment (its index moves from RAM to its file) while
+    // readers read it. A read racing the seal must still find the record: a `None` for a
+    // durable record makes a consumer skip it
+    let d = tempfile::tempdir().unwrap();
+    let mut c = cfg(d.path(), 16 * KB);
+    c.tail_cache_bytes = 0;
+    let mut log = Log::open(c).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (r, done) = (log.reader(), done.clone());
+            std::thread::spawn(move || {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    let n = r.next_lsn();
+                    if n > 0 {
+                        assert!(r.read(n - 1).unwrap().is_some(), "lsn {} missing", n - 1);
+                    }
+                }
+            })
+        })
+        .collect();
+    fill(&mut log, 0, 5_000, 1, 300);
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in readers {
+        t.join().unwrap();
+    }
+}

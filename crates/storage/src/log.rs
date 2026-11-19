@@ -155,22 +155,26 @@ impl Seg {
         }
     }
 
+    // `entries` is locked before `disk` is checked: `seal` sets `disk` before it empties
+    // `entries`, so a reader that finds `disk` unset still holds the full RAM index
     fn end_lsn(&self) -> Lsn {
+        let ents = self.entries.read().unwrap();
         match self.disk.get() {
             Some(d) => self.base_lsn + d.n as u64,
-            None => self.base_lsn + self.entries.read().unwrap().len() as u64,
+            None => self.base_lsn + ents.len() as u64,
         }
     }
 
     /// Up to `limit` index entries from the segment's `rel`-th record.
     fn index(&self, rel: u64, limit: usize) -> Result<Vec<IdxEntry>> {
+        let ents = self.entries.read().unwrap();
         match self.disk.get() {
             Some(d) => {
+                drop(ents);
                 let n = (d.n as u64).saturating_sub(rel).min(limit as u64) as u32;
                 Ok(d.read(0, rel as u32, n)?.into_iter().map(|x| x.1).collect())
             }
             None => {
-                let ents = self.entries.read().unwrap();
                 let from = (rel as usize).min(ents.len());
                 Ok(ents[from..ents.len().min(from.saturating_add(limit))].to_vec())
             }
