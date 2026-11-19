@@ -269,13 +269,13 @@ impl Inner {
         mut f: impl FnMut(u64, Entry) -> bool,
     ) -> Res<()> {
         let l = &self.logs[ix as usize];
-        // the RAM part from the batch before `from` (it may hold it)
+        // the RAM part from the batch before `from` (it may hold it), walked lazily
         let start = l
             .batches
             .range(..=from)
             .next_back()
             .map_or(from, |(&s, _)| s);
-        let hot: Vec<(u64, Entry)> = l.batches.range(start..).map(|(&s, &e)| (s, e)).collect();
+        let mut hot = l.batches.range(start..).map(|(&s, &e)| (s, e)).peekable();
         // by first sequence: the absorbed segments whose range reaches past `from`, and RAM
         // (which may hold a late batch below any of them: it overlaps all after it)
         let mut parts: Vec<(u64, u64, Option<Lsn>)> = l
@@ -284,7 +284,7 @@ impl Inner {
             .filter(|c| c.hi > from)
             .map(|c| (c.lo, c.hi, Some(c.base)))
             .collect();
-        if let Some(&(lo, _)) = hot.first() {
+        if let Some(&(lo, _)) = hot.peek() {
             parts.push((lo, u64::MAX, None));
         }
         parts.sort_by_key(|p| p.0);
@@ -292,17 +292,26 @@ impl Inner {
         while i < parts.len() {
             // parts whose ranges overlap are read before any of them is visited; the next one
             // is read only if the visit gets that far
-            let (mut j, mut hi, mut v) = (i, 0, vec![]);
+            let (mut j, mut hi, mut v, mut with_hot) = (i, 0, vec![], false);
             while j < parts.len() && (j == i || parts[j].0 < hi) {
                 hi = hi.max(parts[j].1);
                 match parts[j].2 {
                     Some(base) => v.extend(self.run(r, ix, base)?.iter().map(|x| (x.first, x.e))),
-                    None => v.extend_from_slice(&hot),
+                    None => with_hot = true,
                 }
                 j += 1;
             }
             v.sort_by_key(|x| x.0);
-            for (s, e) in v {
+            let mut cold = v.into_iter().peekable();
+            loop {
+                // the lower first sequence of the two (RAM's only in its own group: the last)
+                let next = match (cold.peek(), hot.peek().filter(|_| with_hot)) {
+                    (Some(c), Some(h)) if h.0 < c.0 => hot.next(),
+                    (Some(_), _) => cold.next(),
+                    (None, Some(_)) => hot.next(),
+                    (None, None) => None,
+                };
+                let Some((s, e)) = next else { break };
                 if s + e.count as u64 > from && !f(s, e) {
                     return Ok(());
                 }
