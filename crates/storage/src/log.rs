@@ -21,7 +21,7 @@
 
 use crate::record::{self, Decoded, Meta};
 use crate::{Error, Lsn, Result};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::FileExt;
@@ -194,41 +194,81 @@ impl Seg {
     }
 }
 
-/// A sealed segment's index file: `n` records, and its keys (sorted) with each key's run in the
-/// by-key section.
+/// A sealed segment's index file: `n` records, and per key where it is in the file and where its
+/// run starts in the by-key section. The key bytes stay on disk: a segment holding millions of
+/// streams' records costs 8 bytes of RAM per key, not the key.
 struct DiskIdx {
     file: File,
     n: u32,
+    /// The key section, up to the checksum: where `Keys` offsets count from, and its end.
+    keys_at: u64,
+    keys_end: u64,
     keys: Keys,
 }
 
-/// A sealed segment's keys in byte order, each with its run (start, length) in the by-key
-/// section.
-type Keys = Vec<(Vec<u8>, u32, u32)>;
+/// A sealed segment's keys in byte order: each one's (key record's offset in the key section,
+/// run start in the by-key section). A run ends where the next starts (the last at `n`), a key
+/// where the next key's record starts (the last at the section's end).
+type Keys = Vec<(u32, u32)>;
 
 impl DiskIdx {
+    /// Key `k`'s bytes (one read).
+    fn key(&self, k: u32) -> Result<Vec<u8>> {
+        let (off, _) = *(self.keys.get(k as usize))
+            .ok_or_else(|| Error::Corrupt(format!("index key {k} out of range")))?;
+        let end =
+            (self.keys.get(k as usize + 1)).map_or(self.keys_end, |x| self.keys_at + x.0 as u64);
+        let at = self.keys_at + off as u64 + 10;
+        let mut b = vec![0u8; end.saturating_sub(at) as usize];
+        self.file.read_exact_at(&mut b, at)?;
+        Ok(b)
+    }
+
+    /// Key `k`'s run in the by-key section: (start, length).
+    fn run(&self, k: usize) -> (u32, u32) {
+        let start = self.keys[k].1;
+        let end = self.keys.get(k + 1).map_or(self.n, |x| x.1);
+        (start, end - start)
+    }
+
+    /// The index of the key equal to `key`, if there is one (a binary search: a read a probe).
+    fn find(&self, key: &[u8]) -> Result<Option<usize>> {
+        let (mut lo, mut hi) = (0, self.keys.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.key(mid as u32)?.as_slice().cmp(key) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(Some(mid)),
+            }
+        }
+        Ok(None)
+    }
+
     /// `n` entries from the `i`-th of a section (0: by LSN, 1: by key), with each entry's key
     /// field: its key's index in `keys` (by LSN) or its record's index (by key).
     fn read(&self, section: u64, i: u32, n: u32) -> Result<Vec<(u32, IdxEntry)>> {
         let mut b = vec![0u8; n as usize * IDX_ENTRY];
         let at = IDX_HEADER as u64 + (section * self.n as u64 + i as u64) * IDX_ENTRY as u64;
         self.file.read_exact_at(&mut b, at)?;
-        let keys = &self.keys;
+        // each key read once per call
+        let mut keys: HashMap<u32, Vec<u8>> = HashMap::new();
         b.chunks_exact(IDX_ENTRY)
             .zip(i..)
             .map(|(e, at)| {
                 let k = u32_at(e, 12);
                 let key = if section == 0 { k } else { self.key_of(at) };
-                let key = keys
-                    .get(key as usize)
-                    .ok_or_else(|| Error::Corrupt(format!("index key {key} out of range")))?;
+                let key = match keys.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(x) => x.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(x) => x.insert(self.key(key)?),
+                };
                 Ok((
                     k,
                     IdxEntry {
                         offset: u64_at(e, 0),
                         len: u32_at(e, 8),
                         meta: Meta {
-                            key: key.0.clone(),
+                            key: key.clone(),
                             first_seq: u64_at(e, 16),
                             count: u32_at(e, 24),
                             tag: u32_at(e, 28),
@@ -242,7 +282,7 @@ impl DiskIdx {
 
     /// The key whose by-key run holds position `i`.
     fn key_of(&self, i: u32) -> u32 {
-        self.keys.partition_point(|k| k.1 + k.2 <= i) as u32
+        (self.keys.partition_point(|k| k.1 <= i) as u32).saturating_sub(1)
     }
 }
 
@@ -410,10 +450,10 @@ impl Reader {
         let Some(d) = seg.disk.get() else {
             return Ok(vec![]);
         };
-        let Ok(k) = d.keys.binary_search_by(|x| x.0.as_slice().cmp(key)) else {
+        let Some(k) = d.find(key)? else {
             return Ok(vec![]);
         };
-        let (_, start, n) = d.keys[k];
+        let (start, n) = d.run(k);
         Ok(d.read(1, start, n)?
             .into_iter()
             .map(|(rel, e)| entry(&seg, base + rel as u64, e))
@@ -644,8 +684,14 @@ fn encode_index(id: u64, generation: u64, base_lsn: Lsn, ents: &[IdxEntry]) -> V
     b
 }
 
-/// Checks an index file and returns its record count and key table.
-fn decode_index(b: &[u8], id: u64, generation: u64, base_lsn: Lsn) -> Option<(u32, Keys)> {
+/// Checks an index file and returns its record count, its key table and where its key section
+/// starts and ends.
+fn decode_index(
+    b: &[u8],
+    id: u64,
+    generation: u64,
+    base_lsn: Lsn,
+) -> Option<(u32, Keys, (u64, u64))> {
     let (body, crc) = b.split_at_checked(b.len().checked_sub(4)?)?;
     if crc32c::crc32c(body) != u32_at(crc, 0) {
         return None;
@@ -658,26 +704,26 @@ fn decode_index(b: &[u8], id: u64, generation: u64, base_lsn: Lsn) -> Option<(u3
         return None;
     }
     let (n, k) = (u32_at(h, 32), u32_at(h, 36));
-    let mut rest = body.get(IDX_HEADER + n as usize * 2 * IDX_ENTRY..)?;
-    let mut keys = Vec::with_capacity(k as usize);
-    let mut next = 0u32;
+    let at = IDX_HEADER.checked_add((n as usize).checked_mul(2 * IDX_ENTRY)?)?;
+    let section = body.get(at..)?;
+    let mut rest = section;
+    let mut keys = Vec::with_capacity((k as usize).min(section.len() / 10));
+    let (mut next, mut prev): (u32, Option<&[u8]>) = (0, None);
     for _ in 0..k {
         let e = rest.get(..10)?;
         let (start, len) = (u32_at(e, 0), u32_at(e, 4));
         let key = rest.get(10..10 + u16::from_le_bytes(e[8..10].try_into().unwrap()) as usize)?;
         // the runs tile the by-key section in key order
-        if start != next
-            || keys
-                .last()
-                .is_some_and(|(p, _, _): &(Vec<u8>, _, _)| p.as_slice() >= key)
-        {
+        if start != next || prev.is_some_and(|p| p >= key) {
             return None;
         }
         next = start.checked_add(len)?;
+        let off = u32::try_from(section.len() - rest.len()).ok()?;
         rest = &rest[10 + key.len()..];
-        keys.push((key.to_vec(), start, len));
+        prev = Some(key);
+        keys.push((off, start));
     }
-    (rest.is_empty() && next == n).then_some((n, keys))
+    (rest.is_empty() && next == n).then_some((n, keys, (at as u64, body.len() as u64)))
 }
 
 /// Writes a sealed segment's index file and opens it for reads.
@@ -689,10 +735,13 @@ fn write_index(dir: &Path, seg: &Seg, ents: &[IdxEntry]) -> Result<DiskIdx> {
     f.sync_all()?;
     std::fs::rename(&tmp, idx_path(dir, seg.id))?;
     sync_dir(dir)?;
-    let (n, keys) = decode_index(&b, seg.id, seg.generation, seg.base_lsn).unwrap();
+    let (n, keys, (keys_at, keys_end)) =
+        decode_index(&b, seg.id, seg.generation, seg.base_lsn).unwrap();
     Ok(DiskIdx {
         file: File::open(idx_path(dir, seg.id))?,
         n,
+        keys_at,
+        keys_end,
         keys,
     })
 }
@@ -1030,7 +1079,7 @@ impl Log {
                     .and_then(|b| decode_index(&b, m.id, m.generation, m.base_lsn))
                     .filter(|e| m.base_lsn + e.0 as u64 == m.end_lsn);
                 let seg = match index {
-                    Some((n, keys)) => {
+                    Some((n, keys, (keys_at, keys_end))) => {
                         let file2 = File::open(idx_path(&dir, m.id))?;
                         Seg::new(
                             m.id,
@@ -1040,6 +1089,8 @@ impl Log {
                             Some(DiskIdx {
                                 file: file2,
                                 n,
+                                keys_at,
+                                keys_end,
                                 keys,
                             }),
                         )
@@ -2030,24 +2081,34 @@ mod tests {
             })
             .collect();
         let b = encode_index(3, 4, 50, &entries);
-        let (n, ks) = decode_index(&b, 3, 4, 50).unwrap();
+        let (n, ks, (keys_at, keys_end)) = decode_index(&b, 3, 4, 50).unwrap();
         assert_eq!(n, 7);
-        let names: Vec<&[u8]> = ks.iter().map(|k| k.0.as_slice()).collect();
-        assert_eq!(names, [&b"ka"[..], b"kab", b"kb"], "keys in byte order");
         let p = d.path().join("i");
         std::fs::write(&p, &b).unwrap();
         let idx = DiskIdx {
             file: File::open(&p).unwrap(),
             n,
+            keys_at,
+            keys_end,
             keys: ks.clone(),
         };
+        let names: Vec<Vec<u8>> = (0..3).map(|k| idx.key(k).unwrap()).collect();
+        assert_eq!(names, [&b"ka"[..], b"kab", b"kb"], "keys in byte order");
+        assert!(idx.key(3).is_err(), "past the keys");
+        for (k, name) in names.iter().enumerate() {
+            assert_eq!(idx.find(name).unwrap(), Some(k), "found by its bytes");
+        }
+        for absent in [&b""[..], b"k", b"kaa", b"kac", b"kc"] {
+            assert_eq!(idx.find(absent).unwrap(), None, "{absent:?}");
+        }
         let by_lsn = idx.read(0, 0, 7).unwrap();
         for ((_, a), e) in by_lsn.iter().zip(&entries) {
             assert_eq!((a.offset, a.len, &a.meta), (e.offset, e.len, &e.meta));
         }
         assert_eq!(idx.read(0, 5, 2).unwrap()[1].1.offset, entries[6].offset);
-        for (k, (name, start, len)) in ks.iter().enumerate() {
-            let run = idx.read(1, *start, *len).unwrap();
+        for (k, name) in names.iter().enumerate() {
+            let (start, len) = idx.run(k);
+            let run = idx.read(1, start, len).unwrap();
             let rels: Vec<u32> = run.iter().map(|x| x.0).collect();
             let want: Vec<u32> = (0..7u32)
                 .rev()
@@ -2158,12 +2219,27 @@ mod proofs {
         let len: usize = kani::any();
         kani::assume(len <= b.len());
         kani::assume(u32_at(&b, 36) <= k);
-        if let Some((n, keys)) = decode_index(&b[..len], kani::any(), kani::any(), kani::any()) {
+        if let Some((n, keys, (at, end))) =
+            decode_index(&b[..len], kani::any(), kani::any(), kani::any())
+        {
             assert_eq!(n, u32_at(&b, 32));
             assert_eq!(keys.len(), u32_at(&b, 36) as usize);
-            // the runs cover the by-key section: the first starts at 0, together they hold n
-            assert!(keys.first().is_none_or(|k| k.1 == 0));
-            assert_eq!(keys.iter().map(|k| k.2).sum::<u32>(), n);
+            assert_eq!(
+                end as usize + 4,
+                len,
+                "the key section ends at the checksum"
+            );
+            assert!(at <= end);
+            // the runs and the key records each start at the section's start, in order: a run
+            // ends at the next one's start (the last at n), a key at the next one's record
+            assert!(keys.first().is_none_or(|k| *k == (0, 0)));
+            for w in keys.windows(2) {
+                assert!(w[0].1 <= w[1].1 && w[0].0 + 10 <= w[1].0);
+            }
+            assert!(
+                keys.last()
+                    .is_none_or(|k| k.1 <= n && at + k.0 as u64 + 10 <= end)
+            );
         }
     }
 

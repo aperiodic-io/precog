@@ -8,5 +8,6 @@ pub mod node;
 pub mod proto;
 pub mod rpc;
 pub mod store;
+pub mod summary;
 pub mod transport;
 pub mod wal;

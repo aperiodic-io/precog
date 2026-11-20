@@ -42,6 +42,8 @@ pub struct Dedup {
     oldest_s: u64,
     /// when this index first saw an id
     started_s: Option<u64>,
+    /// the newest second it saw an id
+    last_s: u64,
 }
 
 /// One index per stream (a node accepts some streams and replicates others; a replica only
@@ -90,6 +92,14 @@ impl Streams {
         self.len() == 0
     }
 
+    /// Drops the index of every stream that saw no id within the window: none of its ids can
+    /// be a duplicate any more, so an idle (dormant) stream holds no RAM for them.
+    pub fn sweep(&mut self, now_s: u64) {
+        let w = self.window_s;
+        self.by_stream.retain(|_, d| d.last_s + w >= now_s);
+        self.by_stream.shrink_to_fit(); // the map keeps its capacity otherwise
+    }
+
     /// The shortest window any stream remembers now.
     pub fn effective_window_s(&self, now_s: u64) -> u64 {
         self.by_stream
@@ -122,6 +132,7 @@ impl Dedup {
             swept_s: 0,
             oldest_s: 0,
             started_s: None,
+            last_s: 0,
         }
     }
 
@@ -149,6 +160,7 @@ impl Dedup {
     /// recorded, so a batch's later events see its earlier ones.
     pub fn check(&mut self, digests: &[u64], now_s: u64, dup: &mut Vec<bool>) {
         self.started_s.get_or_insert(now_s);
+        self.last_s = self.last_s.max(now_s);
         for (h, t) in self.pending.drain(..) {
             self.seen.insert(h, t + 1); // what this node recorded as a replica
         }
@@ -170,6 +182,7 @@ impl Dedup {
     /// indexed by the next `check` (a node that only replicates the stream never pays for it).
     pub fn record(&mut self, digests: &[u64], now_s: u64) {
         self.started_s.get_or_insert(now_s);
+        self.last_s = self.last_s.max(now_s);
         if self.pending.len() >= self.max_entries {
             // the oldest quarter goes and the window shortens past it (as `sweep` does at the
             // cap), but never this second's ids: within a second the cap is soft there too
@@ -485,7 +498,54 @@ mod model {
         Ok(())
     }
 
+    /// Why: a stream idle past the window leaves its index to keep RAM per stream bounded; no
+    /// answer may change for it: per stream, exact against the reference, sweeps or not.
+    fn streams(window: u64, ops: Vec<(usize, Op, bool)>) -> Result<(), TestCaseError> {
+        let mut d = Streams::new(window, 3, 1 << 20);
+        let mut last: HashMap<(usize, u64), u64> = HashMap::new();
+        // the last second each stream was asked or told of an id
+        let mut used: HashMap<usize, u64> = HashMap::new();
+        let (mut now, mut dup) = (100, vec![]);
+        let name = |s: usize| ["a", "b", "c"][s];
+        for (s, op, sweep) in ops {
+            match op {
+                Op::Tick(dt) => now += 3 * dt,
+                Op::Record(ids) => {
+                    used.insert(s, now);
+                    d.record(name(s), &ids, now);
+                    last.extend(ids.into_iter().map(|h| ((s, h), now)));
+                }
+                Op::Check(ids) => {
+                    used.insert(s, now);
+                    d.check(name(s), &ids, now, &mut dup);
+                    for (&h, &got) in ids.iter().zip(&dup) {
+                        let within = last.get(&(s, h)).is_some_and(|&t| t + window >= now);
+                        prop_assert_eq!(got, within, "{} id {} at {}", name(s), h, now);
+                        if !got {
+                            last.insert((s, h), now);
+                        }
+                    }
+                }
+            }
+            if sweep {
+                d.sweep(now);
+                // swept: only streams used within the window are left
+                let live = used.values().filter(|&&t| t + window >= now).count();
+                prop_assert_eq!(d.by_stream.len(), live);
+            }
+        }
+        Ok(())
+    }
+
     proptest! {
+        #[test]
+        fn streams_idle_past_the_window_leave_ram_and_answer_as_before(
+            window in 1u64..12,
+            ops in prop::collection::vec((0usize..3, ops().prop_map(|v| v[0].clone()), any::<bool>()), 1..80),
+        ) {
+            streams(window, ops)?;
+        }
+
         #[test]
         fn without_the_cap_dedup_is_exact(window in 1u64..12, ops in ops()) {
             run(window, 1 << 20, ops)?;

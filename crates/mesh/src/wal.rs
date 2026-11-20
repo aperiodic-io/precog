@@ -55,6 +55,8 @@ enum Job {
     Copy(Vec<(Meta, Arc<[u8]>)>),
     /// `Log::drop_until`: syncs what is unsynced (the copies), then drops.
     Drop(Lsn),
+    /// Write caching: syncs what is unsynced now (before a checkpoint covers it).
+    Sync,
 }
 
 #[derive(Clone)]
@@ -227,6 +229,11 @@ impl Wal {
         self.request(Job::Drop(end)).await
     }
 
+    /// Makes everything written so far durable (a no-op without write caching).
+    pub async fn sync(&self) -> Result<Lsn> {
+        self.request(Job::Sync).await
+    }
+
     async fn request(&self, job: Job) -> Result<Lsn> {
         let (done, rx) = oneshot::channel();
         self.tx
@@ -339,6 +346,7 @@ fn writer(
                         log.append(&items)
                     }
                     Job::Drop(end) => log.drop_until(end),
+                    Job::Sync => log.flush().map(|_| log.next_lsn()),
                 };
                 publish(&log, &stats, &fatal);
                 let _ = done.send(r.map_err(|e| e.to_string()));

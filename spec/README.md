@@ -17,10 +17,15 @@ property or model test runs (below).
 | RPC frame reader | proptest | Any byte stream, cut into any reads | `rpc::props` |
 | The segment log's read APIs through appends, rolls, retention, lost index files and reopens | proptest, model-based | The code against a list of records, after every step | `model` in `crates/storage/tests/log.rs` |
 | The store's identity and frontier rules | proptest, model-based | | `store::model` |
+| Dormant streams: eviction, wakes, checkpoints racing changes, crashes and the restart from a checkpoint | TLA+ / TLC | Interleavings of a checkpoint taken under the lock and written without it, evictions, changes and power losses | `spec/store/Dormant.tla` |
+| Dormant streams at the code: every query of a store that puts its streams out of RAM, fails checkpoints and reads, and crashes, against one that keeps them | proptest, model-based | A twin store is the reference: what RAM held is what must come back | `store::model_dormant` |
+| Summaries and the checkpoint on disk | proptest | Round trips, every damage refused, any bytes, a number in one LEB128 form only, a commit read back after a reopen | `summary::props` |
+| Repair following a peer's log (`Control::Inventory`) through peer crashes that lose an unsynced tail and reuse its LSNs, follower crashes and lost disks | TLA+ / TLC, proptest | A cursor into another node's log is only as good as that log's history | `spec/mesh/Inventory.tla`, `store::props_rejoin` |
 | The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
 | The WAL's write-caching gate: callers write under the log's lock, a roll or retention diverts them to the WAL thread | TLA+ / TLC | Its bugs are interleavings of worker threads and the WAL thread over two locks and a queue | `spec/wal/WalGate.tla` |
 | The segment cleaner: each stream's own retention under the node cap, through slow batches and restarts | proptest | After every pass: the log within the cap, every log the newest suffix of what was written to it (no hole, once, byte for byte), a stream within its own retention (and within one batch of it unless the cap cut it) | `node::props_cleaner` |
-| The dedup window and its cap | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
+| The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
+| Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
 
 Run them:
@@ -163,6 +168,92 @@ torn or foreign write whose checksum happens to match.
 is shorter than its fixed fields under a matching checksum panicked the open instead of falling
 back to the other slot (`manifest_decode_never_panics`; test
 `a_manifest_body_too_short_for_its_fields_is_refused_not_a_panic`).
+
+## Dormant streams: `spec/store/Dormant.tla`
+
+**Models.** A stream leaving RAM and coming back from its summary (`Inner::evict`,
+`Inner::wake`); a checkpoint collected under the store's lock (`Store::begin_checkpoint`:
+the changed streams' summaries, `cold_end`, `contiguous`, the LSNs in RAM, the forgotten ones)
+and written later without it (`end_checkpoint`), or failing; records appended and marked
+durable in any order, forgotten by a stream's own retention, absorbed in LSN order; a power
+loss (RAM and an unwritten checkpoint gone, every record in the log recovered) and the restart
+(`Store::open`): each summary, the RAM records of the checkpoint put back, the records past it
+replayed as new unless forgotten.
+
+**Abstracts away.** Batches' contents and sequence ranges (a record is its LSN and belongs to a
+stream), frontiers (a stream's state is the set of records it serves), segment boundaries and
+dropping (whole-segment drops follow a checkpoint in `Node::apply_retention`; the twin model and
+`tests/dormant.rs` check them), redb (a commit is atomic and durable).
+
+**Invariant.** `Exact`: a stream in RAM serves exactly its durable records its retention did not
+forget, whether it never left RAM, left it and came back, or the node restarted (what retention
+forgot after the last checkpoint is back after a crash; the next pass forgets it again).
+
+**Bounds.**
+
+| Config | Streams | Records | Crashes | Distinct states |
+|---|---|---|---|---|
+| `MC_dormant` | 2 | 3 | 2 | 453,888 |
+| `Nightly_dormant` | 2 | 4 | 2 | 9,947,372 |
+| `MC_dormant_evict_in_flight` (expect) | 1 | 2 | 0 | eviction while a checkpoint is in flight: `Exact` fails |
+| `MC_dormant_clear_at_commit` (expect) | 2 | 3 | 0 | a stream clean once written, not once collected: `Exact` fails |
+| `MC_dormant_replay_forgotten` (expect) | 1 | 3 | 1 | the restart replays a record forgotten past `contiguous`: `Exact` fails |
+
+**Found.** An eviction between a checkpoint's collection and its write: the stream counts as
+clean, leaves RAM, and wakes from its older summary (`MC_dormant_evict_in_flight`). Fixed: no
+stream leaves RAM while a checkpoint is in flight, and a write that fails marks its streams
+changed again. Test: `no_stream_leaves_ram_while_a_checkpoint_of_it_is_in_flight` (failed first).
+
+### Dormant streams at the code: `store::model_dormant`
+
+Two stores over two logs written alike (96 runs of up to 40 operations, and the cases below
+every run): reservations, writes, durable marks in any order, failures, absorption, retention as
+the node runs it (checkpoint, drop of whole sealed segments, trim), floors inside a segment,
+streams' own retention; the second store also puts every stream it can out of RAM, writes
+checkpoints that fail before or after they are durable, evicts with a checkpoint in flight,
+fails its summary reads, and crashes back to its checkpoint. After every step both answer every
+query alike: totals, frontiers, live starts, inventories, `has`/`get`/`durable_below`/
+`log_batches` for every sequence, cursor reads, seeks by time, tails, event-time reads.
+
+**Found** (each a fixed case of `the_cases_the_model_found_and_its_rare_paths`, failed first):
+- `frontiers(None)` and `live_start(None)` read a dormant stream's summary as written, before the
+  segments retention dropped since: a stale contiguous end (now such a stream is woken first).
+- A restart put a batch back in RAM after a dropped segment had trimmed its log up to it, but
+  did not move the log's contiguous end over it.
+- The restart replayed a batch forgotten past `contiguous` as new (now the checkpoint lists
+  them with the dead ones), and a batch replayed as new did not see the batches put back in RAM
+  later in the log (now those are put back first).
+- A floor inside a segment (store-level `trim`; the node drops whole segments) left dormant
+  streams' totals counted until they woke: such a trim wakes them first.
+- A stream's `ooo` flag missed a batch marked durable before its predecessor at a later LSN, so a
+  seek by time (`cursor_at`) could stop before the lowest sequence (a bug on main too).
+
+Not a dormancy bug, left as it is: a stream's retention floor compares (append time, sequence,
+LSN) across its logs, so a batch logged in the same millisecond as a forgotten one with a lower
+sequence, or written before it and marked durable after, is hidden once absorbed (on main too);
+the twin model gives batches distinct append times and absorbs at a restart.
+
+## Repair by following a peer's log: `spec/mesh/Inventory.tla`
+
+**Models.** `Node::repair_peer` asking a peer for what it logged from a cursor
+(`Control::Inventory`), the peer answering from `rejoin` (`Store::rejoin`), the follower's
+checkpoint keeping its cursor; the peer losing its unsynced tail in a power loss (write caching)
+and logging other records at those LSNs; the follower crashing back to its saved cursor or
+losing its disk. One page is one record.
+
+**Invariants.** `Covered`: a follower caught up with the peer's boot and log holds every
+record the peer holds. `InLog`: its cursor never points past the peer's log.
+
+**Bounds.** `MC_inventory`: 4 records, 3 crashes, 59,861 distinct states. `MC_inventory_norejoin`
+(expect `Covered`): the peer answers from the cursor whatever boot it is in.
+`MC_inventory_lastboot` (expect `Covered`): the peer goes back to its own boot's open only.
+
+**Found.** Two crashes of the peer between a follower's requests: the boot in between logged
+records below the second boot's open, which "back to where this boot opened" skips
+(`MC_inventory_lastboot`). Fixed: a node keeps its boots (incarnation, where its log ended at
+the open) in its checkpoint, written at the open, and answers a follower of an older boot from
+the lowest open since (from the start for a boot it no longer knows). Test:
+`a_peer_is_followed_again_from_the_first_open_after_the_boot_it_followed`, `store::props_rejoin`.
 
 ## Replication and dedup: `spec/mesh/Replication.tla`
 
@@ -461,5 +552,14 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   models a page long; a second model closer to the Rust code would mean keeping two models in
   step with no new class of bug in reach. Apalache: the state spaces are small enough for
   explicit checking, so symbolic checking buys nothing yet.
+- **The summaries' decoders under Kani** (`summary::decode_stream`, `decode_checkpoint`): mesh
+  code, like the codecs above; `summary::props` covers them (round trips, every one-byte flip,
+  cut and extension refused, any bytes behind a valid checksum, a number longer than it needs or
+  past 64 bits refused). redb itself (its pages, its
+  commit) is trusted, as the filesystem is: `a_commit_is_read_back_after_a_reopen` and the crash
+  tests (`summary:before_commit`, `summary:after_commit`) exercise it.
+- **Dormant streams across nodes in TLA+.** Dormancy is local to a node: a peer's repair wakes
+  what it compares (`Inventory.tla` covers what it follows), and `Replication.tla` abstracts a
+  node's store as the set of what it holds, which eviction does not change.
 - **Index and segment header round trips under Kani.** They need a `File`; their decoders are
   proved panic-free above and the round trips are unit-tested.

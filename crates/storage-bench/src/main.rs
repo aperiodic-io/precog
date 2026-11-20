@@ -620,7 +620,7 @@ impl Store for Sqlite {
     fn append_group(&mut self, items: &[(Key, Vec<u8>)]) -> Result<()> {
         let tx = self.c.transaction()?;
         {
-            let mut st = tx.prepare_cached("INSERT INTO kv (k, v) VALUES (?1, ?2)")?;
+            let mut st = tx.prepare_cached("INSERT OR REPLACE INTO kv (k, v) VALUES (?1, ?2)")?;
             for (k, v) in items {
                 st.execute(rusqlite::params![&k[..], &v[..]])?;
             }
@@ -787,6 +787,9 @@ struct Args {
     json: Option<PathBuf>,
     #[arg(long, default_value = "")]
     label: String,
+    /// Dormant-stream summaries instead (docs/S2-PLAN.md C7): this many streams.
+    #[arg(long, default_value_t = 0)]
+    summaries: u64,
 }
 
 struct Req {
@@ -853,6 +856,9 @@ fn main() -> Result<()> {
         }
     }
     let store = open_store(&a.backend, &dir, &pool).context("open")?;
+    if a.summaries > 0 {
+        return summaries(&a, store, &dir, &pool);
+    }
 
     // ---------------- write phase
     let (tx, rx): (Sender<Req>, Receiver<Req>) = bounded(4096);
@@ -1056,4 +1062,108 @@ fn raw_replay(store: &mut Box<dyn Store>, backend: &str, dir: &Path, pool: &Path
     let n = rs.index.len() as u64;
     *store = Box::new(rs);
     Ok(n)
+}
+
+/// A stream's key: its name's hash, in no order (names arrive in any order).
+fn skey(i: u64) -> Key {
+    let mut z = i.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    key(z ^ (z >> 31), i)
+}
+
+fn rss_mib() -> f64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    s.lines()
+        .find_map(|l| l.strip_prefix("VmRSS:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or(0.0)
+        / 1024.0
+}
+
+/// The dormant-stream summary workload: N summaries of ~120 B written by checkpoints of 10k,
+/// then checkpoints of 1k changed streams, a reopen, and point reads of streams that exist
+/// (a wake) and that do not (a new stream's first append), one at a time as the store does.
+fn summaries(a: &Args, mut store: Box<dyn Store>, dir: &Path, pool: &Path) -> Result<()> {
+    let n = a.summaries;
+    let val = |i: u64, v: u64| -> Vec<u8> {
+        let mut b = vec![0u8; 120];
+        b[..8].copy_from_slice(&i.to_le_bytes());
+        b[8..16].copy_from_slice(&v.to_le_bytes());
+        b
+    };
+    let hist = || Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    let (dev0, t) = (io_write_bytes(), Instant::now());
+    let mut load = hist();
+    let mut i = 0;
+    while i < n {
+        let items: Vec<(Key, Vec<u8>)> = (i..(i + 10_000).min(n))
+            .map(|j| (skey(j), val(j, 0)))
+            .collect();
+        let tc = Instant::now();
+        store.append_group(&items)?;
+        load.saturating_record(tc.elapsed().as_micros().max(1) as u64);
+        i += items.len() as u64;
+    }
+    let load_s = t.elapsed().as_secs_f64();
+    let mut upd = hist();
+    let (dev1, tu) = (io_write_bytes(), Instant::now());
+    for r in 0..200u64 {
+        let items: Vec<(Key, Vec<u8>)> = (0..1000)
+            .map(|_| {
+                let j = rand::random::<u64>() % n;
+                (skey(j), val(j, r + 1))
+            })
+            .collect();
+        let tc = Instant::now();
+        store.append_group(&items)?;
+        upd.saturating_record(tc.elapsed().as_micros().max(1) as u64);
+    }
+    let upd_s = tu.elapsed().as_secs_f64();
+    let upd_dev = io_write_bytes() - dev1;
+    drop(store);
+    std::thread::sleep(Duration::from_millis(200));
+    let cold = drop_caches();
+    let rss0 = rss_mib();
+    let tr = Instant::now();
+    let mut store = open_store(&a.backend, dir, pool)?;
+    raw_replay(&mut store, &a.backend, dir, pool)?;
+    let reopen_ms = tr.elapsed().as_secs_f64() * 1e3;
+    let (mut hit, mut miss) = (hist(), hist());
+    let tg = Instant::now();
+    for _ in 0..a.gets {
+        let j = rand::random::<u64>() % n;
+        let tc = Instant::now();
+        let got = store.get(&skey(j))?;
+        hit.saturating_record(tc.elapsed().as_nanos().max(1) as u64);
+        anyhow::ensure!(got == Some(120), "stream {j} lost");
+    }
+    let hit_s = tg.elapsed().as_secs_f64();
+    for _ in 0..a.gets {
+        let j = n + rand::random::<u64>() % (n * 10);
+        let tc = Instant::now();
+        let got = store.get(&skey(j))?;
+        miss.saturating_record(tc.elapsed().as_nanos().max(1) as u64);
+        anyhow::ensure!(got.is_none());
+    }
+    let r = serde_json::json!({
+        "label": a.label, "backend": a.backend, "streams": n,
+        "load_per_s": n as f64 / load_s, "load_commit_p50_ms": load.value_at_quantile(0.5) as f64 / 1e3,
+        "load_write_amp": (dev1 - dev0) as f64 / (n * 136) as f64,
+        "ckpt1k_p50_ms": upd.value_at_quantile(0.5) as f64 / 1e3, "ckpt1k_p99_ms": upd.value_at_quantile(0.99) as f64 / 1e3,
+        "ckpt1k_per_s": 200.0 / upd_s, "ckpt1k_dev_kib": upd_dev as f64 / 200.0 / 1024.0,
+        "reopen_ms": reopen_ms, "cold": cold,
+        "wake_p50_us": hit.value_at_quantile(0.5) as f64 / 1e3, "wake_p99_us": hit.value_at_quantile(0.99) as f64 / 1e3,
+        "wake_per_s": a.gets as f64 / hit_s,
+        "miss_p50_us": miss.value_at_quantile(0.5) as f64 / 1e3, "miss_p99_us": miss.value_at_quantile(0.99) as f64 / 1e3,
+        "rss_after_mib": rss_mib(), "rss_before_open_mib": rss0, "disk_mib": dir_size(dir) as f64 / (1 << 20) as f64,
+    });
+    println!("{r}");
+    if let Some(p) = &a.json {
+        let mut f = OpenOptions::new().create(true).append(true).open(p)?;
+        writeln!(f, "{r}")?;
+    }
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
 }

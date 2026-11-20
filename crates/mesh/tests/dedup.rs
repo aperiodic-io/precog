@@ -154,3 +154,15 @@ async fn a_batch_the_fenced_log_refuses_is_unknown_so_the_client_retries_it() {
     let ack = node.append(1, keyed("b", 0, &["t3"])).await;
     assert_eq!(ack.status, AckStatus::Unknown, "{ack:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retention_pass_keeps_the_window_s_keys() {
+    // Why: the pass sweeps streams idle past the window out of the dedup index (in seconds);
+    // a stream used just now must keep its keys, or a second replica's copy gets through.
+    let d = tempfile::tempdir().unwrap();
+    let node = Node::open(config(d.path())).await.unwrap();
+    append(&node, &keyed("a", 0, &["t1"])).await;
+    node.apply_retention().await.unwrap();
+    append(&node, &keyed("b", 0, &["t1", "t2"])).await;
+    assert_eq!(payloads(&node), ["a:t1", "b:t2"]);
+}

@@ -325,7 +325,7 @@ impl Consumer {
         }
     }
 
-    /// One read: None when no batch came back.
+    /// One read: None when no node had a batch past the cursor.
     async fn poll_batches(&mut self, max_bytes: u32) -> Result<Option<Vec<Event>>> {
         let n = self.client.mc.node_count();
         let req = Control::ReadCursor {
@@ -334,17 +334,26 @@ impl Consumer {
             max_bytes,
         };
         let body = Bytes::from(serde_json::to_vec(&req)?);
-        let mut last = None;
+        let (mut last, mut answered) = (None, false);
+        // a node with nothing past the cursor may be behind (an acked batch is on 2 of 3): caught
+        // up only when no node has more. ponytail: an empty poll asks every node; ask the merged
+        // end (`Client::end`) first if tailing readers' empty polls cost too much
         for i in 0..n {
             let node = (self.node + i) % n;
             match self.client.mc.call(node, Kind::Control, body.clone()).await {
                 Ok(f) if f.kind == Kind::Batches => {
-                    self.node = node;
-                    return self.take(f.body);
+                    answered = true;
+                    if let Some(evs) = self.take(f.body)? {
+                        self.node = node;
+                        return Ok(Some(evs));
+                    }
                 }
                 Ok(f) => last = Some(anyhow::anyhow!("unexpected {:?}", f.kind)),
                 Err(e) => last = Some(e),
             }
+        }
+        if answered {
+            return Ok(None);
         }
         Err(last.unwrap()).context("no node answered")
     }

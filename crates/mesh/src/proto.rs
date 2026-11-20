@@ -833,6 +833,15 @@ pub enum Control {
     Latest {
         stream: String,
     },
+    /// Repair: the frontiers of the logs with a batch in this node's log from LSN `from`, at
+    /// most `max` records of it (`Store::inventory`). `incarnation`: the boot of this node the
+    /// asker last followed; after another, LSNs past where its log ended at that boot's open
+    /// may hold other records, so it answers from there at the latest.
+    Inventory {
+        from: u64,
+        max: u32,
+        incarnation: u64,
+    },
 }
 
 /// A cursor within one stream: (writer, epoch, next sequence) per writer log.
@@ -857,6 +866,18 @@ pub enum ControlResp {
     Latest {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     },
+    Inventory(Inventory),
+}
+
+/// An answer to `Control::Inventory`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Inventory {
+    /// This boot of the node.
+    pub incarnation: u64,
+    /// The next LSN to ask for, and the end of what is durable now.
+    pub next: u64,
+    pub end: u64,
+    pub logs: Vec<Frontier>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -883,6 +904,11 @@ pub struct Status {
     #[serde(default)]
     pub dedup_window_s: u64,
     pub logs: Vec<Frontier>,
+    /// Streams in RAM, and streams that are only a summary on disk (dormant).
+    #[serde(default)]
+    pub streams_hot: u64,
+    #[serde(default)]
+    pub streams_dormant: u64,
 }
 
 /// Per writer-log coverage on one node.
