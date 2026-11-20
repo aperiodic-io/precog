@@ -604,7 +604,9 @@ mod props {
             ..Default::default()
         };
         let db = Db::memory().with_failpoint(Some("summary:before_commit"));
-        assert!(db.commit(&c, &[]).is_err());
+        // an operator reading the node's error can tell which store failed, and where
+        let e = db.commit(&c, &[]).unwrap_err().to_string();
+        assert_eq!(e, "streams database: failpoint summary:before_commit");
         assert_eq!(db.checkpoint().unwrap(), None, "nothing written");
         let db = Db::memory().with_failpoint(Some("summary:after_commit"));
         assert!(db.commit(&c, &[]).is_err());
