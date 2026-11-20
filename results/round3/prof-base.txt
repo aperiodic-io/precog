@@ -1,0 +1,46 @@
+    18.99%  [.] _RNvMs0_NtCs2kKUPl3Qpau_11precog_mesh5dedupNtB5_5Dedup5check
+     8.10%  [k] _raw_spin_unlock_irqrestore
+                                             0x7f760df2872e
+     7.36%  [k] finish_task_switch.isra.0
+                          0x7f760df2872e
+     3.07%  [k] copy_folio_from_iter_atomic
+                          0x7f760df2872e
+                          0x89480003b41215ff
+     2.81%  [k] ext4_block_write_begin
+                          0x7f760df2872e
+                          0x89480003b41215ff
+     1.92%  [.] _RINvMs6_NtCsfKiFC1ztrmh_9hashbrown3rawINtB6_8RawTableTymEE14reserve_rehashNCINvNtB8_3map11make_hasherymINtNtCscI6d9CVNmLh_4core4hash18BuildHasherDefaultNtNtCs2kKUPl3Qpau_11precog_mesh5dedup4PassEE0EB2u_
+     1.58%  [.] 0x000000000017bb72
+     1.53%  [.] _RNvNtCskx4KMIwKQlE_6crc32c9hw_x86_6417crc_u64_parallel3.llvm.10166000587646359280
+     1.53%  [k] clear_page_erms
+     1.33%  [k] block_commit_write
+                          0x7f760df2872e
+                          0x89480003b41215ff
+     1.15%  [.] 0x00000000000a1d3a
+     1.12%  [.] _RNvXs2_NtCseM0MKB6uKAc_5bytes9bytes_mutNtB5_8BytesMutNtNtNtB7_3buf7buf_mut6BufMut9put_slice
+     1.02%  [.] malloc
+     0.79%  [.] _RNvMNtCs2kKUPl3Qpau_11precog_mesh5protoNtB2_5Batch5parse
+     0.79%  [k] exc_page_fault
+     0.66%  [.] 0x00000000000a1968
+     0.61%  [k] nft_do_chain
+     0.59%  [k] _copy_to_iter
+               0x7f760df2872e
+     0.59%  [k] _raw_spin_unlock_irq
+     0.51%  [k] __nf_conntrack_find_get
+     0.51%  [k] iowrite16
+     0.51%  [k] tcp_sendmsg_locked
+               0x7f760df2872e
+     0.49%  [.] realloc
+     0.46%  [.] _RNvNtCs2kKUPl3Qpau_11precog_mesh5dedup6digest
+     0.46%  [.] cfree
+     0.46%  [k] mpage_process_page_bufs
+     0.43%  [k] fdget
+     0.43%  [.] 0x000000000009a72e
+     0.41%  [k] do_syscall_64
+     0.38%  [k] __check_object_size
+    92.69%  tokio-rt-worker
+     3.68%  precog-wal     
+     3.63%  precog-prealloc
+                       0x7f760df2872e
+total% 101.19
+0

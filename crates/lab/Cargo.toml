@@ -12,6 +12,14 @@ bytes = "1"
 crc32c = "0.6"
 libc = "0.2"
 lz4_flex = { version = "0.13", default-features = false, features = ["std"] }
+# Round 3 (transport and I/O): each is one POC's I/O layer.
+io-uring = "0.7"
+monoio = { version = "0.2", default-features = false, features = ["iouring", "async-cancel", "bytes"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+zstd = { version = "0.13", features = ["zdict_builder"] }
 
 [dev-dependencies]
 precog-mesh = { path = "../mesh" }

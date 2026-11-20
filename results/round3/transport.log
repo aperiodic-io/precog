@@ -1,0 +1,533 @@
+59 POCs, 3 reps, sys_enter counter: true
+rep 0 std blocking thread (rounds 1-2): sat 6323354/s srv 0.061 cli 0.153 µs/rec
+rep 0 std blocking thread (rounds 1-2) @100000: srv 0.481 µs/rec p50 802 p99 2985 p99.9 5296 µs
+rep 0 std blocking thread (rounds 1-2) @1000000: srv 0.086 µs/rec p50 917 p99 3207 p99.9 5978 µs
+rep 0 epoll, one thread: sat 6046643/s srv 0.054 cli 0.163 µs/rec
+rep 0 epoll, one thread @100000: srv 0.531 µs/rec p50 774 p99 1682 p99.9 3868 µs
+rep 0 epoll, one thread @1000000: srv 0.085 µs/rec p50 893 p99 2537 p99.9 4922 µs
+rep 0 io_uring recv, batched submit: sat 5884846/s srv 0.054 cli 0.170 µs/rec
+rep 0 io_uring recv, batched submit @100000: srv 0.461 µs/rec p50 761 p99 3453 p99.9 20109 µs
+rep 0 io_uring recv, batched submit @1000000: srv 0.079 µs/rec p50 874 p99 2087 p99.9 3507 µs
+rep 0 io_uring multishot + buf ring + fixed files: sat 6774399/s srv 0.065 cli 0.145 µs/rec
+rep 0 io_uring multishot + buf ring + fixed files @100000: srv 0.505 µs/rec p50 775 p99 3405 p99.9 11925 µs
+rep 0 io_uring multishot + buf ring + fixed files @1000000: srv 0.109 µs/rec p50 927 p99 2728 p99.9 5468 µs
+rep 0 io_uring read_fixed (registered buffers): sat 5901036/s srv 0.057 cli 0.170 µs/rec
+rep 0 io_uring read_fixed (registered buffers) @100000: srv 0.467 µs/rec p50 766 p99 3192 p99.9 15682 µs
+rep 0 io_uring read_fixed (registered buffers) @1000000: srv 0.092 µs/rec p50 928 p99 31937 p99.9 41798 µs
+rep 0 io_uring multishot, SQPOLL: sat 6757933/s srv 0.191 cli 0.142 µs/rec
+rep 0 io_uring multishot, SQPOLL @100000: srv 10.162 µs/rec p50 757 p99 2925 p99.9 4808 µs
+rep 0 io_uring multishot, SQPOLL @1000000: srv 1.035 µs/rec p50 919 p99 4456 p99.9 12838 µs
+rep 0 tokio multi-thread, rpc.rs shape (today): sat 5692524/s srv 0.064 cli 0.174 µs/rec
+rep 0 tokio multi-thread, rpc.rs shape (today) @100000: srv 0.531 µs/rec p50 827 p99 10292 p99.9 19825 µs
+rep 0 tokio multi-thread, rpc.rs shape (today) @1000000: srv 0.100 µs/rec p50 940 p99 6411 p99.9 12545 µs
+rep 0 tokio current-thread, rpc.rs shape: sat 5622145/s srv 0.059 cli 0.168 µs/rec
+rep 0 tokio current-thread, rpc.rs shape @100000: srv 0.477 µs/rec p50 747 p99 1859 p99.9 5749 µs
+rep 0 tokio current-thread, rpc.rs shape @1000000: srv 0.094 µs/rec p50 919 p99 17796 p99.9 31780 µs
+rep 0 tokio current-thread, inline: sat 5605654/s srv 0.060 cli 0.175 µs/rec
+rep 0 tokio current-thread, inline @100000: srv 0.570 µs/rec p50 772 p99 1586 p99.9 2810 µs
+rep 0 tokio current-thread, inline @1000000: srv 0.082 µs/rec p50 889 p99 3620 p99.9 10318 µs
+rep 0 monoio (thread-per-core, io_uring): sat 6809748/s srv 0.057 cli 0.149 µs/rec
+rep 0 monoio (thread-per-core, io_uring) @100000: srv 0.477 µs/rec p50 741 p99 1539 p99.9 3459 µs
+rep 0 monoio (thread-per-core, io_uring) @1000000: srv 0.084 µs/rec p50 872 p99 2126 p99.9 3465 µs
+rep 0 shared-memory ring (upper bound): sat 8549566/s srv 0.050 cli 0.123 µs/rec
+rep 0 shared-memory ring (upper bound) @100000: srv 0.595 µs/rec p50 714 p99 1786 p99.9 3513 µs
+rep 0 shared-memory ring (upper bound) @1000000: srv 0.092 µs/rec p50 856 p99 3126 p99.9 10661 µs
+rep 0 QUIC (quinn), one stream: sat 1752161/s srv 0.398 cli 0.533 µs/rec
+rep 0 QUIC (quinn), one stream @100000: srv 1.353 µs/rec p50 916 p99 1835 p99.9 3244 µs
+rep 0 QUIC (quinn), one stream @1000000: srv 0.422 µs/rec p50 1353 p99 41619 p99.9 50728 µs
+rep 0 8 conns: std thread per conn: sat 7263603/s srv 0.065 cli 0.131 µs/rec
+rep 0 8 conns: std thread per conn @100000: srv 1.758 µs/rec p50 654 p99 2006 p99.9 5578 µs
+rep 0 8 conns: std thread per conn @1000000: srv 0.203 µs/rec p50 684 p99 3091 p99.9 9719 µs
+rep 0 8 conns: epoll, one thread: sat 6363963/s srv 0.078 cli 0.144 µs/rec
+rep 0 8 conns: epoll, one thread @100000: srv 1.777 µs/rec p50 661 p99 21657 p99.9 39088 µs
+rep 0 8 conns: epoll, one thread @1000000: srv 0.176 µs/rec p50 686 p99 27796 p99.9 39373 µs
+rep 0 8 conns: io_uring multishot, one submit: sat 7606702/s srv 0.083 cli 0.120 µs/rec
+rep 0 8 conns: io_uring multishot, one submit @100000: srv 1.690 µs/rec p50 679 p99 12320 p99.9 29886 µs
+rep 0 8 conns: io_uring multishot, one submit @1000000: srv 0.167 µs/rec p50 676 p99 1446 p99.9 7097 µs
+rep 0 8 conns: tokio multi-thread, rpc.rs shape: sat 8140784/s srv 0.054 cli 0.120 µs/rec
+rep 0 8 conns: tokio multi-thread, rpc.rs shape @100000: srv 1.745 µs/rec p50 653 p99 1603 p99.9 3439 µs
+rep 0 8 conns: tokio multi-thread, rpc.rs shape @1000000: srv 0.194 µs/rec p50 685 p99 1501 p99.9 2937 µs
+rep 0 8 conns: monoio: sat 7175688/s srv 0.076 cli 0.129 µs/rec
+rep 0 8 conns: monoio @100000: srv 1.993 µs/rec p50 690 p99 13805 p99.9 31346 µs
+rep 0 8 conns: monoio @1000000: srv 0.235 µs/rec p50 702 p99 16281 p99.9 31005 µs
+rep 0 epoll, busy spin: sat 7572841/s srv 0.126 cli 0.128 µs/rec
+rep 0 epoll, busy spin @100000: srv 9.828 µs/rec p50 695 p99 1891 p99.9 3231 µs
+rep 0 epoll, busy spin @1000000: srv 0.995 µs/rec p50 816 p99 1759 p99.9 3747 µs
+rep 0 epoll, adaptive spin 50 µs then park: sat 7465920/s srv 0.058 cli 0.135 µs/rec
+rep 0 epoll, adaptive spin 50 µs then park @100000: srv 0.587 µs/rec p50 748 p99 1583 p99.9 3301 µs
+rep 0 epoll, adaptive spin 50 µs then park @1000000: srv 0.083 µs/rec p50 900 p99 3667 p99.9 7124 µs
+rep 0 SO_BUSY_POLL 50 µs (std): sat 7005803/s srv 0.052 cli 0.144 µs/rec
+rep 0 SO_BUSY_POLL 50 µs (std) @100000: srv 0.426 µs/rec p50 745 p99 1399 p99.9 3367 µs
+rep 0 SO_BUSY_POLL 50 µs (std) @1000000: srv 0.074 µs/rec p50 859 p99 1577 p99.9 2885 µs
+rep 0 TCP_QUICKACK (std): sat 6914193/s srv 0.055 cli 0.145 µs/rec
+rep 0 TCP_QUICKACK (std) @100000: srv 0.479 µs/rec p50 753 p99 1777 p99.9 10092 µs
+rep 0 TCP_QUICKACK (std) @1000000: srv 0.077 µs/rec p50 876 p99 1992 p99.9 5660 µs
+rep 0 Nagle on (no TCP_NODELAY): sat 7505752/s srv 0.052 cli 0.133 µs/rec
+rep 0 Nagle on (no TCP_NODELAY) @100000: srv 0.426 µs/rec p50 751 p99 1790 p99.9 3811 µs
+rep 0 Nagle on (no TCP_NODELAY) @1000000: srv 0.079 µs/rec p50 856 p99 2193 p99.9 3988 µs
+rep 0 TCP_CORK around each send: sat 6710620/s srv 0.049 cli 0.149 µs/rec
+rep 0 TCP_CORK around each send @100000: srv 0.418 µs/rec p50 752 p99 2756 p99.9 5246 µs
+rep 0 TCP_CORK around each send @1000000: srv 0.092 µs/rec p50 929 p99 5916 p99.9 16730 µs
+rep 0 64 KiB socket buffers: sat 5558381/s srv 0.075 cli 0.159 µs/rec
+rep 0 64 KiB socket buffers @100000: srv 0.415 µs/rec p50 738 p99 2182 p99.9 7282 µs
+rep 0 64 KiB socket buffers @1000000: srv 0.098 µs/rec p50 896 p99 2869 p99.9 4828 µs
+rep 0 8 MiB socket buffers: sat 7039264/s srv 0.061 cli 0.139 µs/rec
+rep 0 8 MiB socket buffers @100000: srv 0.397 µs/rec p50 738 p99 1659 p99.9 3063 µs
+rep 0 8 MiB socket buffers @1000000: srv 0.072 µs/rec p50 866 p99 3552 p99.9 11564 µs
+rep 0 250-rec frames, a write each: sat 6103141/s srv 0.081 cli 0.182 µs/rec
+rep 0 250-rec frames, a write each @100000: srv 0.253 µs/rec p50 1589 p99 2844 p99.9 3297 µs
+rep 0 250-rec frames, a write each @1000000: srv 0.123 µs/rec p50 312 p99 1016 p99.9 3001 µs
+rep 0 250-rec frames, writev of 8: sat 9165552/s srv 0.046 cli 0.112 µs/rec
+rep 0 250-rec frames, writev of 8 @100000: srv 0.244 µs/rec p50 1608 p99 2935 p99.9 4002 µs
+rep 0 250-rec frames, writev of 8 @1000000: srv 0.129 µs/rec p50 314 p99 562 p99.9 2712 µs
+rep 0 250-rec frames, sendmmsg of 8: sat 5927380/s srv 0.056 cli 0.170 µs/rec
+rep 0 250-rec frames, sendmmsg of 8 @100000: srv 0.241 µs/rec p50 1627 p99 3070 p99.9 5047 µs
+rep 0 250-rec frames, sendmmsg of 8 @1000000: srv 0.138 µs/rec p50 309 p99 2336 p99.9 12133 µs
+rep 0 64 KiB frames, write: sat 6187980/s srv 0.090 cli 0.176 µs/rec
+rep 0 64 KiB frames, write @100000: srv 5.019 µs/rec p50 83 p99 490 p99.9 1663 µs
+rep 0 64 KiB frames, write @1000000: srv 0.404 µs/rec p50 84 p99 1184 p99.9 3564 µs
+rep 0 64 KiB frames, MSG_ZEROCOPY: sat 4372150/s srv 0.112 cli 0.243 µs/rec
+rep 0 64 KiB frames, MSG_ZEROCOPY @100000: srv 4.697 µs/rec p50 91 p99 1467 p99.9 7454 µs
+rep 0 64 KiB frames, MSG_ZEROCOPY @1000000: srv 0.413 µs/rec p50 97 p99 1283 p99.9 2635 µs
+rep 0 64 KiB frames, io_uring SEND_ZC: sat 4063053/s srv 0.139 cli 0.265 µs/rec
+rep 0 64 KiB frames, io_uring SEND_ZC @100000: srv 5.327 µs/rec p50 128 p99 646 p99.9 2768 µs
+rep 0 64 KiB frames, io_uring SEND_ZC @1000000: srv 0.502 µs/rec p50 115 p99 1800 p99.9 3785 µs
+rep 0 256 KiB frames, write: sat 5689799/s srv 0.066 cli 0.174 µs/rec
+rep 0 256 KiB frames, write @100000: srv 4.544 µs/rec p50 92 p99 1418 p99.9 8554 µs
+rep 0 256 KiB frames, write @1000000: srv 0.433 µs/rec p50 90 p99 10235 p99.9 25333 µs
+rep 0 256 KiB frames, MSG_ZEROCOPY: sat 6430096/s srv 0.071 cli 0.160 µs/rec
+rep 0 256 KiB frames, MSG_ZEROCOPY @100000: srv 4.273 µs/rec p50 98 p99 588 p99.9 2766 µs
+rep 0 256 KiB frames, MSG_ZEROCOPY @1000000: srv 0.438 µs/rec p50 68 p99 635 p99.9 2532 µs
+rep 0 256 KiB frames, io_uring SEND_ZC: sat 5932188/s srv 0.068 cli 0.172 µs/rec
+rep 0 256 KiB frames, io_uring SEND_ZC @100000: srv 4.717 µs/rec p50 158 p99 1643 p99.9 3472 µs
+rep 0 256 KiB frames, io_uring SEND_ZC @1000000: srv 0.483 µs/rec p50 118 p99 2140 p99.9 3306 µs
+rep 0 1 MiB frames, write: sat 6708392/s srv 0.056 cli 0.147 µs/rec
+rep 0 1 MiB frames, write @100000: srv 4.989 µs/rec p50 85 p99 1430 p99.9 2949 µs
+rep 0 1 MiB frames, write @1000000: srv 0.369 µs/rec p50 85 p99 2734 p99.9 5971 µs
+rep 0 1 MiB frames, MSG_ZEROCOPY: sat 6022344/s srv 0.075 cli 0.164 µs/rec
+rep 0 1 MiB frames, MSG_ZEROCOPY @100000: srv 3.962 µs/rec p50 89 p99 1142 p99.9 2264 µs
+rep 0 1 MiB frames, MSG_ZEROCOPY @1000000: srv 0.372 µs/rec p50 96 p99 2308 p99.9 4609 µs
+rep 0 1 MiB frames, io_uring SEND_ZC: sat 5426447/s srv 0.068 cli 0.178 µs/rec
+rep 0 1 MiB frames, io_uring SEND_ZC @100000: srv 5.036 µs/rec p50 127 p99 1372 p99.9 2542 µs
+rep 0 1 MiB frames, io_uring SEND_ZC @1000000: srv 0.445 µs/rec p50 93 p99 1871 p99.9 4070 µs
+rep 0 loopback, TSO/GSO/GRO off (std): sat 6337204/s srv 0.057 cli 0.155 µs/rec
+rep 0 loopback, TSO/GSO/GRO off (std) @100000: srv 0.419 µs/rec p50 771 p99 1574 p99.9 2926 µs
+rep 0 loopback, TSO/GSO/GRO off (std) @1000000: srv 0.080 µs/rec p50 917 p99 2634 p99.9 5806 µs
+rep 0 8 conns, linger 1 ms, ack writer per conn: sat 7241491/s srv 0.080 cli 0.130 µs/rec
+rep 0 8 conns, linger 1 ms, ack writer per conn @100000: srv 2.212 µs/rec p50 1243 p99 3775 p99.9 12499 µs
+rep 0 8 conns, linger 1 ms, ack writer per conn @1000000: srv 0.240 µs/rec p50 1227 p99 6389 p99.9 15206 µs
+rep 0 8 conns, linger 1 ms, acks coalesced: sat 6023545/s srv 0.074 cli 0.159 µs/rec
+rep 0 8 conns, linger 1 ms, acks coalesced @100000: srv 1.879 µs/rec p50 1234 p99 3994 p99.9 17241 µs
+rep 0 8 conns, linger 1 ms, acks coalesced @1000000: srv 0.229 µs/rec p50 1230 p99 3106 p99.9 9760 µs
+rep 0 8 conns, clocked by commit, ack writer per conn: sat 8019342/s srv 0.062 cli 0.120 µs/rec
+rep 0 8 conns, clocked by commit, ack writer per conn @100000: srv 2.531 µs/rec p50 1042 p99 4024 p99.9 9245 µs
+rep 0 8 conns, clocked by commit, ack writer per conn @1000000: srv 0.273 µs/rec p50 976 p99 3153 p99.9 9602 µs
+rep 0 8 conns, clocked by commit, acks coalesced: sat 7007127/s srv 0.063 cli 0.138 µs/rec
+rep 0 8 conns, clocked by commit, acks coalesced @100000: srv 1.861 µs/rec p50 1031 p99 2966 p99.9 9729 µs
+rep 0 8 conns, clocked by commit, acks coalesced @1000000: srv 0.209 µs/rec p50 976 p99 2934 p99.9 10287 µs
+rep 0 no linger: std blocking thread: sat 6472951/s srv 0.050 cli 0.154 µs/rec
+rep 0 no linger: std blocking thread @100000: srv 4.535 µs/rec p50 92 p99 1044 p99.9 2488 µs
+rep 0 no linger: std blocking thread @1000000: srv 0.381 µs/rec p50 86 p99 5428 p99.9 21214 µs
+rep 0 no linger: epoll, one thread: sat 6325107/s srv 0.058 cli 0.158 µs/rec
+rep 0 no linger: epoll, one thread @100000: srv 4.320 µs/rec p50 103 p99 1525 p99.9 5908 µs
+rep 0 no linger: epoll, one thread @1000000: srv 0.398 µs/rec p50 77 p99 1126 p99.9 2818 µs
+rep 0 no linger: epoll, adaptive spin 50 µs: sat 8289244/s srv 0.054 cli 0.122 µs/rec
+rep 0 no linger: epoll, adaptive spin 50 µs @100000: srv 9.734 µs/rec p50 71 p99 786 p99.9 3067 µs
+rep 0 no linger: epoll, adaptive spin 50 µs @1000000: srv 0.947 µs/rec p50 66 p99 1755 p99.9 5397 µs
+rep 0 no linger: io_uring multishot: sat 8240469/s srv 0.066 cli 0.122 µs/rec
+rep 0 no linger: io_uring multishot @100000: srv 5.028 µs/rec p50 86 p99 1354 p99.9 5182 µs
+rep 0 no linger: io_uring multishot @1000000: srv 0.438 µs/rec p50 85 p99 1261 p99.9 3873 µs
+rep 0 no linger: io_uring read_fixed: sat 5663494/s srv 0.064 cli 0.178 µs/rec
+rep 0 no linger: io_uring read_fixed @100000: srv 5.071 µs/rec p50 89 p99 1052 p99.9 3764 µs
+rep 0 no linger: io_uring read_fixed @1000000: srv 0.476 µs/rec p50 79 p99 1834 p99.9 5010 µs
+rep 0 no linger: tokio multi-thread, rpc.rs shape: sat 7853806/s srv 0.060 cli 0.128 µs/rec
+rep 0 no linger: tokio multi-thread, rpc.rs shape @100000: srv 7.481 µs/rec p50 97 p99 1361 p99.9 3035 µs
+rep 0 no linger: tokio multi-thread, rpc.rs shape @1000000: srv 0.668 µs/rec p50 95 p99 2803 p99.9 5319 µs
+rep 0 no linger: tokio current-thread, rpc.rs shape: sat 6833013/s srv 0.056 cli 0.148 µs/rec
+rep 0 no linger: tokio current-thread, rpc.rs shape @100000: srv 5.647 µs/rec p50 103 p99 311 p99.9 2520 µs
+rep 0 no linger: tokio current-thread, rpc.rs shape @1000000: srv 0.557 µs/rec p50 74 p99 2888 p99.9 6545 µs
+rep 0 no linger: tokio current-thread, inline: sat 6434885/s srv 0.052 cli 0.157 µs/rec
+rep 0 no linger: tokio current-thread, inline @100000: srv 5.562 µs/rec p50 81 p99 1449 p99.9 3215 µs
+rep 0 no linger: tokio current-thread, inline @1000000: srv 0.461 µs/rec p50 89 p99 1372 p99.9 3956 µs
+rep 0 no linger: monoio: sat 6956148/s srv 0.059 cli 0.143 µs/rec
+rep 0 no linger: monoio @100000: srv 5.217 µs/rec p50 86 p99 1107 p99.9 3532 µs
+rep 0 no linger: monoio @1000000: srv 0.483 µs/rec p50 76 p99 810 p99.9 2241 µs
+rep 0 no linger: shared-memory ring: sat 8676744/s srv 0.045 cli 0.124 µs/rec
+rep 0 no linger: shared-memory ring @100000: srv 9.540 µs/rec p50 11 p99 1761 p99.9 3334 µs
+rep 0 no linger: shared-memory ring @1000000: srv 0.978 µs/rec p50 2 p99 725 p99.9 3114 µs
+rep 0 veth: std blocking thread: sat 5388229/s srv 0.064 cli 0.186 µs/rec
+rep 0 veth: std blocking thread @100000: srv 0.443 µs/rec p50 742 p99 1473 p99.9 2894 µs
+rep 0 veth: std blocking thread @1000000: srv 0.081 µs/rec p50 884 p99 2504 p99.9 6085 µs
+rep 0 veth: epoll, one thread: sat 4136235/s srv 0.068 cli 0.239 µs/rec
+rep 0 veth: epoll, one thread @100000: srv 0.442 µs/rec p50 735 p99 1532 p99.9 2774 µs
+rep 0 veth: epoll, one thread @1000000: srv 0.080 µs/rec p50 878 p99 1780 p99.9 3095 µs
+rep 0 veth: io_uring multishot: sat 4946139/s srv 0.067 cli 0.201 µs/rec
+rep 0 veth: io_uring multishot @100000: srv 0.493 µs/rec p50 747 p99 2065 p99.9 6379 µs
+rep 0 veth: io_uring multishot @1000000: srv 0.100 µs/rec p50 906 p99 3500 p99.9 10021 µs
+rep 0 veth: tokio multi-thread, rpc.rs shape: sat 4907477/s srv 0.067 cli 0.205 µs/rec
+rep 0 veth: tokio multi-thread, rpc.rs shape @100000: srv 0.509 µs/rec p50 738 p99 1833 p99.9 4412 µs
+rep 0 veth: tokio multi-thread, rpc.rs shape @1000000: srv 0.087 µs/rec p50 882 p99 1641 p99.9 3744 µs
+rep 0 veth: 1 MiB frames, MSG_ZEROCOPY: sat 5150127/s srv 0.078 cli 0.185 µs/rec
+rep 0 veth: 1 MiB frames, MSG_ZEROCOPY @100000: srv 3.994 µs/rec p50 91 p99 420 p99.9 1654 µs
+rep 0 veth: 1 MiB frames, MSG_ZEROCOPY @1000000: srv 0.437 µs/rec p50 71 p99 2185 p99.9 4844 µs
+rep 0 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs: sat 5133978/s srv 0.057 cli 0.193 µs/rec
+rep 0 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs @100000: srv 0.478 µs/rec p50 744 p99 2349 p99.9 10878 µs
+rep 0 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs @1000000: srv 0.097 µs/rec p50 908 p99 3080 p99.9 5819 µs
+rep 0 veth: TSO/GSO off: sat 2969959/s srv 0.137 cli 0.324 µs/rec
+rep 0 veth: TSO/GSO off @100000: srv 0.440 µs/rec p50 755 p99 2007 p99.9 4350 µs
+rep 0 veth: TSO/GSO off @1000000: srv 0.137 µs/rec p50 1004 p99 2599 p99.9 4936 µs
+rep 1 std blocking thread (rounds 1-2): sat 6416321/s srv 0.058 cli 0.153 µs/rec
+rep 1 std blocking thread (rounds 1-2) @100000: srv 0.426 µs/rec p50 800 p99 28416 p99.9 42852 µs
+rep 1 std blocking thread (rounds 1-2) @1000000: srv 0.086 µs/rec p50 911 p99 3269 p99.9 6106 µs
+rep 1 epoll, one thread: sat 5446902/s srv 0.057 cli 0.184 µs/rec
+rep 1 epoll, one thread @100000: srv 0.479 µs/rec p50 775 p99 3416 p99.9 7995 µs
+rep 1 epoll, one thread @1000000: srv 0.081 µs/rec p50 911 p99 31168 p99.9 44067 µs
+rep 1 io_uring recv, batched submit: sat 6092880/s srv 0.053 cli 0.160 µs/rec
+rep 1 io_uring recv, batched submit @100000: srv 0.431 µs/rec p50 735 p99 1884 p99.9 4439 µs
+rep 1 io_uring recv, batched submit @1000000: srv 0.079 µs/rec p50 881 p99 2813 p99.9 13226 µs
+rep 1 io_uring multishot + buf ring + fixed files: sat 6893903/s srv 0.066 cli 0.146 µs/rec
+rep 1 io_uring multishot + buf ring + fixed files @100000: srv 0.449 µs/rec p50 743 p99 2284 p99.9 4334 µs
+rep 1 io_uring multishot + buf ring + fixed files @1000000: srv 0.102 µs/rec p50 909 p99 8908 p99.9 21449 µs
+rep 1 io_uring read_fixed (registered buffers): sat 5877181/s srv 0.056 cli 0.165 µs/rec
+rep 1 io_uring read_fixed (registered buffers) @100000: srv 0.451 µs/rec p50 749 p99 1970 p99.9 10930 µs
+rep 1 io_uring read_fixed (registered buffers) @1000000: srv 0.080 µs/rec p50 865 p99 1945 p99.9 4070 µs
+rep 1 io_uring multishot, SQPOLL: sat 7862819/s srv 0.162 cli 0.128 µs/rec
+rep 1 io_uring multishot, SQPOLL @100000: srv 10.025 µs/rec p50 728 p99 2320 p99.9 7013 µs
+rep 1 io_uring multishot, SQPOLL @1000000: srv 1.030 µs/rec p50 893 p99 2886 p99.9 6071 µs
+rep 1 tokio multi-thread, rpc.rs shape (today): sat 7684664/s srv 0.057 cli 0.131 µs/rec
+rep 1 tokio multi-thread, rpc.rs shape (today) @100000: srv 0.491 µs/rec p50 737 p99 1468 p99.9 3755 µs
+rep 1 tokio multi-thread, rpc.rs shape (today) @1000000: srv 0.095 µs/rec p50 896 p99 2221 p99.9 5143 µs
+rep 1 tokio current-thread, rpc.rs shape: sat 7283307/s srv 0.058 cli 0.137 µs/rec
+rep 1 tokio current-thread, rpc.rs shape @100000: srv 0.450 µs/rec p50 737 p99 4346 p99.9 22246 µs
+rep 1 tokio current-thread, rpc.rs shape @1000000: srv 0.105 µs/rec p50 892 p99 2558 p99.9 5671 µs
+rep 1 tokio current-thread, inline: sat 6116912/s srv 0.055 cli 0.160 µs/rec
+rep 1 tokio current-thread, inline @100000: srv 0.492 µs/rec p50 743 p99 1611 p99.9 3139 µs
+rep 1 tokio current-thread, inline @1000000: srv 0.084 µs/rec p50 868 p99 1739 p99.9 3431 µs
+rep 1 monoio (thread-per-core, io_uring): sat 6285331/s srv 0.055 cli 0.149 µs/rec
+rep 1 monoio (thread-per-core, io_uring) @100000: srv 0.445 µs/rec p50 735 p99 2317 p99.9 6377 µs
+rep 1 monoio (thread-per-core, io_uring) @1000000: srv 0.080 µs/rec p50 850 p99 1480 p99.9 2197 µs
+rep 1 shared-memory ring (upper bound): sat 9588548/s srv 0.044 cli 0.111 µs/rec
+rep 1 shared-memory ring (upper bound) @100000: srv 0.536 µs/rec p50 684 p99 1267 p99.9 1946 µs
+rep 1 shared-memory ring (upper bound) @1000000: srv 0.086 µs/rec p50 824 p99 1514 p99.9 2541 µs
+rep 1 QUIC (quinn), one stream: sat 2294171/s srv 0.326 cli 0.408 µs/rec
+rep 1 QUIC (quinn), one stream @100000: srv 1.211 µs/rec p50 902 p99 4529 p99.9 12181 µs
+rep 1 QUIC (quinn), one stream @1000000: srv 0.402 µs/rec p50 1264 p99 5017 p99.9 8719 µs
+rep 1 8 conns: std thread per conn: sat 6807298/s srv 0.058 cli 0.145 µs/rec
+rep 1 8 conns: std thread per conn @100000: srv 1.791 µs/rec p50 704 p99 2421 p99.9 9225 µs
+rep 1 8 conns: std thread per conn @1000000: srv 0.207 µs/rec p50 731 p99 4230 p99.9 13033 µs
+rep 1 8 conns: epoll, one thread: sat 7334342/s srv 0.071 cli 0.129 µs/rec
+rep 1 8 conns: epoll, one thread @100000: srv 1.813 µs/rec p50 700 p99 16593 p99.9 34069 µs
+rep 1 8 conns: epoll, one thread @1000000: srv 0.176 µs/rec p50 708 p99 24555 p99.9 38324 µs
+rep 1 8 conns: io_uring multishot, one submit: sat 7557921/s srv 0.089 cli 0.125 µs/rec
+rep 1 8 conns: io_uring multishot, one submit @100000: srv 1.766 µs/rec p50 703 p99 13672 p99.9 31029 µs
+rep 1 8 conns: io_uring multishot, one submit @1000000: srv 0.183 µs/rec p50 696 p99 20706 p99.9 34633 µs
+rep 1 8 conns: tokio multi-thread, rpc.rs shape: sat 7544327/s srv 0.056 cli 0.129 µs/rec
+rep 1 8 conns: tokio multi-thread, rpc.rs shape @100000: srv 1.896 µs/rec p50 695 p99 1892 p99.9 3579 µs
+rep 1 8 conns: tokio multi-thread, rpc.rs shape @1000000: srv 0.202 µs/rec p50 690 p99 1825 p99.9 3378 µs
+rep 1 8 conns: monoio: sat 6955445/s srv 0.072 cli 0.135 µs/rec
+rep 1 8 conns: monoio @100000: srv 2.009 µs/rec p50 698 p99 13923 p99.9 31419 µs
+rep 1 8 conns: monoio @1000000: srv 0.240 µs/rec p50 735 p99 17357 p99.9 31914 µs
+rep 1 epoll, busy spin: sat 7476982/s srv 0.133 cli 0.134 µs/rec
+rep 1 epoll, busy spin @100000: srv 9.933 µs/rec p50 678 p99 1779 p99.9 3460 µs
+rep 1 epoll, busy spin @1000000: srv 0.985 µs/rec p50 833 p99 2231 p99.9 3199 µs
+rep 1 epoll, adaptive spin 50 µs then park: sat 7140220/s srv 0.054 cli 0.133 µs/rec
+rep 1 epoll, adaptive spin 50 µs then park @100000: srv 0.566 µs/rec p50 741 p99 1688 p99.9 3617 µs
+rep 1 epoll, adaptive spin 50 µs then park @1000000: srv 0.080 µs/rec p50 859 p99 1977 p99.9 3532 µs
+rep 1 SO_BUSY_POLL 50 µs (std): sat 6370377/s srv 0.056 cli 0.157 µs/rec
+rep 1 SO_BUSY_POLL 50 µs (std) @100000: srv 0.424 µs/rec p50 748 p99 2254 p99.9 3754 µs
+rep 1 SO_BUSY_POLL 50 µs (std) @1000000: srv 0.076 µs/rec p50 860 p99 2868 p99.9 13724 µs
+rep 1 TCP_QUICKACK (std): sat 7824511/s srv 0.050 cli 0.129 µs/rec
+rep 1 TCP_QUICKACK (std) @100000: srv 0.447 µs/rec p50 740 p99 1435 p99.9 2517 µs
+rep 1 TCP_QUICKACK (std) @1000000: srv 0.079 µs/rec p50 873 p99 1566 p99.9 2594 µs
+rep 1 Nagle on (no TCP_NODELAY): sat 5954217/s srv 0.053 cli 0.168 µs/rec
+rep 1 Nagle on (no TCP_NODELAY) @100000: srv 0.408 µs/rec p50 752 p99 2350 p99.9 5219 µs
+rep 1 Nagle on (no TCP_NODELAY) @1000000: srv 0.080 µs/rec p50 895 p99 3079 p99.9 11998 µs
+rep 1 TCP_CORK around each send: sat 6190407/s srv 0.053 cli 0.162 µs/rec
+rep 1 TCP_CORK around each send @100000: srv 0.427 µs/rec p50 734 p99 1605 p99.9 3223 µs
+rep 1 TCP_CORK around each send @1000000: srv 0.082 µs/rec p50 898 p99 1838 p99.9 4831 µs
+rep 1 64 KiB socket buffers: sat 5778834/s srv 0.065 cli 0.163 µs/rec
+rep 1 64 KiB socket buffers @100000: srv 0.397 µs/rec p50 744 p99 1438 p99.9 3140 µs
+rep 1 64 KiB socket buffers @1000000: srv 0.102 µs/rec p50 912 p99 8522 p99.9 20209 µs
+rep 1 8 MiB socket buffers: sat 6078297/s srv 0.052 cli 0.150 µs/rec
+rep 1 8 MiB socket buffers @100000: srv 0.460 µs/rec p50 746 p99 1399 p99.9 2957 µs
+rep 1 8 MiB socket buffers @1000000: srv 0.076 µs/rec p50 855 p99 1946 p99.9 3580 µs
+rep 1 250-rec frames, a write each: sat 5495203/s srv 0.088 cli 0.194 µs/rec
+rep 1 250-rec frames, a write each @100000: srv 0.251 µs/rec p50 1605 p99 2903 p99.9 4119 µs
+rep 1 250-rec frames, a write each @1000000: srv 0.129 µs/rec p50 309 p99 1485 p99.9 6807 µs
+rep 1 250-rec frames, writev of 8: sat 9140610/s srv 0.049 cli 0.110 µs/rec
+rep 1 250-rec frames, writev of 8 @100000: srv 0.257 µs/rec p50 1600 p99 3085 p99.9 4726 µs
+rep 1 250-rec frames, writev of 8 @1000000: srv 0.128 µs/rec p50 317 p99 5245 p99.9 11201 µs
+rep 1 250-rec frames, sendmmsg of 8: sat 8114587/s srv 0.048 cli 0.130 µs/rec
+rep 1 250-rec frames, sendmmsg of 8 @100000: srv 0.281 µs/rec p50 1648 p99 10904 p99.9 22647 µs
+rep 1 250-rec frames, sendmmsg of 8 @1000000: srv 0.133 µs/rec p50 315 p99 1328 p99.9 2703 µs
+rep 1 64 KiB frames, write: sat 6060097/s srv 0.081 cli 0.171 µs/rec
+rep 1 64 KiB frames, write @100000: srv 4.813 µs/rec p50 89 p99 944 p99.9 3979 µs
+rep 1 64 KiB frames, write @1000000: srv 0.396 µs/rec p50 86 p99 1281 p99.9 4818 µs
+rep 1 64 KiB frames, MSG_ZEROCOPY: sat 4898213/s srv 0.096 cli 0.216 µs/rec
+rep 1 64 KiB frames, MSG_ZEROCOPY @100000: srv 3.948 µs/rec p50 94 p99 861 p99.9 2806 µs
+rep 1 64 KiB frames, MSG_ZEROCOPY @1000000: srv 0.383 µs/rec p50 71 p99 3342 p99.9 8999 µs
+rep 1 64 KiB frames, io_uring SEND_ZC: sat 4021651/s srv 0.124 cli 0.267 µs/rec
+rep 1 64 KiB frames, io_uring SEND_ZC @100000: srv 4.413 µs/rec p50 132 p99 3511 p99.9 10171 µs
+rep 1 64 KiB frames, io_uring SEND_ZC @1000000: srv 0.477 µs/rec p50 82 p99 1622 p99.9 3600 µs
+rep 1 256 KiB frames, write: sat 7693076/s srv 0.051 cli 0.130 µs/rec
+rep 1 256 KiB frames, write @100000: srv 4.799 µs/rec p50 85 p99 1469 p99.9 3211 µs
+rep 1 256 KiB frames, write @1000000: srv 0.391 µs/rec p50 85 p99 1137 p99.9 2964 µs
+rep 1 256 KiB frames, MSG_ZEROCOPY: sat 5185349/s srv 0.070 cli 0.194 µs/rec
+rep 1 256 KiB frames, MSG_ZEROCOPY @100000: srv 4.873 µs/rec p50 89 p99 493 p99.9 1502 µs
+rep 1 256 KiB frames, MSG_ZEROCOPY @1000000: srv 0.427 µs/rec p50 75 p99 1052 p99.9 2238 µs
+rep 1 256 KiB frames, io_uring SEND_ZC: sat 5081495/s srv 0.071 cli 0.200 µs/rec
+rep 1 256 KiB frames, io_uring SEND_ZC @100000: srv 4.808 µs/rec p50 141 p99 436 p99.9 1325 µs
+rep 1 256 KiB frames, io_uring SEND_ZC @1000000: srv 0.466 µs/rec p50 85 p99 1913 p99.9 3027 µs
+rep 1 1 MiB frames, write: sat 7553630/s srv 0.057 cli 0.133 µs/rec
+rep 1 1 MiB frames, write @100000: srv 4.419 µs/rec p50 89 p99 1588 p99.9 4447 µs
+rep 1 1 MiB frames, write @1000000: srv 0.402 µs/rec p50 88 p99 1365 p99.9 7010 µs
+rep 1 1 MiB frames, MSG_ZEROCOPY: sat 6341686/s srv 0.063 cli 0.154 µs/rec
+rep 1 1 MiB frames, MSG_ZEROCOPY @100000: srv 4.350 µs/rec p50 90 p99 506 p99.9 1798 µs
+rep 1 1 MiB frames, MSG_ZEROCOPY @1000000: srv 0.406 µs/rec p50 71 p99 660 p99.9 2406 µs
+rep 1 1 MiB frames, io_uring SEND_ZC: sat 5415617/s srv 0.068 cli 0.180 µs/rec
+rep 1 1 MiB frames, io_uring SEND_ZC @100000: srv 5.251 µs/rec p50 138 p99 584 p99.9 2250 µs
+rep 1 1 MiB frames, io_uring SEND_ZC @1000000: srv 0.449 µs/rec p50 87 p99 2922 p99.9 11809 µs
+rep 1 loopback, TSO/GSO/GRO off (std): sat 7375237/s srv 0.052 cli 0.132 µs/rec
+rep 1 loopback, TSO/GSO/GRO off (std) @100000: srv 0.441 µs/rec p50 745 p99 1794 p99.9 6323 µs
+rep 1 loopback, TSO/GSO/GRO off (std) @1000000: srv 0.073 µs/rec p50 846 p99 2005 p99.9 3922 µs
+rep 1 8 conns, linger 1 ms, ack writer per conn: sat 7322782/s srv 0.067 cli 0.130 µs/rec
+rep 1 8 conns, linger 1 ms, ack writer per conn @100000: srv 1.974 µs/rec p50 1190 p99 2738 p99.9 10569 µs
+rep 1 8 conns, linger 1 ms, ack writer per conn @1000000: srv 0.254 µs/rec p50 1218 p99 4391 p99.9 14190 µs
+rep 1 8 conns, linger 1 ms, acks coalesced: sat 8549231/s srv 0.066 cli 0.111 µs/rec
+rep 1 8 conns, linger 1 ms, acks coalesced @100000: srv 1.683 µs/rec p50 1198 p99 2368 p99.9 7684 µs
+rep 1 8 conns, linger 1 ms, acks coalesced @1000000: srv 0.202 µs/rec p50 1209 p99 3341 p99.9 10713 µs
+rep 1 8 conns, clocked by commit, ack writer per conn: sat 7935891/s srv 0.068 cli 0.120 µs/rec
+rep 1 8 conns, clocked by commit, ack writer per conn @100000: srv 2.484 µs/rec p50 1017 p99 3430 p99.9 13352 µs
+rep 1 8 conns, clocked by commit, ack writer per conn @1000000: srv 0.266 µs/rec p50 969 p99 3249 p99.9 11460 µs
+rep 1 8 conns, clocked by commit, acks coalesced: sat 7946643/s srv 0.055 cli 0.124 µs/rec
+rep 1 8 conns, clocked by commit, acks coalesced @100000: srv 1.787 µs/rec p50 1017 p99 2788 p99.9 7410 µs
+rep 1 8 conns, clocked by commit, acks coalesced @1000000: srv 0.208 µs/rec p50 968 p99 1879 p99.9 8172 µs
+rep 1 no linger: std blocking thread: sat 8059049/s srv 0.051 cli 0.123 µs/rec
+rep 1 no linger: std blocking thread @100000: srv 4.580 µs/rec p50 86 p99 1684 p99.9 5570 µs
+rep 1 no linger: std blocking thread @1000000: srv 0.387 µs/rec p50 85 p99 1150 p99.9 3232 µs
+rep 1 no linger: epoll, one thread: sat 6701278/s srv 0.056 cli 0.149 µs/rec
+rep 1 no linger: epoll, one thread @100000: srv 4.647 µs/rec p50 94 p99 539 p99.9 1723 µs
+rep 1 no linger: epoll, one thread @1000000: srv 0.468 µs/rec p50 78 p99 1190 p99.9 2829 µs
+rep 1 no linger: epoll, adaptive spin 50 µs: sat 8282337/s srv 0.054 cli 0.121 µs/rec
+rep 1 no linger: epoll, adaptive spin 50 µs @100000: srv 9.822 µs/rec p50 62 p99 265 p99.9 1489 µs
+rep 1 no linger: epoll, adaptive spin 50 µs @1000000: srv 0.953 µs/rec p50 72 p99 1300 p99.9 2840 µs
+rep 1 no linger: io_uring multishot: sat 8507695/s srv 0.062 cli 0.118 µs/rec
+rep 1 no linger: io_uring multishot @100000: srv 4.845 µs/rec p50 85 p99 741 p99.9 4557 µs
+rep 1 no linger: io_uring multishot @1000000: srv 0.437 µs/rec p50 84 p99 656 p99.9 1904 µs
+rep 1 no linger: io_uring read_fixed: sat 7267306/s srv 0.051 cli 0.137 µs/rec
+rep 1 no linger: io_uring read_fixed @100000: srv 5.257 µs/rec p50 88 p99 734 p99.9 1820 µs
+rep 1 no linger: io_uring read_fixed @1000000: srv 0.475 µs/rec p50 80 p99 1705 p99.9 3981 µs
+rep 1 no linger: tokio multi-thread, rpc.rs shape: sat 7683459/s srv 0.057 cli 0.131 µs/rec
+rep 1 no linger: tokio multi-thread, rpc.rs shape @100000: srv 7.487 µs/rec p50 93 p99 1691 p99.9 3855 µs
+rep 1 no linger: tokio multi-thread, rpc.rs shape @1000000: srv 0.616 µs/rec p50 93 p99 3068 p99.9 7174 µs
+rep 1 no linger: tokio current-thread, rpc.rs shape: sat 7505641/s srv 0.051 cli 0.133 µs/rec
+rep 1 no linger: tokio current-thread, rpc.rs shape @100000: srv 5.436 µs/rec p50 93 p99 877 p99.9 2932 µs
+rep 1 no linger: tokio current-thread, rpc.rs shape @1000000: srv 0.501 µs/rec p50 87 p99 1934 p99.9 10792 µs
+rep 1 no linger: tokio current-thread, inline: sat 6900615/s srv 0.056 cli 0.145 µs/rec
+rep 1 no linger: tokio current-thread, inline @100000: srv 5.603 µs/rec p50 85 p99 615 p99.9 2799 µs
+rep 1 no linger: tokio current-thread, inline @1000000: srv 0.425 µs/rec p50 81 p99 1117 p99.9 3621 µs
+rep 1 no linger: monoio: sat 6122953/s srv 0.053 cli 0.157 µs/rec
+rep 1 no linger: monoio @100000: srv 5.301 µs/rec p50 82 p99 1295 p99.9 3849 µs
+rep 1 no linger: monoio @1000000: srv 0.453 µs/rec p50 86 p99 1387 p99.9 2707 µs
+rep 1 no linger: shared-memory ring: sat 7766395/s srv 0.056 cli 0.138 µs/rec
+rep 1 no linger: shared-memory ring @100000: srv 9.002 µs/rec p50 11 p99 1499 p99.9 3177 µs
+rep 1 no linger: shared-memory ring @1000000: srv 0.918 µs/rec p50 2 p99 1829 p99.9 3302 µs
+rep 1 veth: std blocking thread: sat 4790227/s srv 0.060 cli 0.203 µs/rec
+rep 1 veth: std blocking thread @100000: srv 0.432 µs/rec p50 754 p99 2033 p99.9 4033 µs
+rep 1 veth: std blocking thread @1000000: srv 0.087 µs/rec p50 909 p99 2457 p99.9 6091 µs
+rep 1 veth: epoll, one thread: sat 5208923/s srv 0.069 cli 0.190 µs/rec
+rep 1 veth: epoll, one thread @100000: srv 0.491 µs/rec p50 763 p99 1988 p99.9 5444 µs
+rep 1 veth: epoll, one thread @1000000: srv 0.091 µs/rec p50 908 p99 1914 p99.9 4233 µs
+rep 1 veth: io_uring multishot: sat 4760265/s srv 0.077 cli 0.208 µs/rec
+rep 1 veth: io_uring multishot @100000: srv 0.522 µs/rec p50 748 p99 1437 p99.9 2289 µs
+rep 1 veth: io_uring multishot @1000000: srv 0.108 µs/rec p50 949 p99 15835 p99.9 25523 µs
+rep 1 veth: tokio multi-thread, rpc.rs shape: sat 4499560/s srv 0.075 cli 0.217 µs/rec
+rep 1 veth: tokio multi-thread, rpc.rs shape @100000: srv 0.593 µs/rec p50 781 p99 2447 p99.9 4607 µs
+rep 1 veth: tokio multi-thread, rpc.rs shape @1000000: srv 0.100 µs/rec p50 927 p99 3881 p99.9 10906 µs
+rep 1 veth: 1 MiB frames, MSG_ZEROCOPY: sat 4903406/s srv 0.093 cli 0.197 µs/rec
+rep 1 veth: 1 MiB frames, MSG_ZEROCOPY @100000: srv 4.095 µs/rec p50 91 p99 1259 p99.9 4482 µs
+rep 1 veth: 1 MiB frames, MSG_ZEROCOPY @1000000: srv 0.429 µs/rec p50 81 p99 1816 p99.9 6724 µs
+rep 1 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs: sat 5079211/s srv 0.059 cli 0.195 µs/rec
+rep 1 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs @100000: srv 0.431 µs/rec p50 742 p99 1571 p99.9 3056 µs
+rep 1 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs @1000000: srv 0.084 µs/rec p50 913 p99 5017 p99.9 15583 µs
+rep 1 veth: TSO/GSO off: sat 3045167/s srv 0.137 cli 0.308 µs/rec
+rep 1 veth: TSO/GSO off @100000: srv 0.477 µs/rec p50 754 p99 1489 p99.9 3230 µs
+rep 1 veth: TSO/GSO off @1000000: srv 0.137 µs/rec p50 985 p99 2259 p99.9 4786 µs
+rep 2 std blocking thread (rounds 1-2): sat 5925506/s srv 0.056 cli 0.168 µs/rec
+rep 2 std blocking thread (rounds 1-2) @100000: srv 0.399 µs/rec p50 741 p99 1582 p99.9 3719 µs
+rep 2 std blocking thread (rounds 1-2) @1000000: srv 0.074 µs/rec p50 868 p99 2350 p99.9 4429 µs
+rep 2 epoll, one thread: sat 6949197/s srv 0.055 cli 0.146 µs/rec
+rep 2 epoll, one thread @100000: srv 0.436 µs/rec p50 736 p99 1489 p99.9 3061 µs
+rep 2 epoll, one thread @1000000: srv 0.083 µs/rec p50 865 p99 2100 p99.9 5291 µs
+rep 2 io_uring recv, batched submit: sat 6737433/s srv 0.050 cli 0.149 µs/rec
+rep 2 io_uring recv, batched submit @100000: srv 0.467 µs/rec p50 742 p99 1784 p99.9 8151 µs
+rep 2 io_uring recv, batched submit @1000000: srv 0.083 µs/rec p50 879 p99 1940 p99.9 3751 µs
+rep 2 io_uring multishot + buf ring + fixed files: sat 8424081/s srv 0.064 cli 0.120 µs/rec
+rep 2 io_uring multishot + buf ring + fixed files @100000: srv 0.472 µs/rec p50 747 p99 1740 p99.9 3180 µs
+rep 2 io_uring multishot + buf ring + fixed files @1000000: srv 0.104 µs/rec p50 909 p99 3471 p99.9 11912 µs
+rep 2 io_uring read_fixed (registered buffers): sat 5089817/s srv 0.055 cli 0.193 µs/rec
+rep 2 io_uring read_fixed (registered buffers) @100000: srv 0.405 µs/rec p50 737 p99 1834 p99.9 3865 µs
+rep 2 io_uring read_fixed (registered buffers) @1000000: srv 0.083 µs/rec p50 885 p99 3156 p99.9 5646 µs
+rep 2 io_uring multishot, SQPOLL: sat 7836289/s srv 0.161 cli 0.129 µs/rec
+rep 2 io_uring multishot, SQPOLL @100000: srv 10.173 µs/rec p50 742 p99 1959 p99.9 3735 µs
+rep 2 io_uring multishot, SQPOLL @1000000: srv 1.047 µs/rec p50 873 p99 2560 p99.9 5340 µs
+rep 2 tokio multi-thread, rpc.rs shape (today): sat 7339222/s srv 0.056 cli 0.135 µs/rec
+rep 2 tokio multi-thread, rpc.rs shape (today) @100000: srv 0.514 µs/rec p50 760 p99 1413 p99.9 2681 µs
+rep 2 tokio multi-thread, rpc.rs shape (today) @1000000: srv 0.092 µs/rec p50 884 p99 1950 p99.9 3136 µs
+rep 2 tokio current-thread, rpc.rs shape: sat 7864650/s srv 0.053 cli 0.128 µs/rec
+rep 2 tokio current-thread, rpc.rs shape @100000: srv 0.547 µs/rec p50 760 p99 1863 p99.9 4289 µs
+rep 2 tokio current-thread, rpc.rs shape @1000000: srv 0.103 µs/rec p50 909 p99 2416 p99.9 4350 µs
+rep 2 tokio current-thread, inline: sat 7245369/s srv 0.059 cli 0.139 µs/rec
+rep 2 tokio current-thread, inline @100000: srv 0.464 µs/rec p50 745 p99 1773 p99.9 3093 µs
+rep 2 tokio current-thread, inline @1000000: srv 0.078 µs/rec p50 863 p99 1886 p99.9 5593 µs
+rep 2 monoio (thread-per-core, io_uring): sat 6506597/s srv 0.057 cli 0.155 µs/rec
+rep 2 monoio (thread-per-core, io_uring) @100000: srv 0.409 µs/rec p50 725 p99 1494 p99.9 2789 µs
+rep 2 monoio (thread-per-core, io_uring) @1000000: srv 0.078 µs/rec p50 851 p99 1748 p99.9 3410 µs
+rep 2 shared-memory ring (upper bound): sat 10437130/s srv 0.044 cli 0.103 µs/rec
+rep 2 shared-memory ring (upper bound) @100000: srv 0.564 µs/rec p50 693 p99 1498 p99.9 3024 µs
+rep 2 shared-memory ring (upper bound) @1000000: srv 0.088 µs/rec p50 829 p99 1478 p99.9 2286 µs
+rep 2 QUIC (quinn), one stream: sat 2275441/s srv 0.315 cli 0.417 µs/rec
+rep 2 QUIC (quinn), one stream @100000: srv 1.259 µs/rec p50 906 p99 2224 p99.9 3878 µs
+rep 2 QUIC (quinn), one stream @1000000: srv 0.399 µs/rec p50 1305 p99 5087 p99.9 8459 µs
+rep 2 8 conns: std thread per conn: sat 7232531/s srv 0.056 cli 0.129 µs/rec
+rep 2 8 conns: std thread per conn @100000: srv 1.724 µs/rec p50 663 p99 2140 p99.9 5758 µs
+rep 2 8 conns: std thread per conn @1000000: srv 0.195 µs/rec p50 699 p99 8036 p99.9 20270 µs
+rep 2 8 conns: epoll, one thread: sat 7610680/s srv 0.060 cli 0.124 µs/rec
+rep 2 8 conns: epoll, one thread @100000: srv 1.579 µs/rec p50 668 p99 13510 p99.9 31007 µs
+rep 2 8 conns: epoll, one thread @1000000: srv 0.173 µs/rec p50 687 p99 23718 p99.9 37686 µs
+rep 2 8 conns: io_uring multishot, one submit: sat 8117095/s srv 0.077 cli 0.117 µs/rec
+rep 2 8 conns: io_uring multishot, one submit @100000: srv 1.545 µs/rec p50 662 p99 13186 p99.9 30653 µs
+rep 2 8 conns: io_uring multishot, one submit @1000000: srv 0.184 µs/rec p50 699 p99 24722 p99.9 37055 µs
+rep 2 8 conns: tokio multi-thread, rpc.rs shape: sat 7428862/s srv 0.059 cli 0.132 µs/rec
+rep 2 8 conns: tokio multi-thread, rpc.rs shape @100000: srv 1.757 µs/rec p50 658 p99 2367 p99.9 3794 µs
+rep 2 8 conns: tokio multi-thread, rpc.rs shape @1000000: srv 0.195 µs/rec p50 687 p99 2096 p99.9 3856 µs
+rep 2 8 conns: monoio: sat 7012068/s srv 0.073 cli 0.132 µs/rec
+rep 2 8 conns: monoio @100000: srv 1.838 µs/rec p50 670 p99 12613 p99.9 30152 µs
+rep 2 8 conns: monoio @1000000: srv 0.221 µs/rec p50 700 p99 18511 p99.9 32808 µs
+rep 2 epoll, busy spin: sat 7991984/s srv 0.123 cli 0.124 µs/rec
+rep 2 epoll, busy spin @100000: srv 9.749 µs/rec p50 691 p99 3519 p99.9 7819 µs
+rep 2 epoll, busy spin @1000000: srv 0.990 µs/rec p50 801 p99 1589 p99.9 2894 µs
+rep 2 epoll, adaptive spin 50 µs then park: sat 8180112/s srv 0.053 cli 0.123 µs/rec
+rep 2 epoll, adaptive spin 50 µs then park @100000: srv 0.569 µs/rec p50 742 p99 2214 p99.9 4019 µs
+rep 2 epoll, adaptive spin 50 µs then park @1000000: srv 0.084 µs/rec p50 879 p99 1848 p99.9 8359 µs
+rep 2 SO_BUSY_POLL 50 µs (std): sat 7750656/s srv 0.053 cli 0.129 µs/rec
+rep 2 SO_BUSY_POLL 50 µs (std) @100000: srv 0.426 µs/rec p50 749 p99 2670 p99.9 6696 µs
+rep 2 SO_BUSY_POLL 50 µs (std) @1000000: srv 0.073 µs/rec p50 856 p99 1665 p99.9 3584 µs
+rep 2 TCP_QUICKACK (std): sat 7070710/s srv 0.051 cli 0.141 µs/rec
+rep 2 TCP_QUICKACK (std) @100000: srv 0.465 µs/rec p50 747 p99 1672 p99.9 2882 µs
+rep 2 TCP_QUICKACK (std) @1000000: srv 0.079 µs/rec p50 864 p99 2514 p99.9 11261 µs
+rep 2 Nagle on (no TCP_NODELAY): sat 7098625/s srv 0.048 cli 0.137 µs/rec
+rep 2 Nagle on (no TCP_NODELAY) @100000: srv 0.416 µs/rec p50 732 p99 1489 p99.9 4914 µs
+rep 2 Nagle on (no TCP_NODELAY) @1000000: srv 0.074 µs/rec p50 856 p99 2413 p99.9 6333 µs
+rep 2 TCP_CORK around each send: sat 6028697/s srv 0.051 cli 0.159 µs/rec
+rep 2 TCP_CORK around each send @100000: srv 0.396 µs/rec p50 737 p99 1660 p99.9 3740 µs
+rep 2 TCP_CORK around each send @1000000: srv 0.078 µs/rec p50 897 p99 2737 p99.9 4195 µs
+rep 2 64 KiB socket buffers: sat 5485822/s srv 0.064 cli 0.169 µs/rec
+rep 2 64 KiB socket buffers @100000: srv 0.434 µs/rec p50 725 p99 1324 p99.9 2032 µs
+rep 2 64 KiB socket buffers @1000000: srv 0.098 µs/rec p50 891 p99 2450 p99.9 4171 µs
+rep 2 8 MiB socket buffers: sat 5531573/s srv 0.061 cli 0.182 µs/rec
+rep 2 8 MiB socket buffers @100000: srv 0.345 µs/rec p50 725 p99 1635 p99.9 3970 µs
+rep 2 8 MiB socket buffers @1000000: srv 0.076 µs/rec p50 850 p99 2005 p99.9 3767 µs
+rep 2 250-rec frames, a write each: sat 5507101/s srv 0.104 cli 0.197 µs/rec
+rep 2 250-rec frames, a write each @100000: srv 0.228 µs/rec p50 1572 p99 2833 p99.9 3747 µs
+rep 2 250-rec frames, a write each @1000000: srv 0.128 µs/rec p50 321 p99 1164 p99.9 2793 µs
+rep 2 250-rec frames, writev of 8: sat 8762008/s srv 0.047 cli 0.118 µs/rec
+rep 2 250-rec frames, writev of 8 @100000: srv 0.260 µs/rec p50 1589 p99 2844 p99.9 3221 µs
+rep 2 250-rec frames, writev of 8 @1000000: srv 0.134 µs/rec p50 321 p99 1762 p99.9 4071 µs
+rep 2 250-rec frames, sendmmsg of 8: sat 6708882/s srv 0.056 cli 0.158 µs/rec
+rep 2 250-rec frames, sendmmsg of 8 @100000: srv 0.244 µs/rec p50 1577 p99 2837 p99.9 3272 µs
+rep 2 250-rec frames, sendmmsg of 8 @1000000: srv 0.127 µs/rec p50 313 p99 829 p99.9 2223 µs
+rep 2 64 KiB frames, write: sat 5586600/s srv 0.087 cli 0.188 µs/rec
+rep 2 64 KiB frames, write @100000: srv 4.800 µs/rec p50 81 p99 563 p99.9 2283 µs
+rep 2 64 KiB frames, write @1000000: srv 0.375 µs/rec p50 92 p99 972 p99.9 2230 µs
+rep 2 64 KiB frames, MSG_ZEROCOPY: sat 4991983/s srv 0.105 cli 0.216 µs/rec
+rep 2 64 KiB frames, MSG_ZEROCOPY @100000: srv 4.281 µs/rec p50 98 p99 1417 p99.9 2566 µs
+rep 2 64 KiB frames, MSG_ZEROCOPY @1000000: srv 0.395 µs/rec p50 79 p99 1400 p99.9 2620 µs
+rep 2 64 KiB frames, io_uring SEND_ZC: sat 4181542/s srv 0.126 cli 0.250 µs/rec
+rep 2 64 KiB frames, io_uring SEND_ZC @100000: srv 4.772 µs/rec p50 152 p99 2044 p99.9 7832 µs
+rep 2 64 KiB frames, io_uring SEND_ZC @1000000: srv 0.449 µs/rec p50 101 p99 2031 p99.9 3255 µs
+rep 2 256 KiB frames, write: sat 6142257/s srv 0.058 cli 0.161 µs/rec
+rep 2 256 KiB frames, write @100000: srv 4.637 µs/rec p50 89 p99 1663 p99.9 3663 µs
+rep 2 256 KiB frames, write @1000000: srv 0.359 µs/rec p50 89 p99 2095 p99.9 4433 µs
+rep 2 256 KiB frames, MSG_ZEROCOPY: sat 5408850/s srv 0.069 cli 0.186 µs/rec
+rep 2 256 KiB frames, MSG_ZEROCOPY @100000: srv 4.299 µs/rec p50 96 p99 1258 p99.9 2269 µs
+rep 2 256 KiB frames, MSG_ZEROCOPY @1000000: srv 0.373 µs/rec p50 79 p99 2287 p99.9 7470 µs
+rep 2 256 KiB frames, io_uring SEND_ZC: sat 5322416/s srv 0.079 cli 0.188 µs/rec
+rep 2 256 KiB frames, io_uring SEND_ZC @100000: srv 4.819 µs/rec p50 145 p99 1431 p99.9 2848 µs
+rep 2 256 KiB frames, io_uring SEND_ZC @1000000: srv 0.460 µs/rec p50 92 p99 2162 p99.9 5405 µs
+rep 2 1 MiB frames, write: sat 7537571/s srv 0.054 cli 0.131 µs/rec
+rep 2 1 MiB frames, write @100000: srv 4.491 µs/rec p50 88 p99 1255 p99.9 2251 µs
+rep 2 1 MiB frames, write @1000000: srv 0.366 µs/rec p50 81 p99 1894 p99.9 5673 µs
+rep 2 1 MiB frames, MSG_ZEROCOPY: sat 6224335/s srv 0.072 cli 0.159 µs/rec
+rep 2 1 MiB frames, MSG_ZEROCOPY @100000: srv 4.941 µs/rec p50 96 p99 1895 p99.9 3747 µs
+rep 2 1 MiB frames, MSG_ZEROCOPY @1000000: srv 0.368 µs/rec p50 81 p99 1808 p99.9 3646 µs
+rep 2 1 MiB frames, io_uring SEND_ZC: sat 6147570/s srv 0.070 cli 0.149 µs/rec
+rep 2 1 MiB frames, io_uring SEND_ZC @100000: srv 5.483 µs/rec p50 133 p99 1847 p99.9 3202 µs
+rep 2 1 MiB frames, io_uring SEND_ZC @1000000: srv 0.464 µs/rec p50 95 p99 2149 p99.9 5210 µs
+rep 2 loopback, TSO/GSO/GRO off (std): sat 6958615/s srv 0.054 cli 0.144 µs/rec
+rep 2 loopback, TSO/GSO/GRO off (std) @100000: srv 0.447 µs/rec p50 759 p99 1802 p99.9 3299 µs
+rep 2 loopback, TSO/GSO/GRO off (std) @1000000: srv 0.082 µs/rec p50 881 p99 2146 p99.9 3663 µs
+rep 2 8 conns, linger 1 ms, ack writer per conn: sat 8084436/s srv 0.067 cli 0.115 µs/rec
+rep 2 8 conns, linger 1 ms, ack writer per conn @100000: srv 2.056 µs/rec p50 1203 p99 3113 p99.9 10214 µs
+rep 2 8 conns, linger 1 ms, ack writer per conn @1000000: srv 0.256 µs/rec p50 1222 p99 3267 p99.9 13904 µs
+rep 2 8 conns, linger 1 ms, acks coalesced: sat 6745873/s srv 0.071 cli 0.135 µs/rec
+rep 2 8 conns, linger 1 ms, acks coalesced @100000: srv 1.759 µs/rec p50 1212 p99 3335 p99.9 8492 µs
+rep 2 8 conns, linger 1 ms, acks coalesced @1000000: srv 0.214 µs/rec p50 1223 p99 3014 p99.9 8778 µs
+rep 2 8 conns, clocked by commit, ack writer per conn: sat 6471285/s srv 0.068 cli 0.150 µs/rec
+rep 2 8 conns, clocked by commit, ack writer per conn @100000: srv 2.442 µs/rec p50 1021 p99 3214 p99.9 11413 µs
+rep 2 8 conns, clocked by commit, ack writer per conn @1000000: srv 0.278 µs/rec p50 969 p99 2764 p99.9 8318 µs
+rep 2 8 conns, clocked by commit, acks coalesced: sat 7000319/s srv 0.065 cli 0.140 µs/rec
+rep 2 8 conns, clocked by commit, acks coalesced @100000: srv 1.748 µs/rec p50 1013 p99 2526 p99.9 8208 µs
+rep 2 8 conns, clocked by commit, acks coalesced @1000000: srv 0.232 µs/rec p50 1001 p99 3657 p99.9 9623 µs
+rep 2 no linger: std blocking thread: sat 6387355/s srv 0.053 cli 0.156 µs/rec
+rep 2 no linger: std blocking thread @100000: srv 4.481 µs/rec p50 94 p99 1745 p99.9 8713 µs
+rep 2 no linger: std blocking thread @1000000: srv 0.354 µs/rec p50 93 p99 1289 p99.9 3027 µs
+rep 2 no linger: epoll, one thread: sat 5853880/s srv 0.059 cli 0.171 µs/rec
+rep 2 no linger: epoll, one thread @100000: srv 4.759 µs/rec p50 95 p99 697 p99.9 2526 µs
+rep 2 no linger: epoll, one thread @1000000: srv 0.431 µs/rec p50 83 p99 2099 p99.9 10287 µs
+rep 2 no linger: epoll, adaptive spin 50 µs: sat 7167213/s srv 0.057 cli 0.140 µs/rec
+rep 2 no linger: epoll, adaptive spin 50 µs @100000: srv 9.609 µs/rec p50 61 p99 1325 p99.9 4115 µs
+rep 2 no linger: epoll, adaptive spin 50 µs @1000000: srv 0.964 µs/rec p50 63 p99 1162 p99.9 3898 µs
+rep 2 no linger: io_uring multishot: sat 7656806/s srv 0.071 cli 0.128 µs/rec
+rep 2 no linger: io_uring multishot @100000: srv 4.507 µs/rec p50 95 p99 875 p99.9 4186 µs
+rep 2 no linger: io_uring multishot @1000000: srv 0.403 µs/rec p50 85 p99 1492 p99.9 3341 µs
+rep 2 no linger: io_uring read_fixed: sat 6690146/s srv 0.054 cli 0.150 µs/rec
+rep 2 no linger: io_uring read_fixed @100000: srv 5.503 µs/rec p50 84 p99 1026 p99.9 2726 µs
+rep 2 no linger: io_uring read_fixed @1000000: srv 0.484 µs/rec p50 84 p99 1957 p99.9 5048 µs
+rep 2 no linger: tokio multi-thread, rpc.rs shape: sat 7590703/s srv 0.055 cli 0.133 µs/rec
+rep 2 no linger: tokio multi-thread, rpc.rs shape @100000: srv 8.045 µs/rec p50 101 p99 530 p99.9 2262 µs
+rep 2 no linger: tokio multi-thread, rpc.rs shape @1000000: srv 0.743 µs/rec p50 91 p99 1018 p99.9 2403 µs
+rep 2 no linger: tokio current-thread, rpc.rs shape: sat 7726549/s srv 0.060 cli 0.130 µs/rec
+rep 2 no linger: tokio current-thread, rpc.rs shape @100000: srv 6.234 µs/rec p50 84 p99 1331 p99.9 3156 µs
+rep 2 no linger: tokio current-thread, rpc.rs shape @1000000: srv 0.524 µs/rec p50 79 p99 1096 p99.9 2946 µs
+rep 2 no linger: tokio current-thread, inline: sat 6472909/s srv 0.051 cli 0.153 µs/rec
+rep 2 no linger: tokio current-thread, inline @100000: srv 5.169 µs/rec p50 88 p99 591 p99.9 2024 µs
+rep 2 no linger: tokio current-thread, inline @1000000: srv 0.444 µs/rec p50 86 p99 2964 p99.9 6620 µs
+rep 2 no linger: monoio: sat 6751527/s srv 0.055 cli 0.149 µs/rec
+rep 2 no linger: monoio @100000: srv 5.342 µs/rec p50 85 p99 1607 p99.9 4885 µs
+rep 2 no linger: monoio @1000000: srv 0.445 µs/rec p50 87 p99 844 p99.9 2534 µs
+rep 2 no linger: shared-memory ring: sat 9436020/s srv 0.043 cli 0.113 µs/rec
+rep 2 no linger: shared-memory ring @100000: srv 9.600 µs/rec p50 11 p99 1293 p99.9 4307 µs
+rep 2 no linger: shared-memory ring @1000000: srv 0.953 µs/rec p50 2 p99 2142 p99.9 4511 µs
+rep 2 veth: std blocking thread: sat 5207335/s srv 0.065 cli 0.191 µs/rec
+rep 2 veth: std blocking thread @100000: srv 0.470 µs/rec p50 774 p99 1574 p99.9 2731 µs
+rep 2 veth: std blocking thread @1000000: srv 0.084 µs/rec p50 911 p99 2599 p99.9 7087 µs
+rep 2 veth: epoll, one thread: sat 5026383/s srv 0.067 cli 0.200 µs/rec
+rep 2 veth: epoll, one thread @100000: srv 0.489 µs/rec p50 737 p99 1405 p99.9 2437 µs
+rep 2 veth: epoll, one thread @1000000: srv 0.091 µs/rec p50 900 p99 1535 p99.9 3050 µs
+rep 2 veth: io_uring multishot: sat 4108632/s srv 0.079 cli 0.214 µs/rec
+rep 2 veth: io_uring multishot @100000: srv 0.481 µs/rec p50 754 p99 1439 p99.9 3036 µs
+rep 2 veth: io_uring multishot @1000000: srv 0.108 µs/rec p50 890 p99 1740 p99.9 3661 µs
+rep 2 veth: tokio multi-thread, rpc.rs shape: sat 4948317/s srv 0.059 cli 0.203 µs/rec
+rep 2 veth: tokio multi-thread, rpc.rs shape @100000: srv 0.595 µs/rec p50 761 p99 1535 p99.9 3124 µs
+rep 2 veth: tokio multi-thread, rpc.rs shape @1000000: srv 0.093 µs/rec p50 910 p99 2093 p99.9 3841 µs
+rep 2 veth: 1 MiB frames, MSG_ZEROCOPY: sat 5336351/s srv 0.086 cli 0.183 µs/rec
+rep 2 veth: 1 MiB frames, MSG_ZEROCOPY @100000: srv 4.475 µs/rec p50 95 p99 2241 p99.9 5351 µs
+rep 2 veth: 1 MiB frames, MSG_ZEROCOPY @1000000: srv 0.405 µs/rec p50 72 p99 1414 p99.9 4777 µs
+rep 2 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs: sat 5736836/s srv 0.063 cli 0.170 µs/rec
+rep 2 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs @100000: srv 0.424 µs/rec p50 735 p99 1394 p99.9 2448 µs
+rep 2 veth: NAPI (GRO on) + SO_BUSY_POLL 50 µs @1000000: srv 0.087 µs/rec p50 918 p99 4453 p99.9 9304 µs
+rep 2 veth: TSO/GSO off: sat 3155476/s srv 0.121 cli 0.307 µs/rec
+rep 2 veth: TSO/GSO off @100000: srv 0.455 µs/rec p50 762 p99 2181 p99.9 10991 µs
+rep 2 veth: TSO/GSO off @1000000: srv 0.143 µs/rec p50 1016 p99 8092 p99.9 18627 µs
+ALLDONE
