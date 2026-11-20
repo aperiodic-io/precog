@@ -383,6 +383,14 @@ and the vectored writes cost more per call. Dropped.
   - `MSG_ZEROCOPY` for replicate frames if they grow past ~64 KiB on a real NIC;
   - io_uring only once the brokers run under a seccomp profile that allows it and a profile shows syscall entry, not wake-ups, as the cost.
 
+**Staging checks, if the flag is turned on.**
+- **Merging changes nothing on staging.** The flag is off by default, and the node is not given `--runtime current-thread` unless its StatefulSet args (`serve --config … --member-from-hostname`, as in `deploy/k8s/precog.yaml`) add it.
+- **Before and after**, with someone who has cluster access. Compare the same traffic window:
+  - **CPU:** each pod's CPU (`container_cpu_usage_seconds_total`) per acknowledged record. The expected change is −5 to −10% at a steady rate.
+  - **Latency:** the client-side ack p50 and p99. They should stay within ±10%. A sustained p99 rise means the node is near saturation, where this mode loses throughput.
+  - **Health:** `precog_*` dedup and append counters (unchanged ratios), restarts (zero), memory (unchanged).
+- **Rollback:** drop the argument, or move back to the previous image pin. Neither changes data or wire format.
+
 **Caveats.**
 - **Loopback and veth:** both charge the receiver's TCP processing to the sender's `write` (softirq in the sender's context), as in round 1. On a NIC the server pays it.
 - **One VM:** single-run noise is about ±10% end to end and much more at p99. Every comparison above alternates candidates and reports ranges.
