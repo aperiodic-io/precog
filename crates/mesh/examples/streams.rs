@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     PEAK.store(base, Ordering::Relaxed);
     let t = std::time::Instant::now();
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut done = 0;
+    let (mut done, mut pass) = (0, 0.0);
     while done < count {
         let upto = if dormant {
             (done + 100_000).min(count)
@@ -102,7 +102,9 @@ async fn main() -> anyhow::Result<()> {
         while tasks.join_next().await.is_some() {}
         done = upto;
         if dormant {
+            let t = std::time::Instant::now();
             node.apply_retention().await?;
+            pass += t.elapsed().as_secs_f64();
         }
     }
     let rate = count as f64 / t.elapsed().as_secs_f64();
@@ -123,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
     let c = node.store.cursor_at(&last, 0);
     assert_eq!(node.store.read_cursor(&last, &c, 1 << 20).0.len(), 1);
     println!(
-        "{{\"streams\":{count},\"segment_size\":{segment},\"dormant\":{dormant},\"create_per_s\":{rate:.0},\"rss_mib\":{rss:.1},\"heap_mib\":{heap:.1},\"heap_peak_mib\":{peak:.1},\"heap_per_stream\":{:.0},\"hot\":{},\"restart_s\":{restart:.2},\"rss_after_restart_mib\":{rss2:.1},\"heap_after_restart_mib\":{heap2:.1}}}",
+        "{{\"streams\":{count},\"segment_size\":{segment},\"dormant\":{dormant},\"create_per_s\":{rate:.0},\"passes_s\":{pass:.2},\"rss_mib\":{rss:.1},\"heap_mib\":{heap:.1},\"heap_peak_mib\":{peak:.1},\"heap_per_stream\":{:.0},\"hot\":{},\"restart_s\":{restart:.2},\"rss_after_restart_mib\":{rss2:.1},\"heap_after_restart_mib\":{heap2:.1}}}",
         heap * (1 << 20) as f64 / count as f64,
         hot.hot
     );
