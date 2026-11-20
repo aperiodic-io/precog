@@ -5,7 +5,9 @@
 //! by the request rate. With write caching (`Config::flush_delay_ms`) the caller writes its batch
 //! under the log's lock and has its LSN at once; the thread only runs the deferred fsync when it
 //! falls due (idle or not), without the lock. Retention (the cleaner's copies and the drop of
-//! old segments) runs on the same thread. A storage fault
+//! old segments) runs on the same thread. A caller never waits for a slow step: a batch that
+//! rolls the segment, and every batch submitted while the thread rolls or runs retention, is
+//! queued to the thread (`Wal::gate`), in submit order. A storage fault
 //! (`precog_storage::Error::Fatal`) sets `fatal`: every later append fails, and the node
 //! must restart and recover.
 
@@ -59,6 +61,9 @@ enum Job {
 pub struct Wal {
     tx: std::sync::mpsc::Sender<Req>,
     log: Arc<Mutex<precog_storage::Log>>,
+    /// Write caching: set while the WAL thread runs a slow step (a roll, retention), during which
+    /// callers queue their batches to it instead of waiting for the log. Taken before `log`.
+    gate: Arc<Mutex<bool>>,
     caching: bool,
     pub stats: Arc<WalStats>,
     pub fatal: Arc<AtomicBool>,
@@ -96,17 +101,20 @@ impl Wal {
             .store(s.recovery_scanned_bytes, Ordering::Relaxed);
         let fatal = Arc::new(AtomicBool::new(false));
         let log = Arc::new(Mutex::new(log));
+        let gate = Arc::new(Mutex::new(false));
         {
             let log = log.clone();
+            let gate = gate.clone();
             let stats = stats.clone();
             let fatal = fatal.clone();
             std::thread::Builder::new()
                 .name("precog-wal".into())
-                .spawn(move || writer(log, rx, stats, fatal))?;
+                .spawn(move || writer(log, gate, rx, stats, fatal))?;
         }
         Ok(Wal {
             tx,
             log,
+            gate,
             caching,
             stats,
             fatal,
@@ -119,7 +127,8 @@ impl Wal {
         Self::durable(self.submit(batch)?).await
     }
 
-    /// Queues the batch: batches reach the log in the order they are submitted.
+    /// Queues the batch (under write caching: writes it on the caller): batches reach the log in
+    /// the order they are submitted.
     pub fn submit(&self, batch: Batch) -> Result<oneshot::Receiver<Result<Lsn, String>>> {
         self.submit_as(batch, false)
     }
@@ -138,9 +147,19 @@ impl Wal {
             bail!("storage is fenced after a fatal error");
         }
         let (done, rx) = oneshot::channel();
-        if self.caching {
-            let _ = done.send(self.write(&batch, replaces));
-            return Ok(rx);
+        // held until the batch is written or queued: no batch submitted after it goes first
+        let mut gate = self.caching.then(|| self.gate.lock());
+        if let Some(g) = &mut gate
+            && !**g
+        {
+            let log = self.log.lock();
+            let item = [(meta(&batch, replaces, stamp(&self.stats)), &batch.bytes[..])];
+            if !log.rolls(&item) {
+                drop(gate);
+                let _ = done.send(self.write(log, &item));
+                return Ok(rx);
+            }
+            **g = true; // the WAL thread rolls; the batches after this one queue behind it
         }
         self.tx
             .send(Req::Append {
@@ -152,12 +171,17 @@ impl Wal {
         Ok(rx)
     }
 
-    /// Write caching: appends the batch on the calling thread, and wakes the WAL thread only when
-    /// the flush deadline moves (the first unsynced write, or `flush_bytes` crossed).
-    fn write(&self, batch: &Batch, replaces: bool) -> Result<Lsn, String> {
-        let mut log = self.log.lock();
+    /// Write caching: appends a batch that does not roll on the calling thread, and wakes the WAL
+    /// thread only when the flush deadline moves (the first unsynced write, or `flush_bytes`
+    /// crossed). ponytail: past twice `flush_bytes` unsynced the append syncs here, on the caller
+    /// (an fsync of at most that much); queue it too if p99 shows it.
+    fn write(
+        &self,
+        mut log: parking_lot::MutexGuard<'_, precog_storage::Log>,
+        item: &[(Meta, &[u8])],
+    ) -> Result<Lsn, String> {
         let due = log.flush_due();
-        let r = log.append(&[(meta(batch, replaces, stamp(&self.stats)), &batch.bytes[..])]);
+        let r = log.append(item);
         publish(&log, &self.stats, &self.fatal);
         let wake = log.flush_due() != due;
         drop(log);
@@ -227,8 +251,11 @@ fn meta(b: &Batch, replaces: bool, time_ms: u64) -> Meta {
 }
 
 fn publish(log: &precog_storage::Log, stats: &WalStats, fatal: &AtomicBool) {
-    // a fatal error fences the log for good; the node stops acknowledging until restart
-    fatal.store(log.is_fenced(), Ordering::Release);
+    // a fatal error fences the log for good; the node stops acknowledging until restart. Only
+    // ever raise it: the node also fences on its own (a claimed batch that failed to store).
+    if log.is_fenced() {
+        fatal.store(true, Ordering::Release);
+    }
     let s = log.stats();
     stats.syncs.store(s.syncs, Ordering::Relaxed);
     stats.bytes.store(s.bytes, Ordering::Relaxed);
@@ -257,6 +284,7 @@ fn flush(log: &Mutex<precog_storage::Log>, stats: &WalStats, fatal: &AtomicBool)
 
 fn writer(
     log: Arc<Mutex<precog_storage::Log>>,
+    gate: Arc<Mutex<bool>>,
     rx: std::sync::mpsc::Receiver<Req>,
     stats: Arc<WalStats>,
     fatal: Arc<AtomicBool>,
@@ -267,6 +295,19 @@ fn writer(
         let first = match pending.take() {
             Some(r) => r,
             None => {
+                {
+                    // the slow step that diverted callers is over once nothing is queued behind it
+                    let mut g = gate.lock();
+                    if *g {
+                        match rx.try_recv() {
+                            Ok(r) => {
+                                pending = Some(r);
+                                continue;
+                            }
+                            Err(_) => *g = false,
+                        }
+                    }
+                }
                 let due = log.lock().flush_due();
                 let next = match due {
                     None => rx.recv().map_err(|_| true),
@@ -289,6 +330,7 @@ fn writer(
         };
         match first {
             Req::Retain { job, done } => {
+                *gate.lock() = true; // callers queue meanwhile rather than wait for the log
                 let mut log = log.lock();
                 let r = match job {
                     Job::Copy(records) => {
@@ -396,6 +438,100 @@ mod tests {
             let t = wal.reader.time_ms(lsn).unwrap().unwrap();
             assert!(t >= ahead, "flush_delay_ms {flush_delay_ms}: {t} < {ahead}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_write_caching_a_submit_never_waits_for_a_roll() {
+        // Why: under write caching the caller is a network worker. A roll seals and syncs the
+        // segment and, with no spare ready, zero-fills a whole new one: done on the worker under
+        // the log's lock, it stalls that worker and every other one that submits meanwhile.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Config::new(dir.path());
+        c.segment_size = 64 << 20;
+        c.spares = 0; // every roll zero-fills its segment: slow
+        c.flush_delay_ms = 60_000;
+        c.flush_bytes = 1 << 30;
+        let wal = Wal::open(c).unwrap();
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let p = vec![7u8; 4 << 20];
+        let mut rolled = false;
+        for seq in 0..20 {
+            let b = Batch::parse(Batch::encode(&log, seq, &[(1, &p[..])]).unwrap()).unwrap();
+            let segments = wal.stats.segments.load(Ordering::Relaxed);
+            let t = std::time::Instant::now();
+            let rx = wal.submit(b).unwrap();
+            let submitted = t.elapsed();
+            assert_eq!(Wal::durable(rx).await.unwrap(), seq, "in submit order");
+            if wal.stats.segments.load(Ordering::Relaxed) > segments {
+                rolled = true;
+                let written = t.elapsed();
+                assert!(
+                    submitted * 4 < written,
+                    "the submit waited for the roll: {submitted:?} of {written:?}"
+                );
+            }
+        }
+        assert!(rolled, "never rolled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_write_caching_a_submit_never_waits_for_retention() {
+        // Why: retention runs on the WAL thread under the log's lock: a manifest write, file
+        // renames, and the cleaner's copies, which can roll. A caller arriving meanwhile is a
+        // network worker; it queues its batch behind the step instead of blocking on the lock.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Config::new(dir.path());
+        c.segment_size = 64 << 20;
+        c.spares = 0; // the copy's roll zero-fills its segment: slow
+        c.flush_delay_ms = 60_000;
+        c.flush_bytes = 1 << 30;
+        let wal = Wal::open(c).unwrap();
+        let log = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        let p = vec![7u8; 4 << 20];
+        let at = |seq| Batch::parse(Batch::encode(&log, seq, &[(1, &p[..])]).unwrap()).unwrap();
+        let mut seq = 0;
+        let copy = loop {
+            let b = at(seq);
+            let item = [(meta(&b, false, 1), &b.bytes[..])];
+            if wal.log.lock().rolls(&item) {
+                break vec![(item[0].0.clone(), Arc::<[u8]>::from(&b.bytes[..]))];
+            }
+            wal.append(b).await.unwrap();
+            seq += 1;
+        };
+        let w = wal.clone();
+        let t = std::time::Instant::now();
+        let copied = tokio::spawn(async move { w.copy(copy).await });
+        while !*wal.gate.lock() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(5),
+                "never gated"
+            );
+            tokio::task::yield_now().await;
+        }
+        let t = std::time::Instant::now();
+        let rx = wal.submit(at(seq + 1)).unwrap();
+        let submitted = t.elapsed();
+        let first = copied.await.unwrap().unwrap();
+        let copying = t.elapsed();
+        assert!(
+            submitted * 4 < copying,
+            "the submit waited for retention: {submitted:?} of {copying:?}"
+        );
+        assert_eq!(first, seq, "the copy first");
+        assert_eq!(
+            Wal::durable(rx).await.unwrap(),
+            seq + 1,
+            "then the queued batch"
+        );
     }
 
     async fn replacing_key(flush_delay_ms: u64) {
