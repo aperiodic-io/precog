@@ -552,11 +552,8 @@ impl Node {
         // the dedup window's batches rebuild its index: the segments logged within it
         if let (Some(d), Some(since)) = (dedup.as_mut(), since) {
             // append times never go back: a segment's newest is no older than any before it
-            let segs = wal.segments();
-            let older = segs.iter().rev().find(|s| s.max_time < since);
-            let mut at = older.map_or(wal.reader.first_lsn(), |s| s.end);
-            let end = wal.reader.next_lsn();
-            while at < end {
+            let mut at = window_start(&wal.segments(), wal.reader.first_lsn(), since);
+            loop {
                 let es = wal.reader.entries(at, 1 << 16)?;
                 let Some(last) = es.last() else { break };
                 at = last.lsn + 1;
@@ -584,7 +581,7 @@ impl Node {
         }
         let cfg_id = cfg.id;
         // this boot, on disk before any peer follows it
-        let incarnation = rand::random::<u64>() | 1;
+        let incarnation = rand::random::<u64>().max(1);
         store.boot(incarnation, wal.reader.next_lsn());
         let p = store.begin_checkpoint();
         let synced = wal.sync().await.map(|_| ());
@@ -1983,6 +1980,15 @@ pub fn parse_frame_ack(f: &Frame) -> Result<Ack> {
     Ack::decode(f.body.clone())
 }
 
+/// Where the dedup window's batches start in the log: past the last sealed segment whose newest
+/// batch is older than `since` (append times never go back, so none before it is newer).
+fn window_start(segs: &[precog_storage::Sealed], first: u64, since: u64) -> u64 {
+    segs.iter()
+        .rev()
+        .find(|s| s.max_time < since)
+        .map_or(first, |s| s.end)
+}
+
 #[cfg(test)]
 mod props_cleaner {
     use super::*;
@@ -2826,6 +2832,29 @@ mod props {
 
     use super::*;
     use proptest::prelude::*;
+
+    proptest! {
+        /// Every segment with a batch at or past `since` is scanned, and nothing before the last
+        /// that is wholly older.
+        #[test]
+        fn the_dedup_window_starts_after_the_last_wholly_older_segment(
+            gaps in proptest::collection::vec(0u64..3, 0..8),
+            since in 0u64..12,
+        ) {
+            let (mut t, mut segs) = (0, vec![]);
+            for (i, g) in gaps.iter().enumerate() {
+                t += g;
+                let base = 10 + 5 * i as u64;
+                segs.push(precog_storage::Sealed { base, end: base + 5, bytes: 1, max_time: t });
+            }
+            let at = window_start(&segs, 10, since);
+            for s in &segs {
+                prop_assert!(s.max_time < since || s.base >= at, "{s:?} skipped at {at}");
+            }
+            let last_older = segs.iter().filter(|s| s.max_time < since).map(|s| s.end).max();
+            prop_assert_eq!(at, last_older.unwrap_or(10));
+        }
+    }
 
     proptest! {
         /// The streams' retention floors (read at every start) round-trip, and any bytes under a

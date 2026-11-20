@@ -263,3 +263,47 @@ async fn a_restart_does_not_rebuild_dormant_streams_so_it_costs_the_same_for_mor
     // the log's own open reads each sealed index (a few bytes per stream): well under 8x
     assert!(many.2 < 4.0 * few.2.max(0.05), "{few:?} {many:?}");
 }
+
+#[test]
+fn a_node_keeps_streams_in_ram_for_ten_minutes_within_256_mib_by_default() {
+    // Why: live-ingestion's 62 streams are written every few seconds and must never leave RAM;
+    // these defaults change nothing for them (docs/S2-PLAN.md, C7).
+    let c = NodeConfig::single(0, "a", "/d".into(), "t".into());
+    assert_eq!(
+        (
+            c.dormant_after_ms,
+            c.hot_streams_bytes,
+            c.summary_cache_bytes
+        ),
+        (600_000, 256 << 20, 64 << 20)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_metrics_count_loads_and_their_time_in_microseconds() {
+    let d = tempfile::tempdir().unwrap();
+    let node = Node::open(config(d.path())).await.unwrap();
+    assert!(node.append(1, batch("a", 0, 1)).await.is_success());
+    settle(&node, 1).await;
+    assert!(dormant(&node, "a"));
+    let h = node.store.hot_stats();
+    assert!(h.load_ns > 0, "{h:?}");
+    let m = node.metrics();
+    let row = |name: &str| {
+        m.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} in {m}"))
+            .to_string()
+    };
+    assert_eq!(row("precog_stream_loads_total"), h.loads.to_string());
+    assert_eq!(
+        row("precog_stream_evictions_total"),
+        h.evictions.to_string()
+    );
+    assert_eq!(
+        row("precog_stream_load_microseconds_total"),
+        (h.load_ns / 1000).to_string()
+    );
+    assert_eq!(row("precog_streams_hot"), h.hot.to_string());
+    assert_eq!(row("precog_streams_dormant"), h.dormant.to_string());
+}

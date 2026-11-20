@@ -74,7 +74,11 @@ async fn main() -> anyhow::Result<()> {
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut done = 0;
     while done < count {
-        let upto = if dormant { (done + 100_000).min(count) } else { count };
+        let upto = if dormant {
+            (done + 100_000).min(count)
+        } else {
+            count
+        };
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..64 {
             let (node, next) = (node.clone(), next.clone());

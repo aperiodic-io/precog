@@ -97,9 +97,7 @@ impl Streams {
     pub fn sweep(&mut self, now_s: u64) {
         let w = self.window_s;
         self.by_stream.retain(|_, d| d.last_s + w >= now_s);
-        if self.by_stream.capacity() > 2 * self.by_stream.len() {
-            self.by_stream.shrink_to_fit();
-        }
+        self.by_stream.shrink_to_fit(); // the map keeps its capacity otherwise
     }
 
     /// The shortest window any stream remembers now.

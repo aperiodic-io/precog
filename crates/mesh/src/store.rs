@@ -37,7 +37,6 @@ use parking_lot::Mutex;
 use precog_storage::record::Meta;
 use precog_storage::{Lsn, Reader};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use tokio::sync::watch;
 
@@ -104,24 +103,9 @@ struct Log {
     ooo: bool,
 }
 
-/// A log's index is its own hash, spread over the high bits SwissTable reads.
-#[derive(Default)]
-struct Spread(u64);
-
-impl Hasher for Spread {
-    fn finish(&self) -> u64 {
-        self.0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
-    }
-    fn write(&mut self, b: &[u8]) {
-        for &x in b {
-            self.0 = self.0 << 8 | x as u64;
-        }
-    }
-}
-
 /// The logs in RAM by index: an index is free again once its stream is dormant (`Inner::put`).
 #[derive(Default)]
-struct Logs(HashMap<u32, Log, BuildHasherDefault<Spread>>);
+struct Logs(HashMap<u32, Log>);
 
 impl std::ops::Index<usize> for Logs {
     type Output = Log;
@@ -144,7 +128,7 @@ impl Logs {
 }
 
 impl std::ops::Deref for Logs {
-    type Target = HashMap<u32, Log, BuildHasherDefault<Spread>>;
+    type Target = HashMap<u32, Log>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -328,27 +312,16 @@ fn untotal(segs: &mut BTreeMap<Lsn, (Lsn, Totals)>, base: Lsn, n: u64, len: u64)
     }
 }
 
-/// What one stream in RAM costs, about (bytes): what `Store::evict` holds to its budget.
-fn cost(name: &str, s: &StreamLog, logs: &Logs) -> usize {
-    let per_log: usize = s
-        .logs
-        .iter()
-        .filter_map(|ix| logs.get(ix))
-        .map(|l| {
-            std::mem::size_of::<Log>()
-                + 64
-                + 2 * (l.id.stream.len() + l.id.writer.len())
-                + 32 * l.cold.len()
-                + 64 * l.batches.len()
-        })
-        .sum();
-    std::mem::size_of::<StreamLog>()
-        + 64
-        + 2 * name.len()
-        + 96 * s.cold.len()
-        + 48 * s.order.len()
-        + per_log
+/// What a stream in RAM costs, about (bytes): what `Store::evict` holds to its budget. Its
+/// batches in RAM are not counted (a stream with any stays), nor its segments' entries.
+fn cost(s: &StreamLog) -> usize {
+    STREAM_COST + LOG_COST * s.logs.len()
 }
+
+/// A stream's and a writer log's metadata in RAM, measured (`tests/dormant_memory.rs`: ~1.6 KB
+/// for a stream of one log, names included).
+const STREAM_COST: usize = 1024;
+const LOG_COST: usize = 512;
 
 /// A dormant stream's log as RAM holds it (no batch in RAM).
 fn log_of(stream: &str, l: LogSum) -> Log {
@@ -388,13 +361,8 @@ impl Inner {
 
     /// A free index for `l`.
     fn put(&mut self, l: Log) -> u32 {
-        let i = match self.free.pop() {
-            Some(i) => i,
-            None => {
-                self.next_ix += 1;
-                self.next_ix - 1
-            }
-        };
+        let i = self.free.pop().unwrap_or(self.next_ix);
+        self.next_ix = self.next_ix.max(i + 1);
         self.logs.insert(i, l);
         i
     }
@@ -736,7 +704,8 @@ impl Inner {
         // or its predecessor is later in the log: marked durable first (any earlier batch later
         // in the log than this one is later than its predecessor, or the flag is up already)
         let pred = l.batches.range(..first).next_back();
-        l.ooo |= pred.is_some_and(|(_, p)| p.durable() && p.lsn > lsn);
+        // (a predecessor is another batch, never at `lsn`)
+        l.ooo |= pred.is_some_and(|(_, p)| p.durable() && p.lsn.cmp(&lsn).is_gt());
         l.high = l.high.max(first + e.count as u64);
         let at_contig = first == l.contig.max(l.trimmed);
         let s = self
@@ -1070,11 +1039,7 @@ impl Inner {
     /// used ones while the streams in RAM cost more than `budget` bytes. Only a stream whose
     /// summary is written (not `dirty`) and with no batch in RAM leaves.
     fn evict(&mut self, idle_ms: u64, budget: usize) -> usize {
-        let mut held: usize = self
-            .streams
-            .iter()
-            .map(|(n, s)| cost(n, s, &self.logs))
-            .sum();
+        let mut held: usize = self.streams.values().map(cost).sum();
         let mut out: Vec<(u64, String)> = self
             .streams
             .iter()
@@ -1094,7 +1059,7 @@ impl Inner {
                 break;
             }
             let s = self.streams.remove(&name).expect("listed");
-            held = held.saturating_sub(cost(&name, &s, &self.logs));
+            held -= cost(&s);
             for ix in s.logs {
                 let l = self.logs.remove(&ix).expect("a stream's log is in RAM");
                 self.ix.remove(&l.id);
@@ -1103,11 +1068,10 @@ impl Inner {
             n += 1;
         }
         // the maps keep their capacity: give it back once most of it is free
-        if self.streams.capacity() > 2 * self.streams.len() {
-            self.streams.shrink_to_fit();
-            self.ix.shrink_to_fit();
-            self.logs.shrink_to_fit();
-        }
+        self.streams.shrink_to_fit();
+        self.ix.shrink_to_fit();
+        self.logs.shrink_to_fit();
+        self.free.shrink_to_fit();
         self.evictions += n as u64;
         n
     }
@@ -4504,8 +4468,9 @@ mod tests {
         // a budget for one stream: the older of t and u goes
         let one = {
             let g = t.s.inner.lock();
-            cost("u", &g.streams["u"], &g.logs)
+            cost(&g.streams["u"])
         };
+        assert_eq!(one, 1536, "a stream of one log");
         let tight = Dormancy {
             idle_ms: u64::MAX,
             budget: one,
@@ -4537,6 +4502,27 @@ mod tests {
             assert!(t.s.get(&on(name, "w", 0).id).is_some(), "{name}");
         }
         assert_eq!(t.s.hot_stats().loads, 3);
+        // a stream woken by a use, and a new one, are used now (the last pass's clock): within
+        // their idle time
+        let idle = Dormancy {
+            idle_ms: 20,
+            budget: usize::MAX,
+        };
+        t.s.evict(idle, 50);
+        t.s.cursor_at("s", 0);
+        for x in [on("v", "w", 0), on("f", "w", 2), on("f", "w", 3)] {
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        t.s.checkpoint().unwrap();
+        let has = |t: &T, n: &str| hot(t).contains(&n.to_string());
+        t.s.evict(idle, 69);
+        t.s.evict(idle, 70);
+        assert!(has(&t, "s") && has(&t, "v"), "used at 50, now 69");
+        assert!(!has(&t, "t"), "used at 40");
+        t.s.evict(idle, 71);
+        assert!(!has(&t, "s") && !has(&t, "v"), "idle for 20 at 70");
     }
 
     #[test]
@@ -5226,6 +5212,15 @@ mod model_dormant {
     fn the_cases_the_model_found_and_its_rare_paths() {
         use Op::*;
         let cases = [
+            // a batch logged after a later one of its log: out of order only behind a durable one
+            vec![
+                Reserve(0, 0, 4, 1, 0),
+                Write(0),
+                Reserve(0, 0, 0, 1, 0),
+                Durable(0),
+                Mark(0),
+                Crash,
+            ],
             // a dormant log's frontier after the segment of its batches went (5 to a segment)
             vec![
                 Reserve(0, 0, 1, 1, 0),
