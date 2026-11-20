@@ -109,8 +109,9 @@ impl<'a> R<'a> {
     }
     /// A number in its one LEB128 form: no longer than it needs, at most 64 bits.
     fn u64(&mut self) -> Option<u64> {
-        let mut x = 0;
-        for i in 0..10 {
+        // (the tenth byte ends it: past 1 it is refused, and 1 or less has no top bit)
+        let (mut x, mut i) = (0, 0);
+        loop {
             let b = self.take(1)?[0];
             if i == 9 && b > 1 || i > 0 && b == 0 {
                 return None;
@@ -119,8 +120,8 @@ impl<'a> R<'a> {
             if b < 0x80 {
                 return Some(x);
             }
+            i += 1;
         }
-        None
     }
     fn age(&mut self) -> Option<Age> {
         Some((self.u64()?, self.u64()?, self.u64()?))
