@@ -42,7 +42,8 @@ on arrival play no part in read order.
 | `proto.rs` | Batch codec (zero re-encoding: client bytes go unchanged to WALs and peers), RPC framing, acks, control messages |
 | `wal.rs` | One WAL per node with **cross-writer group commit**: a dedicated thread drains every queued append into one `write` + one `fdatasync`. Exclusive file lock. Recovery truncates a torn tail and fails closed on interior corruption. An I/O error fences the WAL. |
 | `store.rs` | Index over the segment log: per-log `BTreeMap<first_seq, batch>` for the active segment, sealed segments' batches read from their index files (see below), reservation of pending ranges (concurrent duplicates coalesce), durable-only visibility, frontiers (`contiguous` prefix + `high`), event-time snapshot read |
-| `node.rs` | Append = local WAL ‖ replicate to one peer per other domain. **Early completion** at `copies`. Replicate is accepted only from authenticated peers and does not fan out further. Anti-entropy repair pulls each peer's durable inventory incrementally (cursor over the peer's WAL order). |
+| `node.rs` | Append = local WAL ‖ replicate to one peer per other domain. **Early completion** at `copies`. Replicate is accepted only from authenticated peers and does not fan out further. Anti-entropy repair follows each peer's log from a cursor (`Control::Inventory`) and compares only the frontiers of the logs it wrote since. |
+| `summary.rs` | Dormant streams' summaries and the store's checkpoint on disk (`<data_dir>/streams.redb`, see "Dormant streams"). |
 | `rpc.rs` | Multiplexed request/response over one byte stream. The writer task coalesces frames. |
 | `transport.rs` | TCP. |
 | `client.rs` | `Writer` owns the sequence numbers. On a timeout, a transport error or an `Unknown` ack it retries the **same bytes** on the next node until a deadline. Failover sticks to the node that answered. |
@@ -58,8 +59,9 @@ whether it fits its pod. `crates/mesh/tests/memory.rs` measures it and fails pas
 
 | Kept in RAM | Why |
 |---|---|
-| Per writer log: its id (once, interned), `trimmed`, `contiguous`, `high`, and per sealed segment holding its batches their sequence range | Frontiers, repair and `Expired` answer from these alone; the ranges say which segment indexes a lookup must read |
-| Per stream: its logs, its own retention floor, and per sealed segment its bytes, batches, events, newest append time and (a lower bound of) its oldest | Per-stream retention (bytes and age, oldest first) and the totals without reading the log |
+| Per writer log of a stream in RAM: its id (once, interned), `trimmed`, `contiguous`, `high`, and per sealed segment holding its batches their sequence range | Frontiers, repair and `Expired` answer from these alone; the ranges say which segment indexes a lookup must read |
+| Per stream in RAM: its logs, its own retention floor, and per sealed segment its bytes, batches, events, newest append time and (a lower bound of) its oldest | Per-stream retention (bytes and age, oldest first) and the totals without reading the log |
+| Per sealed segment: its totals over every stream, and per key in its index the key's place in the file and its run's start (8 bytes; the key itself is read from the index file) | Dropping a segment subtracts what dormant streams held in it without waking them; a lookup by key is a binary search over the file |
 | Batches of the active segment, pending batches and their waiters | Appends, duplicate checks of recent retries and live subscribers touch only these |
 | The segment log's index of the active segment | Appends and the tail |
 
@@ -78,6 +80,91 @@ Measured (`tests/memory.rs`, 200k batches, heap per retained batch): 1092 B befo
 layout, 338 B with interned logs and waiters only while pending, 6 B with sealed segments on
 disk. The active segment's batches still cost ~340 B each: with 1 GiB segments and 2 KiB
 batches that is ~170 MB, independent of retention.
+
+## Dormant streams
+
+A stream's metadata in RAM costs ~1.6 KB (its logs, their frontiers, its totals per segment), so
+a node of millions of streams that each write now and then would hold them all (docs/S2-PLAN.md,
+F12). A stream nobody uses leaves RAM instead and is a summary on disk until it is used again.
+
+**When.** At the end of each retention pass (`Node::apply_retention`, every 10 s), after the
+checkpoint below, a stream leaves RAM (`Store::evict`) if it has no batch in RAM (all of its
+batches are in absorbed segments, none pending) and its summary on disk is current, and either
+nothing used it for `dormant_after_ms` (default 10 minutes: past the dedup window) or the
+streams in RAM cost more than `hot_streams_bytes` (default 256 MiB, least recently used first).
+A use is an append, a read (cursor, seek, `get`, event-time read) or a live feed's poll;
+retention, repair and metrics wake a stream without counting as one. No stream leaves RAM while
+a checkpoint is in flight. live-ingestion's 62 streams are written every 100 ms: none leaves.
+
+**What stays in RAM per dormant stream: nothing** of the store's (its log indexes are reused),
+plus 8 bytes per sealed segment holding its batches (that segment's key table) and its dedup
+ids until they expire (`dedup::Streams::sweep` drops a stream's index once it saw no id for a
+window). Measured by `tests/dormant_memory.rs`: 37 B of heap per dormant stream, 2,649 B
+before.
+
+**On disk.** One redb database per node (`<data_dir>/streams.redb`; redb was already a
+dependency of the workspace, pure Rust, copy-on-write pages, its commit atomic; quick repair is
+on, so a crash costs no walk of the file). Table `streams`: per stream one value in this crate's
+format (`summary::encode_stream`: version byte, CRC-32C): its retention floor and bytes, per
+absorbed segment its totals and age bounds, per writer log its frontier (`trimmed`, `contig`,
+`high`, out-of-order flag) and its sequence range per absorbed segment. Table `meta`: the
+checkpoint (`summary::Checkpoint`): `cold_end` and `contiguous`, the LSNs of the batches in RAM
+(as runs), the node's floor and totals, the totals per absorbed segment, the dead and forgotten
+LSNs, repair's position in each peer's log, and this node's boots. A version mismatch refuses
+to open, loudly. redb over index files or a file per stream: millions of small values updated in
+place with crash safety is what a B-tree with copy-on-write commits does; index files are
+written once per segment, and a file per stream is millions of inodes and fsyncs.
+
+**Waking** (`Inner::wake`): one read of the stream's summary (a cached read-only table, ~0.5 µs
+from the page cache), no index read. What retention did meanwhile catches up then
+(`Inner::reconcile`: whole segments dropped since go, as `drop_segment` did to the streams in
+RAM; a floor inside a segment wakes every stream first). Any operation that needs the stream
+wakes it, under the store's lock: reserve, dup and conflict checks, `has`/`get`, cursors,
+`cursor_at`, `read`, `live_start`, `log_batches` (repair), `frontier`, retention by stream, the
+cleaner's copies. `tail` reads a dormant stream's floor from its summary without waking it;
+`frontiers(None)` and `live_start(None)` (every log: `Status`, a feed of every stream) read every
+summary.
+
+**The checkpoint** (`Store::begin_checkpoint` under the lock, `end_checkpoint` without it):
+once per pass, and before a pass drops segments, so it always covers the log past the first
+LSN. Each changed stream's summary as RAM holds it (its batches in RAM counted), the checkpoint
+above, and in between the log syncs what it covers (write caching: the checkpoint never counts
+a batch a power loss can take). A failed write marks its streams changed again.
+
+**Restart** (`Store::open`): the checkpoint, the segments dropped since subtracted, then the
+batches in RAM at the checkpoint put back (counted already), then the log from `cold_end` on
+replayed: a record below `contiguous` not in RAM was forgotten (skipped), one past it is new
+unless dead or forgotten. Streams the replay does not touch stay dormant: the start reads the
+log's tail (the unabsorbed segments), not every stream (`a_restart_does_not_rebuild_dormant_
+streams_so_it_costs_the_same_for_more_of_them`). The log's own open still checks each sealed
+index file (its CRC and key table: a few bytes per stream). An older data directory (no
+`streams.redb`) is rebuilt from the whole log, its `floors` file restored, as before.
+
+**Repair** follows each peer's log instead of comparing every log's frontier: `Control::Inventory
+{from, max, incarnation}` returns the frontiers of the logs with a record at LSNs `from..` (at
+most `max` records), and the follower fetches where the peer holds sequences it lacks. A pass
+costs what the peer logged since the last one; a caught-up pass wakes nothing. The cursor is in
+the follower's checkpoint (a new data directory follows every peer from its start). A peer may
+lose an unsynced tail in a crash and log other records at those LSNs: it keeps its boots
+(incarnation, where its log ended at the open) and answers a follower of an older boot from the
+lowest open since (`Store::rejoin`, `spec/mesh/Inventory.tla`). `Status` still lists every log
+(reading every summary): nodes no longer poll it.
+
+**Metrics**: `precog_streams_hot`, `precog_streams_dormant`, `precog_stream_loads_total`,
+`precog_stream_evictions_total`, `precog_stream_load_microseconds_total` (its rate over the
+loads' is the mean load time); `Status` has `streams_hot` and `streams_dormant`.
+
+**Config**: `dormant_after_ms` (default 600,000), `hot_streams_bytes` (268,435,456),
+`summary_cache_bytes` (redb's page cache, 67,108,864). For many streams: keep the defaults, and
+size `segment_size` so the active segment's batches fit RAM (they stay until sealed: ~340 B each).
+
+Tests: `store::model_dormant` (a twin store, see spec/README.md), the `dormant` reruns of the
+store's tests (every stream out of RAM after every batch and before every query),
+`absorbed_segments_answer_every_query_as_ram_does` and `a_batch_copied_forward_answers_every_query_as_before`
+(also dozing and restarted from the checkpoint), `tests/dormant.rs` (wakes, crashes at every
+failpoint of a pass, appends racing evictions, restart cost), `repair_follows_a_peers_log_and_wakes_only_the_streams_it_wrote_to`,
+`node::props_cleaner` (dozing), and `features/dormant.feature` (3 nodes, a restart, a replaced
+node).
 
 ## The segment cleaner: each stream keeps its own retention
 
@@ -126,7 +213,9 @@ next pass copies it again and drops the old segment. What a stream's own retenti
 forgotten across a restart: a copy of it can outlive the segments of its next batches, so each
 stream's floor (append time, sequence, LSN) is written to `<data_dir>/floors` (format `PCF1`,
 CRC-32C; a temporary file, fsynced, renamed, then the directory) before a pass drops segments,
-and restored when the node opens (`a_restart_does_not_bring_back_what_a_stream_s_retention_forgot`). Tests: `a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`
+and restored when the node opens (`a_restart_does_not_bring_back_what_a_stream_s_retention_forgot`).
+The streams' floors are now in their summaries (the checkpoint before the drop writes them); the
+`floors` file is read only to rebuild an older data directory. Tests: `a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`
 (storage failpoints at the copy's fsync, the sync before the drop, before and after the manifest
 write).
 
