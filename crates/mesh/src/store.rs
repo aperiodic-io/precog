@@ -318,6 +318,31 @@ fn cost(s: &StreamLog) -> usize {
     STREAM_COST + LOG_COST * s.logs.len()
 }
 
+/// A stream's summary: what its dormant copy on disk holds.
+fn summary(s: &StreamLog, logs: &Logs) -> StreamSum {
+    StreamSum {
+        floor: s.floor,
+        bytes: s.bytes,
+        cold: s.cold.iter().map(|(&b, &c)| (b, c)).collect(),
+        logs: s
+            .logs
+            .iter()
+            .map(|&ix| {
+                let l = &logs[ix as usize];
+                LogSum {
+                    writer: l.id.writer.clone(),
+                    epoch: l.id.epoch,
+                    cold: l.cold.clone(),
+                    trimmed: l.trimmed,
+                    contig: l.contig,
+                    high: l.high,
+                    ooo: l.ooo,
+                }
+            })
+            .collect(),
+    }
+}
+
 /// A stream's and a writer log's metadata in RAM, measured (`tests/dormant_memory.rs`: ~1.6 KB
 /// for a stream of one log, names included).
 const STREAM_COST: usize = 1024;
@@ -457,31 +482,6 @@ impl Inner {
     }
 
     /// The stream's summary: everything RAM holds of it but its batches in RAM.
-    fn summary(&self, name: &str) -> StreamSum {
-        let s = &self.streams[name];
-        StreamSum {
-            floor: s.floor,
-            bytes: s.bytes,
-            cold: s.cold.iter().map(|(&b, &c)| (b, c)).collect(),
-            logs: s
-                .logs
-                .iter()
-                .map(|&ix| {
-                    let l = &self.logs[ix as usize];
-                    LogSum {
-                        writer: l.id.writer.clone(),
-                        epoch: l.id.epoch,
-                        cold: l.cold.clone(),
-                        trimmed: l.trimmed,
-                        contig: l.contig,
-                        high: l.high,
-                        ooo: l.ooo,
-                    }
-                })
-                .collect(),
-        }
-    }
-
     /// Whether `seq` of the log is below its trimmed floor: raised by `trim`, or by a segment
     /// the log already dropped (retention runs before `trim` hears of it).
     fn trimmed(&self, r: &Reader, log: &LogId, seq: u64) -> bool {
@@ -1037,45 +1037,67 @@ impl Inner {
 
     /// Puts dormant streams that are not used for `idle_ms` out of RAM, and the least recently
     /// used ones while the streams in RAM cost more than `budget` bytes. Only a stream whose
-    /// summary is written (not `dirty`) and with no batch in RAM leaves.
-    fn evict(&mut self, idle_ms: u64, budget: usize) -> usize {
+    /// summary is written (not `dirty`) and with no batch in RAM leaves. Returns what left, for
+    /// the caller to free off the store's lock (freeing takes longer than the sweeps).
+    fn evict(&mut self, idle_ms: u64, budget: usize) -> Evicted {
+        let logs = &self.logs;
+        let idle = |s: &StreamLog| {
+            !s.dirty
+                && s.order.is_empty()
+                && s.logs
+                    .iter()
+                    .all(|&ix| logs[ix as usize].batches.is_empty())
+        };
         let mut held: usize = self.streams.values().map(cost).sum();
-        let mut out: Vec<(u64, String)> = self
+        let mut out: Vec<(u64, usize)> = self
             .streams
-            .iter()
-            .filter(|(_, s)| {
-                !s.dirty
-                    && s.order.is_empty()
-                    && s.logs
-                        .iter()
-                        .all(|&ix| self.logs[ix as usize].batches.is_empty())
-            })
-            .map(|(n, s)| (s.used, n.clone()))
+            .values()
+            .filter(|s| idle(s))
+            .map(|s| (s.used, cost(s)))
             .collect();
         out.sort_unstable();
-        let mut n = 0;
-        for (used, name) in out {
+        // the newest use that leaves, and how many streams of that use do
+        let (mut upto, mut ties, mut n) = (0, 0, 0);
+        for (used, c) in out {
             if self.now.saturating_sub(used) < idle_ms && held <= budget {
                 break;
             }
-            let s = self.streams.remove(&name).expect("listed");
-            held -= cost(&s);
-            for ix in s.logs {
-                let l = self.logs.remove(&ix).expect("a stream's log is in RAM");
-                self.ix.remove(&l.id);
-                self.free.push(ix);
-            }
-            n += 1;
+            held -= c;
+            ties = if used == upto { ties + 1 } else { 1 };
+            (upto, n) = (used, n + 1);
         }
+        // one sweep of each map, not a lookup per stream: they are bigger than the caches
+        let mut gone = vec![false; self.next_ix as usize];
+        let streams: Vec<_> = self
+            .streams
+            .extract_if(|_, s| {
+                let out = s.used < upto || s.used == upto && ties > 0;
+                if !(out && idle(s)) {
+                    return false;
+                }
+                ties -= (s.used == upto) as usize;
+                for &ix in &s.logs {
+                    gone[ix as usize] = true;
+                }
+                true
+            })
+            .collect();
+        let logs: Vec<_> = self.logs.extract_if(|&ix, _| gone[ix as usize]).collect();
+        self.ix.retain(|_, ix| !gone[*ix as usize]);
+        self.free
+            .extend((0..self.next_ix).filter(|&ix| gone[ix as usize]));
         // the maps keep their capacity: give it back once most of it is free
         self.streams.shrink_to_fit();
         self.ix.shrink_to_fit();
         self.logs.shrink_to_fit();
         self.free.shrink_to_fit();
         self.evictions += n as u64;
-        n
+        (streams, logs)
     }
 }
+
+/// Streams that left RAM, and their logs.
+type Evicted = (Vec<(String, StreamLog)>, Vec<(u32, Log)>);
 
 /// How long a stream may go unused before it leaves RAM, and what the streams in RAM may cost.
 #[derive(Clone, Copy, Debug)]
@@ -2175,18 +2197,14 @@ impl Store {
         let mut g = self.inner.lock();
         self.in_flight.fetch_add(1, Relaxed);
         let inner = &mut *g;
-        let names: Vec<String> = inner
+        let logs = &inner.logs;
+        let streams = inner
             .streams
-            .iter()
+            .iter_mut()
             .filter(|(_, s)| s.dirty)
-            .map(|(n, _)| n.clone())
-            .collect();
-        let streams = names
-            .into_iter()
-            .map(|n| {
-                let v = crate::summary::encode_stream(&inner.summary(&n));
-                inner.streams.get_mut(&n).expect("listed").dirty = false;
-                (n, v)
+            .map(|(n, s)| {
+                s.dirty = false;
+                (n.clone(), crate::summary::encode_stream(&summary(s, logs)))
             })
             .collect();
         // the LSNs of the batches in RAM, as runs
@@ -2227,16 +2245,15 @@ impl Store {
             self.in_flight.fetch_sub(1, Relaxed);
             return Ok(());
         }
-        let r = synced.and_then(|()| {
-            self.db
-                .commit(&p.cp, &p.streams)
-                .map_err(anyhow::Error::msg)
-        });
+        // in key order: the B-tree's inserts then share their pages (sorted off the store's lock)
+        let mut streams = p.streams;
+        streams.sort_unstable();
+        let r = synced.and_then(|()| self.db.commit(&p.cp, &streams).map_err(anyhow::Error::msg));
         // (under the lock: an eviction after this sees the streams changed again, or written)
         let mut g = self.inner.lock();
         self.in_flight.fetch_sub(1, Relaxed);
         if let Err(e) = r {
-            for (n, _) in &p.streams {
+            for (n, _) in &streams {
                 if let Some(s) = g.streams.get_mut(n) {
                     s.dirty = true;
                 }
@@ -2256,12 +2273,13 @@ impl Store {
     /// Puts streams out of RAM (see `Inner::evict`), at time `now_ms`. Returns how many.
     pub fn evict(&self, d: Dormancy, now_ms: u64) -> usize {
         let mut g = self.inner.lock();
-        let n = match self.in_flight.load(Relaxed) {
+        let gone = match self.in_flight.load(Relaxed) {
             0 => g.evict(d.idle_ms, d.budget),
-            _ => 0, // a checkpoint in flight counts its streams as written already
+            _ => Evicted::default(), // a checkpoint in flight counts its streams as written already
         };
         g.now = now_ms;
-        n
+        drop(g);
+        gone.0.len()
     }
 
     pub fn hot_stats(&self) -> HotStats {
@@ -4577,6 +4595,53 @@ mod tests {
         };
         t.s.evict(idle, 60);
         assert_eq!(hot(&t), ["a", "f"]);
+    }
+
+    #[test]
+    fn past_the_budget_only_as_many_streams_used_at_once_leave_as_it_needs() {
+        // Why: every stream used between two passes carries the same use time. Past the budget,
+        // putting all of them out would empty RAM of the streams in use and load them straight
+        // back; only enough to fit go, and those left keep their logs in RAM.
+        let mut t = store_with(TINY);
+        let names = ["a", "b", "c", "d"];
+        for name in names {
+            let x = on(name, "w", 0);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        for seq in 0..6 {
+            let x = on("f", "w", seq); // seals the segments of a to d
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        t.s.checkpoint().unwrap();
+        // a to d and f cost 1536 each: 7680; 5000 holds three
+        let budget = Dormancy {
+            idle_ms: u64::MAX,
+            budget: 5000,
+        };
+        assert_eq!(t.s.evict(budget, 10), 2);
+        let hot: Vec<String> = t.s.inner.lock().streams.keys().cloned().collect();
+        assert_eq!(hot.len(), 3, "{hot:?}");
+        assert!(hot.iter().any(|n| n == "f"));
+        let loads = t.s.hot_stats().loads;
+        for name in &hot {
+            assert!(t.s.get(&on(name, "w", 0).id).is_some());
+        }
+        assert_eq!(
+            t.s.hot_stats().loads,
+            loads,
+            "those left are in RAM, logs too"
+        );
+        for name in names {
+            assert!(t.s.get(&on(name, "w", 0).id).is_some(), "{name} reads back");
+        }
+        assert_eq!(
+            t.s.hot_stats().loads,
+            loads + 2,
+            "the two that left load back"
+        );
     }
 
     #[test]
