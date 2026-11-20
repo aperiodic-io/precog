@@ -1102,7 +1102,7 @@ fn summaries(a: &Args, mut store: Box<dyn Store>, dir: &Path, pool: &Path) -> Re
             .collect();
         let tc = Instant::now();
         store.append_group(&items)?;
-        load.record(tc.elapsed().as_micros().max(1) as u64)?;
+        load.saturating_record(tc.elapsed().as_micros().max(1) as u64);
         i += items.len() as u64;
     }
     let load_s = t.elapsed().as_secs_f64();
@@ -1117,7 +1117,7 @@ fn summaries(a: &Args, mut store: Box<dyn Store>, dir: &Path, pool: &Path) -> Re
             .collect();
         let tc = Instant::now();
         store.append_group(&items)?;
-        upd.record(tc.elapsed().as_micros().max(1) as u64)?;
+        upd.saturating_record(tc.elapsed().as_micros().max(1) as u64);
     }
     let upd_s = tu.elapsed().as_secs_f64();
     let upd_dev = io_write_bytes() - dev1;
@@ -1135,7 +1135,7 @@ fn summaries(a: &Args, mut store: Box<dyn Store>, dir: &Path, pool: &Path) -> Re
         let j = rand::random::<u64>() % n;
         let tc = Instant::now();
         let got = store.get(&skey(j))?;
-        hit.record(tc.elapsed().as_nanos().max(1) as u64)?;
+        hit.saturating_record(tc.elapsed().as_nanos().max(1) as u64);
         anyhow::ensure!(got == Some(120), "stream {j} lost");
     }
     let hit_s = tg.elapsed().as_secs_f64();
@@ -1143,7 +1143,7 @@ fn summaries(a: &Args, mut store: Box<dyn Store>, dir: &Path, pool: &Path) -> Re
         let j = n + rand::random::<u64>() % (n * 10);
         let tc = Instant::now();
         let got = store.get(&skey(j))?;
-        miss.record(tc.elapsed().as_nanos().max(1) as u64)?;
+        miss.saturating_record(tc.elapsed().as_nanos().max(1) as u64);
         anyhow::ensure!(got.is_none());
     }
     let r = serde_json::json!({
