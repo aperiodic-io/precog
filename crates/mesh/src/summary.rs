@@ -74,7 +74,12 @@ struct W(Vec<u8>);
 impl W {
     /// LEB128: seven bits a byte, low first, the top bit set on all but the last.
     fn u64(&mut self, mut x: u64) {
-        while x >= 0x80 {
+        // at most nine bytes before the last (a bound, not a condition: any change to the loop
+        // still ends)
+        for _ in 0..9 {
+            if x < 0x80 {
+                break;
+            }
             self.0.push(x as u8 | 0x80);
             x >>= 7;
         }
