@@ -28,7 +28,7 @@ enum Cmd {
         threads: Option<usize>,
         /// `current-thread` runs the node's network and replication on one thread: about 8%
         /// less CPU per record at a fixed rate, but lower peak throughput at a fixed number of
-        /// appends in flight (results/protocol.md, round 3).
+        /// appends in flight.
         #[arg(long, value_enum, default_value_t = Runtime::MultiThread)]
         runtime: Runtime,
     },
@@ -292,7 +292,7 @@ mod tests {
     use super::*;
 
     /// Why: a node below saturation spends a fifth of its CPU on wake-ups between the runtime's
-    /// threads; one thread for everything is the opt-in for that (results/protocol.md, round 3).
+    /// threads; one thread for everything is the opt-in for that.
     #[test]
     fn serve_runs_on_a_multi_thread_runtime_unless_asked() {
         let parse = |extra: &[&str]| {
