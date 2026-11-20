@@ -4527,6 +4527,59 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_counts_each_stream_s_logs_and_a_stream_loaded_by_a_use_is_used_now() {
+        // Why: the budget is what bounds RAM; a stream of two logs costs more than one of one,
+        // and the streams used longest ago go first until the rest fit. A stream a use loads
+        // back from disk counts as used then, or the next pass puts it straight out again.
+        let mut t = store_with(TINY);
+        for x in [
+            on("a", "w", 0),
+            on("b", "w", 0),
+            on("b", "x", 0),
+            on("c", "w", 0),
+        ] {
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        for seq in 0..6 {
+            let x = on("f", "w", seq); // seals the segments of a, b and c
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        t.s.checkpoint().unwrap();
+        let keep = Dormancy {
+            idle_ms: u64::MAX,
+            budget: usize::MAX,
+        };
+        for (now, name) in [(10, "a"), (20, "b"), (30, "c")] {
+            t.s.evict(keep, now);
+            assert!(t.s.get(&on(name, "w", 0).id).is_some());
+        }
+        let hot = |t: &T| {
+            let mut v: Vec<String> = t.s.inner.lock().streams.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        // a, c and f cost 1536 each, b (two logs) 2048: 6656; 4400 holds c and f only
+        let budget = Dormancy {
+            idle_ms: u64::MAX,
+            budget: 4400,
+        };
+        assert_eq!(t.s.evict(budget, 40), 2, "a, then b");
+        assert_eq!(hot(&t), ["c", "f"]);
+        // a, loaded back by a read at 50, stays; c, used at 30, goes
+        t.s.evict(keep, 50);
+        assert!(t.s.get(&on("a", "w", 0).id).is_some());
+        let idle = Dormancy {
+            idle_ms: 20,
+            budget: usize::MAX,
+        };
+        t.s.evict(idle, 60);
+        assert_eq!(hot(&t), ["a", "f"]);
+    }
+
+    #[test]
     fn idle_streams_leave_ram_and_past_its_budget_the_least_recently_used_go_first() {
         // Why: the idle time keeps a stream in use in RAM, and the budget bounds RAM whatever
         // the idle time: past it the streams used longest ago leave first.
