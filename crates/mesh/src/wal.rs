@@ -234,11 +234,6 @@ impl Wal {
         self.request(Job::Sync).await
     }
 
-    /// The sealed segments, oldest first.
-    pub fn segments(&self) -> Vec<Sealed> {
-        self.log.lock().segments().0
-    }
-
     async fn request(&self, job: Job) -> Result<Lsn> {
         let (done, rx) = oneshot::channel();
         self.tx

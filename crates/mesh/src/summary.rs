@@ -92,6 +92,8 @@ impl W {
     }
 }
 
+/// A reader: a count is a u64 read like any other, nothing is allocated for it, and a count
+/// past the bytes left fails its first short read.
 struct R<'a>(&'a [u8]);
 
 impl<'a> R<'a> {
@@ -106,13 +108,8 @@ impl<'a> R<'a> {
     fn age(&mut self) -> Option<Age> {
         Some((self.u64()?, self.u64()?, self.u64()?))
     }
-    /// A count of items of at least `min` bytes each: never more than what is left can hold.
-    fn len(&mut self, min: usize) -> Option<usize> {
-        let n = self.u64()?;
-        (n <= (self.0.len() / min) as u64).then_some(n as usize)
-    }
     fn str(&mut self) -> Option<String> {
-        let n = self.len(1)?;
+        let n = usize::try_from(self.u64()?).ok()?;
         String::from_utf8(self.take(n)?.to_vec()).ok()
     }
 }
@@ -161,7 +158,7 @@ pub fn decode_stream(b: &[u8]) -> Option<StreamSum> {
         bytes: r.u64()?,
         ..Default::default()
     };
-    for _ in 0..r.len(9 * 8)? {
+    for _ in 0..r.u64()? {
         let base = r.u64()?;
         let c = ColdStream {
             end: r.u64()?,
@@ -173,7 +170,7 @@ pub fn decode_stream(b: &[u8]) -> Option<StreamSum> {
         };
         s.cold.push((base, c));
     }
-    for _ in 0..r.len(7 * 8)? {
+    for _ in 0..r.u64()? {
         let mut l = LogSum {
             writer: r.str()?,
             epoch: r.u64()?,
@@ -183,7 +180,7 @@ pub fn decode_stream(b: &[u8]) -> Option<StreamSum> {
             ooo: r.u64()? != 0,
             cold: vec![],
         };
-        for _ in 0..r.len(3 * 8)? {
+        for _ in 0..r.u64()? {
             l.cold.push(Cold {
                 base: r.u64()?,
                 lo: r.u64()?,
@@ -245,21 +242,21 @@ pub fn decode_checkpoint(b: &[u8]) -> Option<Checkpoint> {
         totals: (r.u64()?, r.u64()?, r.u64()?),
         ..Default::default()
     };
-    for _ in 0..r.len(2 * 8)? {
+    for _ in 0..r.u64()? {
         c.ram.push((r.u64()?, r.u64()?));
     }
-    for _ in 0..r.len(8)? {
+    for _ in 0..r.u64()? {
         c.dead.push(r.u64()?);
     }
-    for _ in 0..r.len(5 * 8)? {
+    for _ in 0..r.u64()? {
         c.segs
             .push((r.u64()?, r.u64()?, (r.u64()?, r.u64()?, r.u64()?)));
     }
-    for _ in 0..r.len(3 * 8)? {
+    for _ in 0..r.u64()? {
         let p = u32::try_from(r.u64()?).ok()?;
         c.peers.push((p, r.u64()?, r.u64()?));
     }
-    for _ in 0..r.len(2 * 8)? {
+    for _ in 0..r.u64()? {
         c.boots.push((r.u64()?, r.u64()?));
     }
     r.0.is_empty().then_some(c)

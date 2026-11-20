@@ -552,7 +552,7 @@ impl Node {
         // the dedup window's batches rebuild its index: the segments logged within it
         if let (Some(d), Some(since)) = (dedup.as_mut(), since) {
             // append times never go back: a segment's newest is no older than any before it
-            let at = window_start(&wal.segments(), wal.reader.first_lsn(), since);
+            let at = window_start(&wal.retirable(None, None).0, wal.reader.first_lsn(), since);
             // LSNs are dense: each chunk is the next 64k of them
             for from in (at..wal.reader.next_lsn()).step_by(1 << 16) {
                 let es = wal.reader.entries(from, 1 << 16)?;
