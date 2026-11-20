@@ -105,7 +105,8 @@ before.
 **On disk.** One redb database per node (`<data_dir>/streams.redb`; redb was already a
 dependency of the workspace, pure Rust, copy-on-write pages, its commit atomic; quick repair is
 on, so a crash costs no walk of the file). Table `streams`: per stream one value in this crate's
-format (`summary::encode_stream`: version byte, CRC-32C): its retention floor and bytes, per
+format (`summary::encode_stream`: version byte, numbers as LEB128, CRC-32C; 62 bytes for a
+stream of one log in one segment): its retention floor and bytes, per
 absorbed segment its totals and age bounds, per writer log its frontier (`trimmed`, `contig`,
 `high`, out-of-order flag) and its sequence range per absorbed segment. Table `meta`: the
 checkpoint (`summary::Checkpoint`): `cold_end` and `contiguous`, the LSNs of the batches in RAM

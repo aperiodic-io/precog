@@ -20,7 +20,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const CHECKPOINT: &str = "checkpoint";
 
 /// The format of a stream's summary and of the checkpoint; bumped on any change.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -72,8 +72,13 @@ pub struct Checkpoint {
 struct W(Vec<u8>);
 
 impl W {
-    fn u64(&mut self, x: u64) {
-        self.0.extend_from_slice(&x.to_le_bytes());
+    /// LEB128: seven bits a byte, low first, the top bit set on all but the last.
+    fn u64(&mut self, mut x: u64) {
+        while x >= 0x80 {
+            self.0.push(x as u8 | 0x80);
+            x >>= 7;
+        }
+        self.0.push(x as u8);
     }
     fn age(&mut self, a: Age) {
         for x in [a.0, a.1, a.2] {
@@ -102,8 +107,20 @@ impl<'a> R<'a> {
         self.0 = b;
         Some(a)
     }
+    /// A number in its one LEB128 form: no longer than it needs, at most 64 bits.
     fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        let mut x = 0;
+        for i in 0..10 {
+            let b = self.take(1)?[0];
+            if i == 9 && b > 1 || i > 0 && b == 0 {
+                return None;
+            }
+            x |= u64::from(b & 0x7f) << (7 * i);
+            if b < 0x80 {
+                return Some(x);
+            }
+        }
+        None
     }
     fn age(&mut self) -> Option<Age> {
         Some((self.u64()?, self.u64()?, self.u64()?))
@@ -125,7 +142,9 @@ fn open(b: &[u8]) -> Option<R<'_>> {
 }
 
 pub fn encode_stream(s: &StreamSum) -> Vec<u8> {
-    let mut w = W(vec![VERSION]);
+    // room for a stream of one log in one segment: no regrowth
+    let mut w = W(Vec::with_capacity(256));
+    w.0.push(VERSION);
     w.age(s.floor);
     w.u64(s.bytes);
     w.u64(s.cold.len() as u64);
@@ -595,6 +614,74 @@ mod props {
             db.each(|k, s| seen.push((k.to_string(), s))).unwrap();
             prop_assert_eq!(seen, names.into_iter().zip(ss).collect::<Vec<_>>());
         }
+    }
+
+    /// A value behind a valid version and checksum, as the decoders see it past those checks.
+    fn sealed(body: &[u8]) -> Vec<u8> {
+        let mut v = vec![VERSION];
+        v.extend_from_slice(body);
+        let c = crc32c::crc32c(&v);
+        v.extend_from_slice(&c.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn a_stream_of_one_log_in_one_segment_has_a_summary_of_under_a_hundred_bytes() {
+        // Why: each checkpoint writes the summary of every stream that changed, and each new
+        // stream changed. Their size sets what the database writes per checkpoint (B-tree
+        // pages, copied on write) and its size on disk per dormant stream. Its numbers are mostly
+        // small: counts, sequences, an LSN, a time in milliseconds.
+        let (lsn, t) = (40_000_000, 1_790_000_000_000);
+        let s = StreamSum {
+            floor: (t, 0, lsn),
+            bytes: 64,
+            cold: vec![(
+                lsn - 1000,
+                ColdStream {
+                    end: lsn + 70_000,
+                    batches: 1,
+                    events: 1,
+                    bytes: 64,
+                    max_time: t,
+                    min: (t, 0, lsn),
+                },
+            )],
+            logs: vec![LogSum {
+                writer: "s2".into(),
+                epoch: 1,
+                cold: vec![Cold {
+                    base: lsn - 1000,
+                    lo: 0,
+                    hi: 1,
+                }],
+                trimmed: 0,
+                contig: 1,
+                high: 1,
+                ooo: false,
+            }],
+        };
+        let n = encode_stream(&s).len();
+        assert!(n < 100, "{n} bytes");
+    }
+
+    #[test]
+    fn a_number_longer_than_it_needs_or_past_64_bits_is_refused() {
+        // Why: one number has one encoding, so a value reads back only as what was written: a
+        // longer form of a number, or one past 64 bits, is damage, not some other number.
+        let ok = |b: &[u8]| R(b).u64();
+        assert_eq!(ok(&[0x7f]), Some(127));
+        assert_eq!(ok(&[0x80, 0x01]), Some(128));
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert_eq!(ok(&max), Some(u64::MAX));
+        assert_eq!(ok(&[0x80, 0x00]), None, "a longer form of 0");
+        assert_eq!(ok(&[0xff, 0x80, 0x00]), None, "a longer form of 127");
+        let mut past = max;
+        past[9] = 0x02;
+        assert_eq!(ok(&past), None, "65 bits");
+        assert_eq!(ok(&[0x80; 11]), None, "11 bytes");
+        assert_eq!(ok(&[0x80]), None, "cut short");
+        // the same behind a valid checksum: a checkpoint of that number is refused
+        assert_eq!(decode_checkpoint(&sealed(&[0x80, 0x00])), None);
     }
 
     #[test]

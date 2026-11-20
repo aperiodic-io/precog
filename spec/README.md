@@ -19,7 +19,7 @@ property or model test runs (below).
 | The store's identity and frontier rules | proptest, model-based | | `store::model` |
 | Dormant streams: eviction, wakes, checkpoints racing changes, crashes and the restart from a checkpoint | TLA+ / TLC | Interleavings of a checkpoint taken under the lock and written without it, evictions, changes and power losses | `spec/store/Dormant.tla` |
 | Dormant streams at the code: every query of a store that puts its streams out of RAM, fails checkpoints and reads, and crashes, against one that keeps them | proptest, model-based | A twin store is the reference: what RAM held is what must come back | `store::model_dormant` |
-| Summaries and the checkpoint on disk | proptest | Round trips, every damage refused, any bytes, a commit read back after a reopen | `summary::props` |
+| Summaries and the checkpoint on disk | proptest | Round trips, every damage refused, any bytes, a number in one LEB128 form only, a commit read back after a reopen | `summary::props` |
 | Repair following a peer's log (`Control::Inventory`) through peer crashes that lose an unsynced tail and reuse its LSNs, follower crashes and lost disks | TLA+ / TLC, proptest | A cursor into another node's log is only as good as that log's history | `spec/mesh/Inventory.tla`, `store::props_rejoin` |
 | The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
 | The WAL's write-caching gate: callers write under the log's lock, a roll or retention diverts them to the WAL thread | TLA+ / TLC | Its bugs are interleavings of worker threads and the WAL thread over two locks and a queue | `spec/wal/WalGate.tla` |
@@ -554,7 +554,8 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   explicit checking, so symbolic checking buys nothing yet.
 - **The summaries' decoders under Kani** (`summary::decode_stream`, `decode_checkpoint`): mesh
   code, like the codecs above; `summary::props` covers them (round trips, every one-byte flip,
-  cut and extension refused, any bytes behind a valid checksum). redb itself (its pages, its
+  cut and extension refused, any bytes behind a valid checksum, a number longer than it needs or
+  past 64 bits refused). redb itself (its pages, its
   commit) is trusted, as the filesystem is: `a_commit_is_read_back_after_a_reopen` and the crash
   tests (`summary:before_commit`, `summary:after_commit`) exercise it.
 - **Dormant streams across nodes in TLA+.** Dormancy is local to a node: a peer's repair wakes
