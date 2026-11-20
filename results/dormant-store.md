@@ -3,7 +3,7 @@
 A dormant stream is a ~120 B summary on disk. The store needs: checkpoints that write the changed
 streams' summaries durably (one commit per retention pass), a point read to wake a stream, a
 point read that misses for every new stream, a reopen that does not walk every stream, and little
-RAM. Two probes, on this 4-vCPU container (one run each, NVMe-backed virtual disk):
+RAM. Two probes, on this 4-vCPU cloud container (one run each):
 
 1. `storage-bench --summaries N` (`crates/storage-bench`): the store alone. Loads N summaries in
    commits of 10k, then 200 commits of 1k changed ones, drops caches, reopens, and times 100k

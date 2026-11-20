@@ -1150,11 +1150,7 @@ impl Store {
             let inner = &mut *g;
             inner.now = now_ms();
             let (first, end) = (r.first_lsn(), r.next_lsn());
-            let cp = cp.unwrap_or(Checkpoint {
-                cold_end: first,
-                contiguous: first,
-                ..Default::default()
-            });
+            let cp = cp.unwrap_or_default();
             anyhow::ensure!(
                 cp.contiguous <= end,
                 "the streams database covers the log up to lsn {}, but the log ends at {end}: \
@@ -1180,29 +1176,26 @@ impl Store {
                 i > 0 && lsn < cp.ram[i - 1].1
             };
             inner.contiguous = end; // everything recovered is durable
-            let mut from = cp.cold_end.max(first);
+            let from = cp.cold_end.max(first);
             inner.cold_end = from;
             // the batches in RAM at the checkpoint first (counted already): a batch replayed as
             // new after them sees those later in the log than it
+            // (LSNs are dense: each chunk is the next 64k of them)
             for &(a, b) in &cp.ram {
-                let mut at = a.max(from);
-                while at < b.min(end) {
-                    let es = r.entries(at, (b.min(end) - at).min(1 << 16) as usize)?;
+                let b = b.min(end);
+                for at in (a.max(from)..b).step_by(1 << 16) {
+                    let es = r.entries(at, (b - at).min(1 << 16) as usize)?;
                     anyhow::ensure!(!es.is_empty(), "the log's index ends at lsn {at}");
                     for e in es {
-                        at = e.lsn + 1;
                         inner.put_back(&s.db, r, &e)?;
                     }
                 }
             }
-            while from < end {
-                let es = r.entries(from, 1 << 16)?;
-                anyhow::ensure!(
-                    !es.is_empty(),
-                    "the log's index ends at lsn {from} of {end}"
-                );
+            for at in (from..end).step_by(1 << 16) {
+                inner.absorb(r, at); // what the chunks before replayed
+                let es = r.entries(at, 1 << 16)?;
+                anyhow::ensure!(!es.is_empty(), "the log's index ends at lsn {at} of {end}");
                 for e in es {
-                    from = e.lsn + 1;
                     let (log, replaces) = decode_record_key(&e.meta.key)?;
                     inner.wake(&s.db, r, &log.stream, false)?;
                     let ix = inner.intern(&log);
@@ -1240,8 +1233,8 @@ impl Store {
                     inner.join(ix);
                     inner.index(r, e.lsn, ix, first, new, e.meta.time_ms);
                 }
-                inner.absorb(r, from);
             }
+            inner.absorb(r, end);
         }
         s.count_known()?;
         Ok(s)
@@ -4424,6 +4417,66 @@ mod tests {
         assert_eq!(ids(2 * lens[0]), all[..2], "only what fits");
         let (got, _) = drain(&t.s, "s", Cursor::new(), 2 * lens[0]);
         assert_eq!(got.len(), 5, "and the rest after");
+    }
+
+    #[test]
+    fn retention_at_a_segment_boundary_and_a_feed_of_every_stream_leave_dormant_streams_on_disk() {
+        // Why: the node's retention drops whole segments, and a node holds millions of dormant
+        // streams: neither that nor a feed of every stream may load each one from disk.
+        let mut t = store_with(TINY);
+        for seq in 0..4 {
+            for name in ["s", "t", "u"] {
+                let x = on(name, "w", seq);
+                t.s.reserve(&x);
+                t.durable(&x);
+            }
+        }
+        // another stream's batches seal the segments theirs are in
+        for seq in 0..6 {
+            let x = on("f", "w", seq);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        t.s.checkpoint().unwrap();
+        let none = Dormancy {
+            idle_ms: 0,
+            budget: 0,
+        };
+        t.s.evict(none, 10);
+        t.s.evict(none, 20);
+        let h = t.s.hot_stats();
+        assert_eq!(h.dormant, 3, "{h:?}");
+        // the first segment starts at the floor: no summary is stale
+        let f = t.s.frontiers(None);
+        assert!(f.iter().any(|f| f.log.stream == "s"), "{f:?}");
+        assert_eq!(
+            t.s.hot_stats().loads,
+            0,
+            "a feed of every stream: none loaded"
+        );
+        let sealed = t.log.reader().sealed();
+        t.s.trim(sealed[1].0);
+        assert_eq!(
+            t.s.hot_stats().loads,
+            0,
+            "a whole segment: no stream loaded"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_the_batches_in_ram_as_runs_of_lsns() {
+        // Why: the checkpoint is rewritten at every pass: one entry per run, not per batch.
+        let mut t = store_with(1 << 20);
+        for seq in 0..3 {
+            let x = on("s", "w", seq);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.checkpoint().unwrap();
+        let cp = t.s.db.checkpoint().unwrap().expect("written");
+        assert_eq!(cp.ram.len(), 1, "{:?}", cp.ram);
+        assert_eq!(cp.ram[0].1 - cp.ram[0].0, 3);
     }
 
     #[test]
