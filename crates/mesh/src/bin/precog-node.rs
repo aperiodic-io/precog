@@ -26,11 +26,11 @@ enum Cmd {
         /// Tokio worker threads (default: all cores).
         #[arg(long)]
         threads: Option<usize>,
-        /// `current-thread` runs the node's network and replication on one thread: about 8%
-        /// less CPU per record at a fixed rate, but lower peak throughput at a fixed number of
-        /// appends in flight.
-        #[arg(long, value_enum, default_value_t = Runtime::MultiThread)]
-        runtime: Runtime,
+        /// `current-thread` (the default, unless `--threads` is given) runs the node's network
+        /// and replication on one thread: about 8% less CPU per record at a fixed rate than
+        /// `multi-thread`, but lower peak throughput at a fixed number of appends in flight.
+        #[arg(long, value_enum)]
+        runtime: Option<Runtime>,
     },
     /// Write configs for an N-node local cluster (one failure domain label per node).
     Init {
@@ -114,20 +114,29 @@ pub fn client_from(path: &PathBuf) -> Result<std::sync::Arc<MeshClient>> {
     MeshClient::new(addrs, c.token)
 }
 
-fn builder(runtime: Runtime, threads: Option<usize>) -> Result<tokio::runtime::Builder> {
+/// The runtime `serve` asked for: one thread unless worker threads were asked for.
+fn flavor(runtime: Option<Runtime>, threads: Option<usize>) -> Result<Runtime> {
     Ok(match (runtime, threads) {
-        (Runtime::CurrentThread, Some(_)) => {
+        (Some(Runtime::CurrentThread), Some(_)) => {
             anyhow::bail!("--threads does not apply to --runtime current-thread")
         }
-        (Runtime::CurrentThread, None) => tokio::runtime::Builder::new_current_thread(),
-        (Runtime::MultiThread, t) => {
+        (Some(r), _) => r,
+        (None, Some(_)) => Runtime::MultiThread,
+        (None, None) => Runtime::CurrentThread,
+    })
+}
+
+fn builder(runtime: Runtime, threads: Option<usize>) -> tokio::runtime::Builder {
+    match runtime {
+        Runtime::CurrentThread => tokio::runtime::Builder::new_current_thread(),
+        Runtime::MultiThread => {
             let mut b = tokio::runtime::Builder::new_multi_thread();
-            if let Some(t) = t {
+            if let Some(t) = threads {
                 b.worker_threads(t);
             }
             b
         }
-    })
+    }
 }
 
 fn main() -> Result<()> {
@@ -140,10 +149,10 @@ fn main() -> Result<()> {
     let (threads, runtime) = match &cli.cmd {
         Cmd::Serve {
             threads, runtime, ..
-        } => (*threads, *runtime),
+        } => (*threads, flavor(*runtime, *threads)?),
         _ => (Some(2), Runtime::MultiThread),
     };
-    builder(runtime, threads)?
+    builder(runtime, threads)
         .enable_all()
         .build()?
         .block_on(run(cli.cmd))
@@ -291,33 +300,33 @@ async fn run(cmd: Cmd) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Why: a node below saturation spends a fifth of its CPU on wake-ups between the runtime's
-    /// threads; one thread for everything is the opt-in for that.
+    /// Why: a node spends a fifth of its CPU on wake-ups between the runtime's threads, and one
+    /// thread for everything takes 8% off at a fixed rate, so it is the default; `--threads`
+    /// (worker threads, which only a multi-thread runtime has) keeps meaning what it meant.
     #[test]
-    fn serve_runs_on_a_multi_thread_runtime_unless_asked() {
-        let parse = |extra: &[&str]| {
+    fn serve_runs_on_one_thread_unless_asked_for_workers() {
+        let flavor = |extra: &[&str]| {
             let mut a = vec!["precog-node", "serve", "--config", "c.json"];
             a.extend_from_slice(extra);
             match Cli::try_parse_from(a).map(|c| c.cmd) {
-                Ok(Cmd::Serve { runtime, .. }) => Ok(runtime),
+                Ok(Cmd::Serve {
+                    runtime, threads, ..
+                }) => flavor(runtime, threads).map_err(|e| e.to_string()),
                 Ok(_) => unreachable!(),
-                Err(e) => Err(e),
+                Err(e) => Err(e.to_string()),
             }
         };
-        assert_eq!(parse(&[]).unwrap(), Runtime::MultiThread);
-        assert_eq!(
-            parse(&["--runtime", "current-thread"]).unwrap(),
-            Runtime::CurrentThread
-        );
-        assert!(parse(&["--runtime", "fibers"]).is_err());
-        // worker threads mean nothing to a current-thread runtime
-        let rt = parse(&["--runtime", "current-thread", "--threads", "2"]).unwrap();
-        assert!(builder(rt, Some(2)).is_err());
-        assert!(builder(Runtime::MultiThread, Some(2)).is_ok());
-        let one = builder(Runtime::CurrentThread, None)
-            .unwrap()
-            .build()
-            .unwrap();
+        assert_eq!(flavor(&[]).unwrap(), Runtime::CurrentThread);
+        assert_eq!(flavor(&["--threads", "2"]).unwrap(), Runtime::MultiThread);
+        let mt = ["--runtime", "multi-thread"];
+        assert_eq!(flavor(&mt).unwrap(), Runtime::MultiThread);
+        let ct = ["--runtime", "current-thread"];
+        assert_eq!(flavor(&ct).unwrap(), Runtime::CurrentThread);
+        assert!(flavor(&["--runtime", "current-thread", "--threads", "2"]).is_err());
+        assert!(flavor(&["--runtime", "fibers"]).is_err());
+        let one = builder(Runtime::CurrentThread, None).build().unwrap();
         assert_eq!(one.metrics().num_workers(), 1);
+        let two = builder(Runtime::MultiThread, Some(2)).build().unwrap();
+        assert_eq!(two.metrics().num_workers(), 2);
     }
 }

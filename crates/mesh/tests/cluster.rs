@@ -89,7 +89,7 @@ async fn status(mc: &MeshClient, node: usize) -> Status {
     }
 }
 
-/// Why: `precog-node serve --runtime current-thread` runs a node's network, replication and
+/// Why: `precog-node serve` (by default) runs a node's network, replication and
 /// group-commit handoff on one thread. Nothing in the node may block that thread: three nodes
 /// and their client sharing one current-thread runtime still replicate every append to three.
 #[tokio::test(flavor = "current_thread")]

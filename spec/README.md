@@ -463,8 +463,8 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   explicit checking, so symbolic checking buys nothing yet.
 - **Index and segment header round trips under Kani.** They need a `File`; their decoders are
   proved panic-free above and the round trips are unit-tested.
-- **The node on a current-thread runtime** (`precog-node serve --runtime current-thread`,
-  opt-in). It changes no protocol, format or invariant: the same tasks
+- **The node on a current-thread runtime** (`precog-node serve`'s default; `--runtime
+  multi-thread` keeps the worker pool). It changes no protocol, format or invariant: the same tasks
   run, on one thread instead of a worker pool, and the WAL thread hands commits back the same
   way. What it needs, that nothing in the node blocks its runtime thread, is a property of the
   code rather than of an interleaving, and is checked by
