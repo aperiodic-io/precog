@@ -33,7 +33,8 @@ static A: Counting = Counting;
 
 /// Heap bytes per dormant stream: the stream's summary is on disk; what may stay is a few bytes
 /// of a sealed segment's key table and of free slots. 2,649 B per stream on main before dormant
-/// streams left RAM; 37 B since.
+/// streams left RAM; 37 B since; 10 B with summaries in LEB128 (measured over 64k streams, with a
+/// page cache full at both measurements).
 const BUDGET: f64 = 64.0;
 
 /// Streams `from..to`, one keyed event each, 16 appends at a time.
@@ -93,11 +94,12 @@ async fn ram_per_dormant_stream_stays_within_budget() {
         "dedup_window_ms": 1000,
         "tail_cache_bytes": 0,
         "dormant_after_ms": 0,
-        "summary_cache_bytes": 1 << 20,
+        // small enough to be full at both measurements: the cache is bounded, not per stream
+        "summary_cache_bytes": 1 << 16,
     }))
     .unwrap();
     let node = Node::open(cfg).await.unwrap();
-    const N: usize = 8_000;
+    const N: usize = 32_000;
     create(&node, 0, N).await;
     settle(&node, 1).await;
     let at_n = LIVE.load(Ordering::Relaxed);
