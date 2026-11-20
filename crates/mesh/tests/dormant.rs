@@ -196,6 +196,9 @@ async fn appends_racing_the_pass_that_puts_their_stream_out_of_ram_are_all_kept(
         tokio::spawn(async move {
             while node.store.frontier(&log("race")).contiguous < n {
                 node.apply_retention().await.unwrap();
+                // a pass with nothing to write awaits nothing: without this the loop keeps its
+                // worker, and the writer it woke waits there (a node sleeps between passes)
+                tokio::task::yield_now().await;
             }
         })
     };
