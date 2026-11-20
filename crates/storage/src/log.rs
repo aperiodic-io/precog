@@ -1382,6 +1382,21 @@ impl Log {
         Ok(())
     }
 
+    /// Whether appending `group` rolls the segment first (a roll seals and syncs the segment, and
+    /// can zero-fill its successor: slow).
+    pub fn rolls(&self, group: &[(Meta, &[u8])]) -> bool {
+        let total = group
+            .iter()
+            .map(|(m, p)| record::encoded_len(m.key.len(), p.len()) as u64);
+        self.must_roll(total.sum())
+    }
+
+    fn must_roll(&self, total: u64) -> bool {
+        self.active
+            .as_ref()
+            .is_none_or(|a| a.offset + total > a.capacity)
+    }
+
     /// Appends one write group. Returns the LSN of its first record after the whole group is
     /// on stable storage. On an I/O error the log becomes unusable (`Error::Fatal`).
     pub fn append(&mut self, group: &[(Meta, &[u8])]) -> Result<Lsn> {
@@ -1416,11 +1431,7 @@ impl Log {
                 MAX_GROUP.min(room)
             )));
         }
-        if self
-            .active
-            .as_ref()
-            .is_none_or(|a| a.offset + total as u64 > a.capacity)
-        {
+        if self.must_roll(total as u64) {
             self.roll()?;
         }
         let first = self.next_lsn();

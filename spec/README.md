@@ -22,6 +22,7 @@ property or model test runs (below).
 | Summaries and the checkpoint on disk | proptest | Round trips, every damage refused, any bytes, a commit read back after a reopen | `summary::props` |
 | Repair following a peer's log (`Control::Inventory`) through peer crashes that lose an unsynced tail and reuse its LSNs, follower crashes and lost disks | TLA+ / TLC, proptest | A cursor into another node's log is only as good as that log's history | `spec/mesh/Inventory.tla`, `store::props_rejoin` |
 | The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
+| The WAL's write-caching gate: callers write under the log's lock, a roll or retention diverts them to the WAL thread | TLA+ / TLC | Its bugs are interleavings of worker threads and the WAL thread over two locks and a queue | `spec/wal/WalGate.tla` |
 | The segment cleaner: each stream's own retention under the node cap, through slow batches and restarts | proptest | After every pass: the log within the cap, every log the newest suffix of what was written to it (no hole, once, byte for byte), a stream within its own retention (and within one batch of it unless the cap cut it) | `node::props_cleaner` |
 | The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
@@ -387,6 +388,35 @@ write caching: acks arrive in submit order with consecutive LSNs, each acked bat
 with its bytes and its key (replacing or not), a failure fences the WAL (`fatal`), and from then
 on nothing is acknowledged or retained. No discrepancy found.
 
+### The write-caching gate: `spec/wal/WalGate.tla`
+
+**Models.** Workers submitting their own batches one after another under write caching: the
+gate's mutex, then the log's; a batch that fits is written by the worker, one that rolls raises
+the gate and is queued; with the gate up a batch is queued under the gate. The WAL thread: at the
+top of its loop, with the gate up, the next queued batch, or lifting the gate when nothing is
+queued; a blocking receive; retention jobs, which raise the gate before taking the log; queued
+batches appended by the thread (which may roll). Slow steps (a roll, a retention job) hold the
+log's lock.
+
+**Abstracts away.** Payloads, the deferred fsync (short, under the lock only to begin and end
+it), the sync past twice `flush_bytes` on the worker (bounded by `flush_bytes`), errors.
+
+**Checks.** `InOrder` (each worker's batches reach the log in its submit order),
+`NeverWaitsOnSlow` (no worker waits for the log's lock while a roll or a retention job holds it),
+`Complete` (once nothing can happen, every batch is logged and every job ran).
+
+| Config | Bound | Result |
+|---|---|---|
+| `MC_gate` | 2 workers x 2 batches, 1 job, any batch may roll | all hold, 1,384 states |
+| `MC_gate_ungated` (expect) | the code before the gate: a worker rolls on itself | `NeverWaitsOnSlow` fails |
+| `MC_gate_clear_early` (expect) | the gate lifted with batches still queued | `InOrder` fails |
+
+**Found.** Before the gate (#16 to #24) a worker rolled the segment on itself under the log's
+lock, and every worker that submitted meanwhile waited for the roll's syncs (and a zero-fill
+with no spare), as it did for retention on the WAL thread (`MC_gate_ungated`). Test:
+`wal::tests::under_write_caching_a_submit_never_waits_for_a_roll` (failed first: the submit
+waited 129 ms of a 129 ms roll).
+
 ### RPC frames: `rpc::props`
 
 Frames of every kind with random ids and bodies, the stream cut into random reads: they read
@@ -496,8 +526,9 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
 
 ## Not verified, and why
 
-- **Loom for the storage write path.** One OS thread owns the `Log`; other threads only read
-  through `Reader` (atomics with acquire/release, `RwLock`s, a `Mutex` around the tail cache).
+- **Loom for the storage write path.** Writers take the `Log` under one mutex (the WAL thread,
+  and under write caching the callers, whose ordering against it is `WalGate.tla`); other
+  threads only read through `Reader` (atomics with acquire/release, `RwLock`s, a `Mutex` around the tail cache).
   There is no lock-free protocol for Loom to explore, and the publication order (`next_lsn`
   stored after the entries) is a single release store, covered by
   `readers_see_appends_concurrently_and_hit_the_tail_cache`.

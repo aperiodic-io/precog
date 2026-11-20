@@ -773,3 +773,42 @@ async fn a_record_the_cleaner_cannot_read_does_not_stop_the_node_cap() {
     }
     assert_eq!(cursor_seqs(&node, "low"), (1..20).collect::<Vec<_>>());
 }
+
+#[test]
+fn a_fence_the_node_sets_survives_the_wal_threads_deferred_flush() {
+    // Why: the node fences the WAL itself when a batch whose dedup ids it claimed fails to store
+    // (those ids stay claimed in the index). Its housekeeping must never lift that: acking again
+    // would drop later events carrying those ids as duplicates.
+    use precog_mesh::wal::Wal;
+    use std::sync::atomic::Ordering;
+    let d = tempfile::tempdir().unwrap();
+    let mut c = precog_storage::Config::new(d.path());
+    c.segment_size = 1 << 20;
+    c.flush_delay_ms = 20;
+    let wal = Wal::open(c).unwrap();
+    wal.submit(Batch::parse(batch("w", 0, 100)).unwrap())
+        .unwrap();
+    wal.fatal.store(true, Ordering::Release); // as node.rs does for a failed claimed batch
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while wal.stats.syncs.load(Ordering::Relaxed) == 0 {
+        assert!(std::time::Instant::now() < deadline, "never flushed");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20)); // past its publish
+    assert!(wal.fatal.load(Ordering::Acquire), "the fence was lifted");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fence_the_node_sets_survives_retention() {
+    // Why: as for the deferred flush: retention runs on a timer, and lifting the node's own fence
+    // would let it ack again with dedup ids claimed that were never written.
+    use precog_mesh::wal::Wal;
+    use std::sync::atomic::Ordering;
+    let d = tempfile::tempdir().unwrap();
+    let mut c = precog_storage::Config::new(d.path());
+    c.segment_size = 1 << 20;
+    let wal = Wal::open(c).unwrap();
+    wal.fatal.store(true, Ordering::Release); // as node.rs does for a failed claimed batch
+    wal.drop_until(0).await.unwrap();
+    assert!(wal.fatal.load(Ordering::Acquire), "the fence was lifted");
+}
