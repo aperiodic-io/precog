@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 76525616cb2fcf993ab52327292028fd38190e6c6a9fa4df6163454bcd1ce7fa # shrinks to ops = [Reserve(0, 0, 0, 1, 0), Crash]
+cc 67083f55538364405342511b55d38a5865ac530a29c24774313d77f78a3848e9 # shrinks to ops = [Reserve(0, 0, 0, 1, 0), Durable(Index(0)), TrimStream(0, 0), Crash]
+cc 6527e1f0c55cc779603de806aed52ebc181326fb74b4822de17f67f03d98d513 # shrinks to ops = [Reserve(0, 0, 1, 1, 0), Durable(Index(0)), Reserve(1, 0, 0, 1, 0), Durable(Index(0)), Absorb, Retain(Index(0)), Crash]
+cc 07487bd4ab2e27698d77736a5b77fcbdeda17fab836610a6ac3824f35f2574f3 # shrinks to ops = [Reserve(1, 0, 5, 1, 0), Durable(Index(0)), Reserve(0, 0, 0, 1, 0), Durable(Index(0)), Reserve(1, 0, 6, 1, 0), Absorb, Durable(Index(0)), Retain(Index(0)), Crash]
+cc 54ee42281ac828bf0b7028757ab33f13ef457f531821e31e9e7f5b0dcbacdfd1 # shrinks to ops = [Reserve(1, 0, 1, 1, 0), Durable(Index(0)), Reserve(1, 0, 0, 1, 0), TrimStream(1, 0), Durable(Index(0)), Crash]
+cc f4bf7c203a78136ec0c06eb500bcfacf8d9411a8332d6c8f37a1653512a06750 # shrinks to ops = [Reserve(0, 0, 4, 1, 0), Write(0), Reserve(0, 0, 0, 1, 0), Durable(0), TrimStream(0, 1), Reserve(0, 1, 0, 1, 0), Crash]
+cc 923eb0d890175bb9ba9937d2695c7875ce83c09601a018ae0c258bee1ddd41fb # shrinks to ops = [Reserve(0, 0, 0, 1, 0), Reserve(0, 0, 1, 1, 0), Reserve(0, 0, 2, 1, 0), Durable(0), Write(0), Durable(0), Mark(0), Reserve(1, 0, 0, 2, 0), Write(340), TrimMid(3918277648458073569, true), Absorb, Doze]
+cc 23f9162669dde570034ed24469a5860f55ee4bfbe3f82aca0597e6262e09cac9 # shrinks to ops = [Reserve(0, 0, 0, 1, 0), Reserve(0, 1, 0, 2, 0), Reserve(1, 0, 0, 1, 0), Write(54035062063345035), Reserve(0, 0, 1, 1, 0), Durable(0), Durable(0), Durable(0), TrimStream(0, 0), Crash]

@@ -220,7 +220,7 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[given(
-    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "(\w+)" retains (\d+) MiB)?$"#
+    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "(\w+)" retains (\d+) MiB)?(, where idle streams leave RAM)?$"#
 )]
 async fn cluster(
     w: &mut Mesh,
@@ -229,6 +229,7 @@ async fn cluster(
     retention_mb: String,
     stream: String,
     stream_mb: String,
+    dormant: String,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let base = NEXT_PORT.fetch_add(10, Ordering::Relaxed);
@@ -256,6 +257,9 @@ async fn cluster(
         let p = dir.path().join(format!("node-{i}.json"));
         let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         v["retention_interval_ms"] = 200.into();
+        if !dormant.is_empty() {
+            v["dormant_after_ms"] = 0.into();
+        }
         if !stream.is_empty() {
             let mb: u64 = stream_mb.parse().unwrap();
             v["streams"] = serde_json::json!({ stream.clone(): { "retention_bytes": mb << 20 } });
@@ -350,6 +354,62 @@ async fn append_many(w: &mut Mesh, k: usize, n: u64, size: usize, copies: u8) {
     }
     for (t, &i) in tasks.into_iter().zip(&ids) {
         w.writers[i].acked = t.await.unwrap();
+    }
+}
+
+#[when(regex = r"^(\d+) streams each get a batch of (\d+) bytes with (\d+) copies$")]
+async fn many_streams(w: &mut Mesh, k: usize, size: usize, copies: u8) {
+    let ids: Vec<usize> = (0..k)
+        .map(|j| {
+            let i = new_writer(w, size, copies);
+            w.writers[i].stream = format!("d{j:05}");
+            i
+        })
+        .collect();
+    // 16 at a time
+    for chunk in ids.chunks(16) {
+        let mut tasks = vec![];
+        for &i in chunk {
+            let (c, preferred) = (w.client(), i % w.n);
+            let ws = &w.writers[i];
+            let (stream, name, epoch) = (ws.stream.clone(), ws.name.clone(), ws.epoch);
+            tasks.push(tokio::spawn(async move {
+                let mut writer = Writer::new(c, &stream, &name, epoch, preferred, copies);
+                let p = payload(&name, 0, size);
+                writer.append(&[(0, &p[..])]).await.unwrap();
+            }));
+        }
+        for (t, &i) in tasks.into_iter().zip(chunk) {
+            t.await.unwrap();
+            w.writers[i].acked = 1;
+        }
+    }
+}
+
+#[when(regex = r"^node (\d+) is replaced by an empty one$")]
+async fn replace_node(w: &mut Mesh, i: usize) {
+    w.kill(i);
+    std::fs::remove_dir_all(w.root().join(format!("n{i}"))).unwrap();
+    w.start(i);
+    w.wait_ready(i).await;
+}
+
+#[then(regex = r"^node (\d+) holds at least (\d+) streams only on disk$")]
+async fn dormant_streams(w: &mut Mesh, i: usize, n: u64) {
+    // the next retention pass puts them out of RAM
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let s = w.status(i).await.unwrap();
+        if s.streams_dormant >= n {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node {i}: {} dormant, {} in RAM",
+            s.streams_dormant,
+            s.streams_hot
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -457,16 +517,19 @@ async fn repair(w: &mut Mesh) {
     // A peer that was just restarted stays marked down for its backoff, and a repair meanwhile
     // reports it: repair has run once it completes without errors, which must happen within the
     // deadline.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // A pass that refills a replaced node takes longer than one request: the node goes on
+    // with it (repair runs every second); ask again until a pass completes cleanly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     for i in 0..w.n {
         loop {
-            match w.client().control(i, &Control::Repair).await.unwrap() {
-                ControlResp::Repair { errors, .. } if errors.is_empty() => break,
-                ControlResp::Repair { errors, .. } => {
+            match w.client().control(i, &Control::Repair).await {
+                Ok(ControlResp::Repair { errors, .. }) if errors.is_empty() => break,
+                Ok(ControlResp::Repair { errors, .. }) => {
                     assert!(std::time::Instant::now() < deadline, "node {i}: {errors:?}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                r => panic!("{r:?}"),
+                Err(e) => assert!(std::time::Instant::now() < deadline, "node {i}: {e}"),
+                Ok(r) => panic!("{r:?}"),
             }
         }
     }

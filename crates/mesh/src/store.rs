@@ -13,22 +13,32 @@
 //! (`Reader::by_key`: one read of the log's run in it), only for the segments whose range
 //! covers what is asked.
 //!
+//! A third keeps RAM independent of the number of streams: a stream with no batch in RAM, unused
+//! for a while (`Store::evict`), leaves RAM whole and is a summary on disk (`crate::summary`).
+//! Any operation on it puts it back (`Inner::wake`: one read of the summary, no index read).
+//! The summaries and a checkpoint are written once per retention pass (`Store::begin_checkpoint`),
+//! and a restart replays only the log past the checkpoint (`Store::open`).
+//!
 //! A consumer replaying retention (`read_cursor`, `cursor_at`, the event-time `read`) reads
 //! absorbed segments' indexes on a copy of their metadata, without the store's lock, which
 //! every append takes.
 //!
 //! ponytail: other old lookups (a late retry's `reserve`, `has`/`get`, repair's `log_batches`,
 //! retention, `tail`'s chunk of at most 1024 entries) read under the lock: each reads a few
-//! segments' runs. Move them onto a view too if they measurably stall appends.
+//! segments' runs; waking a dormant stream reads its summary under it. Move them onto a view too
+//! if they measurably stall appends.
 
 use crate::proto::{
     Batch, BatchId, Event, Frontier, LogId, decode_log_key, decode_record_key, encode_log_key,
     encode_replacing_key,
 };
+use crate::summary::{Checkpoint, Db, LogSum, StreamSum};
 use parking_lot::Mutex;
 use precog_storage::record::Meta;
 use precog_storage::{Lsn, Reader};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use tokio::sync::watch;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,11 +78,11 @@ struct Rec {
 }
 
 /// A log's batches in one sealed segment: their sequences lie in `lo..hi`.
-#[derive(Clone, Copy, Debug)]
-struct Cold {
-    base: Lsn,
-    lo: u64,
-    hi: u64,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cold {
+    pub base: Lsn,
+    pub lo: u64,
+    pub hi: u64,
 }
 
 /// One writer log. Kept for good once seen: its frontier outlives its batches.
@@ -94,12 +104,68 @@ struct Log {
     ooo: bool,
 }
 
+/// A log's index is its own hash, spread over the high bits SwissTable reads.
+#[derive(Default)]
+struct Spread(u64);
+
+impl Hasher for Spread {
+    fn finish(&self) -> u64 {
+        self.0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = self.0 << 8 | x as u64;
+        }
+    }
+}
+
+/// The logs in RAM by index: an index is free again once its stream is dormant (`Inner::put`).
+#[derive(Default)]
+struct Logs(HashMap<u32, Log, BuildHasherDefault<Spread>>);
+
+impl std::ops::Index<usize> for Logs {
+    type Output = Log;
+    fn index(&self, i: usize) -> &Log {
+        &self.0[&(i as u32)]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Logs {
+    fn index_mut(&mut self, i: usize) -> &mut Log {
+        self.0.get_mut(&(i as u32)).expect("a log in RAM")
+    }
+}
+
+impl Logs {
+    /// Adds a log at the next index (a view's logs, from 0).
+    fn push(&mut self, l: Log) {
+        self.0.insert(self.0.len() as u32, l);
+    }
+}
+
+impl std::ops::Deref for Logs {
+    type Target = HashMap<u32, Log, BuildHasherDefault<Spread>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Logs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 /// Writer logs are interned: a batch refers to its log by index, so no map holds a copy of its
 /// stream and writer names per batch.
 #[derive(Default)]
 struct Inner {
-    logs: Vec<Log>,
+    logs: Logs,
+    /// Indexes freed by dormant streams, and the next never used.
+    free: Vec<u32>,
+    next_ix: u32,
     ix: HashMap<LogId, u32>,
+    /// The streams in RAM; the others are dormant, summaries in the database.
     streams: HashMap<String, StreamLog>,
     /// Durable batches in RAM by LSN: (log, len, first seq).
     order: BTreeMap<Lsn, (u32, u32, u64)>,
@@ -127,6 +193,19 @@ struct Inner {
     batches: u64,
     events: u64,
     bytes: u64,
+    /// Per absorbed segment (base): its end, and what every stream, dormant ones too, retains in
+    /// it. Dropping it subtracts these from the totals without waking anyone.
+    segs: BTreeMap<Lsn, (Lsn, Totals)>,
+    /// Repair's position in each peer's log: (its incarnation, the next LSN to ask for).
+    peers: BTreeMap<u32, (u64, u64)>,
+    /// This node's boots, oldest first: (incarnation, where its log ended at the open).
+    boots: Vec<(u64, Lsn)>,
+    /// The clock of the last eviction pass (ms): a use marks a stream with it.
+    now: u64,
+    /// Dormant streams woken, and the time it took.
+    loads: u64,
+    load_ns: u64,
+    evictions: u64,
 }
 
 #[derive(Default)]
@@ -140,18 +219,22 @@ struct StreamLog {
     /// Its own retention forgot every one of its batches below this: it trims oldest first.
     floor: Age,
     bytes: u64,
+    /// When it was last used (`Inner::now`); 0 if only retention or repair woke it.
+    used: u64,
+    /// Changed since its summary was last written.
+    dirty: bool,
 }
 
 /// A stream's batches still retained in one absorbed segment.
-#[derive(Clone, Copy, Default)]
-struct ColdStream {
-    end: Lsn,
-    batches: u64,
-    events: u64,
-    bytes: u64,
-    max_time: u64,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColdStream {
+    pub end: Lsn,
+    pub batches: u64,
+    pub events: u64,
+    pub bytes: u64,
+    pub max_time: u64,
     /// At most the age of its oldest batch (exact when absorbed).
-    min: Age,
+    pub min: Age,
 }
 
 /// The order a stream trims in, oldest first: (append time, first sequence, LSN). A copy forward
@@ -216,13 +299,81 @@ pub fn now_ms() -> u64 {
 
 type Res<T> = precog_storage::Result<T>;
 
+/// Retained (batches, events, bytes).
+type Totals = (u64, u64, u64);
+
+/// Boots a node keeps: a follower of an older one follows its log from the start again.
+const BOOTS: usize = 64;
+
+/// Where a peer that followed this node's log up to `from` in the boot `theirs` goes on from,
+/// given its `boots` (oldest first; the last is this one): no later than where the log ended at
+/// the open of any boot after `theirs` (a crash may have lost an unsynced tail, and other
+/// records were logged at those LSNs since); from the start for a boot it no longer knows
+/// (spec/mesh/Inventory.tla: one boot back is not enough, `MC_inventory_lastboot`).
+pub fn rejoin(from: Lsn, theirs: u64, boots: &[(u64, Lsn)]) -> Lsn {
+    match boots.iter().rposition(|b| b.0 == theirs) {
+        Some(i) => boots[i + 1..].iter().fold(from, |m, b| m.min(b.1)),
+        None => 0,
+    }
+}
+
+fn corrupt(e: String) -> precog_storage::Error {
+    precog_storage::Error::Corrupt(e)
+}
+
+/// Takes an absorbed batch of `n` events and `len` bytes off its segment's totals.
+fn untotal(segs: &mut BTreeMap<Lsn, (Lsn, Totals)>, base: Lsn, n: u64, len: u64) {
+    if let Some((_, t)) = segs.get_mut(&base) {
+        (t.0, t.1, t.2) = (t.0 - 1, t.1 - n, t.2 - len);
+    }
+}
+
+/// What one stream in RAM costs, about (bytes): what `Store::evict` holds to its budget.
+fn cost(name: &str, s: &StreamLog, logs: &Logs) -> usize {
+    let per_log: usize = s
+        .logs
+        .iter()
+        .filter_map(|ix| logs.get(ix))
+        .map(|l| {
+            std::mem::size_of::<Log>()
+                + 64
+                + 2 * (l.id.stream.len() + l.id.writer.len())
+                + 32 * l.cold.len()
+                + 64 * l.batches.len()
+        })
+        .sum();
+    std::mem::size_of::<StreamLog>()
+        + 64
+        + 2 * name.len()
+        + 96 * s.cold.len()
+        + 48 * s.order.len()
+        + per_log
+}
+
+/// A dormant stream's log as RAM holds it (no batch in RAM).
+fn log_of(stream: &str, l: LogSum) -> Log {
+    Log {
+        id: LogId {
+            stream: stream.into(),
+            writer: l.writer,
+            epoch: l.epoch,
+        },
+        batches: BTreeMap::new(),
+        cold: l.cold,
+        trimmed: l.trimmed,
+        contig: l.contig,
+        high: l.high,
+        ooo: l.ooo,
+    }
+}
+
 impl Inner {
+    /// The log's index, a new one if it is new to RAM. Its stream must be awake (`wake`).
     fn intern(&mut self, log: &LogId) -> u32 {
         if let Some(&i) = self.ix.get(log) {
             return i;
         }
-        let i = self.logs.len() as u32;
-        self.logs.push(Log {
+        let i = self.put(Log {
             id: log.clone(),
             batches: BTreeMap::new(),
             cold: vec![],
@@ -235,8 +386,132 @@ impl Inner {
         i
     }
 
+    /// A free index for `l`.
+    fn put(&mut self, l: Log) -> u32 {
+        let i = match self.free.pop() {
+            Some(i) => i,
+            None => {
+                self.next_ix += 1;
+                self.next_ix - 1
+            }
+        };
+        self.logs.insert(i, l);
+        i
+    }
+
     fn log(&self, log: &LogId) -> Option<(u32, &Log)> {
         self.ix.get(log).map(|&i| (i, &self.logs[i as usize]))
+    }
+
+    /// Puts a dormant stream back in RAM from its summary (one read of it; nothing if it is
+    /// awake or unknown). `touch`: a use (an append, a read, a subscription), which keeps it
+    /// in RAM for the idle time; retention and repair wake it without one.
+    fn wake(&mut self, db: &Db, r: &Reader, stream: &str, touch: bool) -> Res<()> {
+        if let Some(s) = self.streams.get_mut(stream) {
+            if touch {
+                s.used = self.now;
+            }
+            return Ok(());
+        }
+        let t = std::time::Instant::now();
+        let Some(sum) = db.stream(stream).map_err(corrupt)? else {
+            return Ok(());
+        };
+        let mut s = StreamLog {
+            cold: sum.cold.into_iter().collect(),
+            floor: sum.floor,
+            bytes: sum.bytes,
+            used: if touch { self.now } else { 0 },
+            ..Default::default()
+        };
+        for l in sum.logs {
+            let l = log_of(stream, l);
+            let id = l.id.clone();
+            let ix = self.put(l);
+            self.ix.insert(id, ix);
+            s.logs.insert(ix);
+        }
+        self.streams.insert(stream.into(), s);
+        self.reconcile(r, stream);
+        self.loads += 1;
+        self.load_ns += t.elapsed().as_nanos() as u64;
+        Ok(())
+    }
+
+    /// A batch in RAM at the checkpoint, back in RAM (it is counted in the summaries already).
+    fn put_back(&mut self, db: &Db, r: &Reader, e: &precog_storage::Entry) -> Res<()> {
+        let (log, _) = decode_record_key(&e.meta.key).map_err(|x| corrupt(x.to_string()))?;
+        self.wake(db, r, &log.stream, false)?;
+        let ix = self.intern(&log);
+        self.join(ix);
+        let first = e.meta.first_seq;
+        let l = &mut self.logs[ix as usize];
+        let new = Entry {
+            lsn: e.lsn,
+            count: e.meta.count,
+            crc: e.meta.tag,
+            len: e.payload_len,
+        };
+        l.batches.insert(first, new);
+        // a segment dropped since may have trimmed the log up to it
+        let at_contig = first == l.contig.max(l.trimmed);
+        self.order.insert(e.lsn, (ix, new.len, first));
+        self.stream_mut(ix).order.insert(e.lsn, e.meta.time_ms);
+        if at_contig {
+            self.advance(r, ix);
+        }
+        Ok(())
+    }
+
+    /// What `trim` did to the streams in RAM while this one was dormant: the absorbed segments
+    /// below the floor went (a floor inside one wakes every stream first: `Store::trim`).
+    fn reconcile(&mut self, r: &Reader, stream: &str) {
+        let floor = self.floor;
+        let s = self.streams.get_mut(stream).expect("woken");
+        let logs: Vec<u32> = s.logs.iter().copied().collect();
+        // (one the floor cuts through was cut while the stream was in RAM: `Store::trim`)
+        let gone = s.cold.range(..floor).filter(|(_, c)| c.end <= floor);
+        let dropped: Vec<Lsn> = gone.map(|x| *x.0).collect();
+        for base in &dropped {
+            let cs = s.cold.remove(base).expect("listed");
+            s.bytes -= cs.bytes;
+            s.dirty = true;
+        }
+        for ix in logs {
+            while let Some(c) = self.logs[ix as usize].cold.first().copied() {
+                if !dropped.contains(&c.base) {
+                    break;
+                }
+                self.logs[ix as usize].cold.remove(0);
+                self.trim_log(r, ix, c.hi);
+            }
+        }
+    }
+
+    /// The stream's summary: everything RAM holds of it but its batches in RAM.
+    fn summary(&self, name: &str) -> StreamSum {
+        let s = &self.streams[name];
+        StreamSum {
+            floor: s.floor,
+            bytes: s.bytes,
+            cold: s.cold.iter().map(|(&b, &c)| (b, c)).collect(),
+            logs: s
+                .logs
+                .iter()
+                .map(|&ix| {
+                    let l = &self.logs[ix as usize];
+                    LogSum {
+                        writer: l.id.writer.clone(),
+                        epoch: l.id.epoch,
+                        cold: l.cold.clone(),
+                        trimmed: l.trimmed,
+                        contig: l.contig,
+                        high: l.high,
+                        ooo: l.ooo,
+                    }
+                })
+                .collect(),
+        }
     }
 
     /// Whether `seq` of the log is below its trimmed floor: raised by `trim`, or by a segment
@@ -254,16 +529,27 @@ impl Inner {
         &self.streams[&self.logs[ix as usize].id.stream]
     }
 
+    fn stream_mut(&mut self, ix: u32) -> &mut StreamLog {
+        let name = &self.logs[ix as usize].id.stream;
+        self.streams
+            .get_mut(name)
+            .expect("a log in RAM has its stream in RAM")
+    }
+
     /// Adds the log to its stream's.
     fn join(&mut self, ix: u32) {
         let stream = &self.logs[ix as usize].id.stream;
         match self.streams.get_mut(stream) {
             Some(s) => {
-                s.logs.insert(ix);
+                if s.logs.insert(ix) {
+                    s.dirty = true;
+                }
             }
             None => {
                 let s = StreamLog {
                     logs: BTreeSet::from([ix]),
+                    used: self.now,
+                    dirty: true,
                     ..Default::default()
                 };
                 self.streams.insert(stream.clone(), s);
@@ -447,6 +733,10 @@ impl Inner {
         self.bytes += e.len as u64;
         let l = &mut self.logs[ix as usize];
         l.ooo |= first < l.high;
+        // or its predecessor is later in the log: marked durable first (any earlier batch later
+        // in the log than this one is later than its predecessor, or the flag is up already)
+        let pred = l.batches.range(..first).next_back();
+        l.ooo |= pred.is_some_and(|(_, p)| p.durable() && p.lsn > lsn);
         l.high = l.high.max(first + e.count as u64);
         let at_contig = first == l.contig.max(l.trimmed);
         let s = self
@@ -455,6 +745,7 @@ impl Inner {
             .expect("a log joins its stream when reserved");
         s.order.insert(lsn, time_ms);
         s.bytes += e.len as u64;
+        s.dirty = true;
         // only a batch at the log's contiguous end can move it
         if at_contig {
             self.advance(r, ix);
@@ -480,6 +771,7 @@ impl Inner {
 
     /// Raises the log's trimmed floor to `end` (retention forgot a batch ending there).
     fn trim_log(&mut self, r: &Reader, ix: u32, end: u64) {
+        self.stream_mut(ix).dirty = true;
         let l = &mut self.logs[ix as usize];
         l.trimmed = l.trimmed.max(end);
         if l.trimmed > l.contig {
@@ -496,6 +788,7 @@ impl Inner {
         self.dead.insert(e.lsn);
         let l = &mut self.logs[ix as usize];
         let s = self.streams.get_mut(&l.id.stream).unwrap();
+        s.dirty = true;
         if self.order.remove(&e.lsn).is_some() {
             l.batches.remove(&first);
             if s.order.remove(&e.lsn).is_some() {
@@ -506,10 +799,11 @@ impl Inner {
             self.superseded.insert(e.lsn);
         } else {
             s.bytes -= e.len as u64;
-            if let Some((_, cs)) = s.cold.range_mut(..=e.lsn).next_back() {
+            if let Some((&base, cs)) = s.cold.range_mut(..=e.lsn).next_back() {
                 cs.batches -= 1;
                 cs.events -= e.count as u64;
                 cs.bytes -= e.len as u64;
+                untotal(&mut self.segs, base, e.count as u64, e.len as u64);
             }
         }
         self.batches -= 1;
@@ -554,10 +848,11 @@ impl Inner {
             .get_mut(&self.logs[x.ix as usize].id.stream)
             .unwrap();
         s.bytes -= x.e.len as u64;
-        if let Some((_, cs)) = s.cold.range_mut(..=x.lsn).next_back() {
+        if let Some((&base, cs)) = s.cold.range_mut(..=x.lsn).next_back() {
             cs.batches -= 1;
             cs.events -= x.e.count as u64;
             cs.bytes -= x.e.len as u64;
+            untotal(&mut self.segs, base, x.e.count as u64, x.e.len as u64);
         }
         self.batches -= 1;
         self.events -= x.e.count as u64;
@@ -565,17 +860,22 @@ impl Inner {
         self.trim_log(r, x.ix, x.first + x.e.count as u64);
     }
 
-    /// Forgets the absorbed segment at `base` whole (the log dropped it).
+    /// Forgets the absorbed segment at `base` whole (the log dropped it): its totals, and what
+    /// the streams in RAM hold of it (a dormant stream catches up when it wakes: `reconcile`).
     fn drop_segment(&mut self, r: &Reader, base: Lsn) {
+        if let Some((_, t)) = self.segs.remove(&base) {
+            self.batches -= t.0;
+            self.events -= t.1;
+            self.bytes -= t.2;
+        }
         for s in self.streams.values_mut() {
             if let Some(cs) = s.cold.remove(&base) {
                 s.bytes -= cs.bytes;
-                self.batches -= cs.batches;
-                self.events -= cs.events;
-                self.bytes -= cs.bytes;
+                s.dirty = true;
             }
         }
-        for ix in 0..self.logs.len() as u32 {
+        let ixs: Vec<u32> = self.logs.keys().copied().collect();
+        for ix in ixs {
             let l = &mut self.logs[ix as usize];
             if let Ok(i) = l.cold.binary_search_by_key(&base, |c| c.base) {
                 let hi = l.cold.remove(i).hi;
@@ -644,7 +944,10 @@ impl Inner {
                         hi,
                     }),
                 }
+                let (_, t) = self.segs.entry(base).or_insert((end, (0, 0, 0)));
+                (t.0, t.1, t.2) = (t.0 + 1, t.1 + e.count as u64, t.2 + len as u64);
                 let s = self.streams.get_mut(&l.id.stream).unwrap();
+                s.dirty = true;
                 let time = s.order.remove(&lsn).unwrap_or(0);
                 let cs = s.cold.entry(base).or_insert(ColdStream {
                     end,
@@ -661,7 +964,8 @@ impl Inner {
         }
     }
 
-    /// The batch logged at `lsn` (`m`), if it is still retained here: its log.
+    /// The batch logged at `lsn` (`m`), if it is still retained here: its log. Its stream must
+    /// be awake.
     fn live(&self, lsn: Lsn, m: &Meta) -> Option<u32> {
         let (l, _) = decode_record_key(&m.key).ok()?;
         let ix = *self.ix.get(&l)?;
@@ -739,6 +1043,7 @@ impl Inner {
                     if let Some(base) = base {
                         let s = self.streams.get_mut(stream).unwrap();
                         s.cold.get_mut(&base).unwrap().min = (x.time, x.first, x.lsn);
+                        s.dirty = true;
                         raised = true;
                     }
                     break;
@@ -749,6 +1054,7 @@ impl Inner {
                 // forgotten oldest first: everything older is gone too
                 let s = self.streams.get_mut(stream).unwrap();
                 s.floor = s.floor.max((x.time, x.first, x.lsn + 1));
+                s.dirty = true;
                 match base {
                     Some(_) => self.forget_cold(r, x),
                     None => self.forget(r, x.lsn),
@@ -759,11 +1065,91 @@ impl Inner {
         }
         n
     }
+
+    /// Puts dormant streams that are not used for `idle_ms` out of RAM, and the least recently
+    /// used ones while the streams in RAM cost more than `budget` bytes. Only a stream whose
+    /// summary is written (not `dirty`) and with no batch in RAM leaves.
+    fn evict(&mut self, idle_ms: u64, budget: usize) -> usize {
+        let mut held: usize = self
+            .streams
+            .iter()
+            .map(|(n, s)| cost(n, s, &self.logs))
+            .sum();
+        let mut out: Vec<(u64, String)> = self
+            .streams
+            .iter()
+            .filter(|(_, s)| {
+                !s.dirty
+                    && s.order.is_empty()
+                    && s.logs
+                        .iter()
+                        .all(|&ix| self.logs[ix as usize].batches.is_empty())
+            })
+            .map(|(n, s)| (s.used, n.clone()))
+            .collect();
+        out.sort_unstable();
+        let mut n = 0;
+        for (used, name) in out {
+            if self.now.saturating_sub(used) < idle_ms && held <= budget {
+                break;
+            }
+            let s = self.streams.remove(&name).expect("listed");
+            held = held.saturating_sub(cost(&name, &s, &self.logs));
+            for ix in s.logs {
+                let l = self.logs.remove(&ix).expect("a stream's log is in RAM");
+                self.ix.remove(&l.id);
+                self.free.push(ix);
+            }
+            n += 1;
+        }
+        // the maps keep their capacity: give it back once most of it is free
+        if self.streams.capacity() > 2 * self.streams.len() {
+            self.streams.shrink_to_fit();
+            self.ix.shrink_to_fit();
+            self.logs.shrink_to_fit();
+        }
+        self.evictions += n as u64;
+        n
+    }
+}
+
+/// How long a stream may go unused before it leaves RAM, and what the streams in RAM may cost.
+#[derive(Clone, Copy, Debug)]
+pub struct Dormancy {
+    pub idle_ms: u64,
+    pub budget: usize,
+}
+
+/// Counters of the hot set (metrics).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotStats {
+    /// Streams in RAM.
+    pub hot: u64,
+    /// Streams with a summary on disk and not in RAM.
+    pub dormant: u64,
+    pub loads: u64,
+    pub load_ns: u64,
+    pub evictions: u64,
+}
+
+/// A checkpoint taken under the store's lock, to be written once the log has synced what it
+/// covers (`Store::end_checkpoint`).
+pub struct Pending {
+    cp: Checkpoint,
+    streams: Vec<(String, Vec<u8>)>,
 }
 
 pub struct Store {
     inner: Mutex<Inner>,
     reader: Reader,
+    db: Db,
+    /// One checkpoint at a time: the database's view moves only forward.
+    writing: Mutex<()>,
+    /// Checkpoints taken and not yet written: their streams count as written, so none leaves
+    /// RAM meanwhile (spec/store/Dormant.tla, `MC_dormant_evict_in_flight`).
+    in_flight: AtomicU64,
+    /// Streams with a summary on disk (after the last checkpoint).
+    known: AtomicU64,
     /// Index reads of absorbed segments made without the lock (`Inner::reads`: under it).
     unlocked_reads: std::sync::atomic::AtomicU64,
     /// Woken whenever a batch becomes durable (live subscriptions).
@@ -772,20 +1158,25 @@ pub struct Store {
 
 impl Store {
     /// Rebuilds the index from the segment log, one chunk of its index at a time: the batches
-    /// of sealed segments end up on disk, not in RAM.
+    /// of sealed segments end up on disk, not in RAM. Its summaries are in RAM (no data
+    /// directory: tests and tools).
     pub fn load(reader: Reader) -> anyhow::Result<Store> {
-        Self::load_with(reader, |_| {})
+        Self::open(reader, Db::memory())
     }
 
-    /// `load`, showing `each` every index entry of the log in LSN order (one pass for the
-    /// node's other indexes too).
-    pub fn load_with(
-        reader: Reader,
-        mut each: impl FnMut(&precog_storage::Entry),
-    ) -> anyhow::Result<Store> {
+    /// Opens the store over the segment log with the summaries in `db`: back to the last
+    /// checkpoint, then the log past it replayed. Without a checkpoint (a new database) the whole
+    /// log is replayed. Streams the replay does not touch stay dormant.
+    pub fn open(reader: Reader, db: Db) -> anyhow::Result<Store> {
+        let cp = db.checkpoint().map_err(anyhow::Error::msg)?;
+        let known = AtomicU64::new(0);
         let s = Store {
             inner: Mutex::default(),
             reader,
+            db,
+            writing: Mutex::new(()),
+            in_flight: AtomicU64::new(0),
+            known,
             unlocked_reads: Default::default(),
             durable_notify: tokio::sync::Notify::new(),
         };
@@ -793,10 +1184,53 @@ impl Store {
             let r = &s.reader;
             let mut g = s.inner.lock();
             let inner = &mut *g;
-            let end = r.next_lsn();
+            inner.now = now_ms();
+            let (first, end) = (r.first_lsn(), r.next_lsn());
+            let cp = cp.unwrap_or(Checkpoint {
+                cold_end: first,
+                contiguous: first,
+                ..Default::default()
+            });
+            anyhow::ensure!(
+                cp.contiguous <= end,
+                "the streams database covers the log up to lsn {}, but the log ends at {end}: \
+                 remove streams.redb to rebuild it from the log",
+                cp.contiguous
+            );
+            inner.floor = cp.floor.max(first);
+            (inner.batches, inner.events, inner.bytes) = cp.totals;
+            inner.segs = cp.segs.into_iter().map(|(b, e, t)| (b, (e, t))).collect();
+            inner.dead = cp.dead.into_iter().filter(|&l| l >= first).collect();
+            inner.peers = cp.peers.into_iter().map(|(p, i, n)| (p, (i, n))).collect();
+            inner.boots = cp.boots;
+            // segments retention dropped after the checkpoint
+            let gone: Vec<Lsn> = (inner.segs.iter())
+                .filter(|(_, (end, _))| *end <= first)
+                .map(|x| *x.0)
+                .collect();
+            for base in gone {
+                inner.drop_segment(r, base);
+            }
+            let in_ram = |lsn: Lsn| {
+                let i = cp.ram.partition_point(|&(a, _)| a <= lsn);
+                i > 0 && lsn < cp.ram[i - 1].1
+            };
             inner.contiguous = end; // everything recovered is durable
-            inner.cold_end = r.first_lsn();
-            let mut from = r.first_lsn();
+            let mut from = cp.cold_end.max(first);
+            inner.cold_end = from;
+            // the batches in RAM at the checkpoint first (counted already): a batch replayed as
+            // new after them sees those later in the log than it
+            for &(a, b) in &cp.ram {
+                let mut at = a.max(from);
+                while at < b.min(end) {
+                    let es = r.entries(at, (b.min(end) - at).min(1 << 16) as usize)?;
+                    anyhow::ensure!(!es.is_empty(), "the log's index ends at lsn {at}");
+                    for e in es {
+                        at = e.lsn + 1;
+                        inner.put_back(&s.db, r, &e)?;
+                    }
+                }
+            }
             while from < end {
                 let es = r.entries(from, 1 << 16)?;
                 anyhow::ensure!(
@@ -805,8 +1239,8 @@ impl Store {
                 );
                 for e in es {
                     from = e.lsn + 1;
-                    each(&e);
                     let (log, replaces) = decode_record_key(&e.meta.key)?;
+                    inner.wake(&s.db, r, &log.stream, false)?;
                     let ix = inner.intern(&log);
                     let first = e.meta.first_seq;
                     let new = Entry {
@@ -815,6 +1249,13 @@ impl Store {
                         crc: e.meta.tag,
                         len: e.payload_len,
                     };
+                    if e.lsn < cp.contiguous || in_ram(e.lsn) {
+                        continue; // indexed at the checkpoint (and back in RAM if it was there)
+                    }
+                    // forgotten in RAM past `contiguous` (retention), or superseded (`dead`)
+                    if inner.dead.contains(&e.lsn) {
+                        continue;
+                    }
                     if let Some((s0, x)) = inner.overlap(r, ix, first, first + new.count as u64)? {
                         if s0 == first && x.crc == new.crc && x.count == new.count {
                             inner.dead.insert(e.lsn); // logged twice (a repair raced a replicate): keep the first
@@ -838,7 +1279,14 @@ impl Store {
                 inner.absorb(r, from);
             }
         }
+        s.count_known()?;
         Ok(s)
+    }
+
+    fn count_known(&self) -> anyhow::Result<()> {
+        let n = self.db.streams().map_err(anyhow::Error::msg)?;
+        self.known.store(n, Relaxed);
+        Ok(())
     }
 
     /// Moves the batches of sealed segments out of RAM once each of them is durable.
@@ -848,9 +1296,23 @@ impl Store {
         g.absorb(&self.reader, upto);
     }
 
+    /// Wakes the stream (see `Inner::wake`), logging what fails.
+    fn wake(&self, g: &mut Inner, stream: &str, touch: bool) -> bool {
+        match g.wake(&self.db, &self.reader, stream, touch) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("waking stream {stream:?}: {e}");
+                false
+            }
+        }
+    }
+
     pub fn reserve(&self, b: &Batch) -> Reserve {
         let mut g = self.inner.lock();
         let inner = &mut *g;
+        if let Err(e) = inner.wake(&self.db, &self.reader, &b.id.log.stream, true) {
+            return Reserve::Error(format!("{:?}: waking its stream: {e}", b.id.log));
+        }
         let first = b.id.first_seq;
         let end = b.end_seq();
         if inner.trimmed(&self.reader, &b.id.log, first) {
@@ -934,7 +1396,8 @@ impl Store {
     /// other bytes over exactly the same sequence range. ponytail: an overlap of another shape
     /// stays a logged conflict; replace those too if writers ever reuse identities that way.
     pub fn replaceable(&self, b: &Batch) -> bool {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        self.wake(&mut g, &b.id.log.stream, false);
         self.durable_at(&g, &b.id.log, b.id.first_seq)
             .is_some_and(|e| e.count == b.count && e.crc != b.ident)
     }
@@ -944,6 +1407,7 @@ impl Store {
         let time = self.time_of(lsn);
         let mut g = self.inner.lock();
         let inner = &mut *g;
+        self.wake(inner, &b.id.log.stream, false);
         let ix = inner.intern(&b.id.log);
         let first = b.id.first_seq;
         if let Err(e) = inner.unindex(&self.reader, ix, first) {
@@ -990,8 +1454,19 @@ impl Store {
             .flat_map(|s| s.cold.iter().map(|(&b, cs)| (b, cs.end)))
             .filter(|&(b, _)| b < floor)
             .collect();
+        // whole segments of dormant streams too: their totals go now
+        bases.extend(inner.segs.range(..floor).map(|(&b, &(end, _))| (b, end)));
         bases.sort_unstable();
         bases.dedup();
+        // a floor inside a segment (the node drops whole ones; tests) cuts dormant streams too
+        if bases.iter().any(|&(_, end)| end > floor) {
+            let mut names = vec![];
+            let read = self.db.each(|n, _| names.push(n.to_string()));
+            read.unwrap_or_else(|e| tracing::error!("{e}"));
+            for name in names {
+                self.wake(inner, &name, false);
+            }
+        }
         for (base, end) in bases {
             if end <= floor {
                 inner.drop_segment(r, base);
@@ -1028,33 +1503,27 @@ impl Store {
         max_age_ms: Option<u64>,
         now_ms: u64,
     ) -> usize {
-        self.inner
-            .lock()
-            .trim_while(&self.reader, stream, |bytes, x| {
-                max_bytes.is_some_and(|m| bytes > m)
-                    || max_age_ms.is_some_and(|a| now_ms.saturating_sub(x.time) > a)
-            })
+        let mut g = self.inner.lock();
+        self.wake(&mut g, stream, false);
+        g.trim_while(&self.reader, stream, |bytes, x| {
+            max_bytes.is_some_and(|m| bytes > m)
+                || max_age_ms.is_some_and(|a| now_ms.saturating_sub(x.time) > a)
+        })
     }
 
-    /// Each stream's own retention floor: below it the stream forgot every batch. Kept on disk by the node so that a restart does not bring those back.
-    pub fn floors(&self) -> BTreeMap<String, Age> {
-        let g = self.inner.lock();
-        g.streams
-            .iter()
-            .map(|(n, s)| (n.clone(), s.floor))
-            .collect()
-    }
-
-    /// After a restart: forgets again what each stream's own retention had forgotten (copies of
-    /// it may still be on disk, in segments newer than its next batches).
+    /// After a rebuild from the log (an older node's data directory, `<data_dir>/floors`):
+    /// forgets again what each stream's own retention had forgotten (copies of it may still be
+    /// on disk, in segments newer than its next batches).
     pub fn restore_floors(&self, floors: &BTreeMap<String, Age>) {
         let mut g = self.inner.lock();
         for (stream, &floor) in floors {
+            self.wake(&mut g, stream, false);
             g.trim_while(&self.reader, stream, |_, x| {
                 (x.time, x.first, x.lsn) < floor
             });
             if let Some(s) = g.streams.get_mut(stream) {
                 s.floor = s.floor.max(floor);
+                s.dirty = true;
             }
         }
     }
@@ -1066,21 +1535,27 @@ impl Store {
 
     /// The bytes of the stream's batches this node retains.
     pub fn stream_bytes(&self, stream: &str) -> u64 {
-        self.inner.lock().streams.get(stream).map_or(0, |s| s.bytes)
+        let mut g = self.inner.lock();
+        self.wake(&mut g, stream, false);
+        g.streams.get(stream).map_or(0, |s| s.bytes)
     }
 
-    /// What streams `keeps` still retain (not forgotten, not a dead copy) in the absorbed
-    /// segments at `bases`, logged at or after `min_time`, by stream: what the cleaner copies
-    /// forward before the log drops those segments.
+    /// What `streams` still retain (not forgotten, not a dead copy) in the absorbed segments at
+    /// `bases`, logged at or after `min_time`, by stream: what the cleaner copies forward before
+    /// the log drops those segments.
     pub fn retained(
         &self,
         bases: &[Lsn],
-        keeps: impl Fn(&str) -> bool,
+        streams: &[&str],
         min_time: u64,
     ) -> HashMap<String, Vec<Kept>> {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
         let mut out: HashMap<String, Vec<Kept>> = HashMap::new();
-        for (name, s) in g.streams.iter().filter(|(n, _)| keeps(n)) {
+        for &name in streams {
+            self.wake(&mut g, name, false);
+            let Some(s) = g.streams.get(name) else {
+                continue;
+            };
             for base in bases {
                 let v = match g.seg_recs(&self.reader, s, *base) {
                     Ok(v) => v,
@@ -1090,7 +1565,7 @@ impl Store {
                         continue;
                     }
                 };
-                out.entry(name.clone()).or_default().extend(
+                out.entry(name.to_string()).or_default().extend(
                     v.into_iter().filter(|x| x.time >= min_time).map(|x| {
                         // a replacement's key is the longer one
                         let k = encode_replacing_key(&g.logs[x.ix as usize].id).len();
@@ -1109,15 +1584,24 @@ impl Store {
     /// Cuts the stream's oldest batches (as its own retention does, oldest first) while `f`
     /// (its bytes, the batch's LSN) says so. Returns how many.
     pub fn cut(&self, stream: &str, mut f: impl FnMut(u64, Lsn) -> bool) -> usize {
-        self.inner
-            .lock()
-            .trim_while(&self.reader, stream, |bytes, x| f(bytes, x.lsn))
+        let mut g = self.inner.lock();
+        self.wake(&mut g, stream, false);
+        g.trim_while(&self.reader, stream, |bytes, x| f(bytes, x.lsn))
+    }
+
+    /// The stream the record with key `key` belongs to, awake.
+    fn wake_key(&self, g: &mut Inner, key: &[u8]) {
+        if let Ok((l, _)) = decode_record_key(key) {
+            self.wake(g, &l.stream, false);
+        }
     }
 
     /// Whether the batch logged at `lsn` (`m`) is still retained here (not forgotten, replaced
     /// or copied since): what the cleaner may copy.
     pub fn retains(&self, lsn: Lsn, m: &Meta) -> bool {
-        self.inner.lock().live(lsn, m).is_some()
+        let mut g = self.inner.lock();
+        self.wake_key(&mut g, &m.key);
+        g.live(lsn, m).is_some()
     }
 
     /// Batches the cleaner copied forward: each (old LSN, new LSN, its record's metadata,
@@ -1128,16 +1612,19 @@ impl Store {
         let inner = &mut *g;
         let mut new = vec![];
         for (old, lsn, m, len) in copies {
+            self.wake_key(inner, &m.key);
             let ix = inner
                 .live(old, m)
                 .expect("a copy is of a retained batch: Node::copy_forward checks, under its lock");
             inner.dead.insert(old);
             let l = &mut inner.logs[ix as usize];
             let s = inner.streams.get_mut(&l.id.stream).unwrap();
-            if let Some((_, cs)) = s.cold.range_mut(..=old).next_back() {
+            s.dirty = true;
+            if let Some((&base, cs)) = s.cold.range_mut(..=old).next_back() {
                 cs.batches -= 1;
                 cs.events -= m.count as u64;
                 cs.bytes -= len as u64;
+                untotal(&mut inner.segs, base, m.count as u64, len as u64);
             }
             s.order.insert(lsn, m.time_ms);
             let e = Entry {
@@ -1161,11 +1648,14 @@ impl Store {
 
     /// Before the log drops the absorbed segments at `bases`: a log keeps a segment's range only
     /// up to the end of the batches of it still retained there (they go with it), so dropping
-    /// it does not trim the log past the batches copied out of it.
+    /// it does not trim the log past the batches copied out of it. Only logs in RAM: copies are
+    /// of streams `retained` woke, and for any other log the range's end is what it retains
+    /// there or below its trimmed floor already.
     pub fn vacate(&self, bases: &[Lsn]) {
         let mut g = self.inner.lock();
         let inner = &mut *g;
-        for ix in 0..inner.logs.len() as u32 {
+        let ixs: Vec<u32> = inner.logs.keys().copied().collect();
+        for ix in ixs {
             for base in bases {
                 let cold = &inner.logs[ix as usize].cold;
                 let Ok(i) = cold.binary_search_by_key(base, |c| c.base) else {
@@ -1178,6 +1668,7 @@ impl Store {
                         continue;
                     }
                 };
+                inner.stream_mut(ix).dirty = true;
                 let cold = &mut inner.logs[ix as usize].cold;
                 match left {
                     Some(end) => cold[i].hi = end,
@@ -1203,7 +1694,8 @@ impl Store {
 
     /// Durable copy with this exact checksum present (or aged out by retention)?
     pub fn has(&self, id: &BatchId, crc: u32) -> bool {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        self.wake(&mut g, &id.log.stream, false);
         g.trimmed(&self.reader, &id.log, id.first_seq)
             || self
                 .durable_at(&g, &id.log, id.first_seq)
@@ -1222,21 +1714,43 @@ impl Store {
     }
 
     pub fn get(&self, id: &BatchId) -> Option<Batch> {
-        let lsn = self
-            .durable_at(&self.inner.lock(), &id.log, id.first_seq)?
-            .lsn;
+        let mut g = self.inner.lock();
+        self.wake(&mut g, &id.log.stream, true);
+        let lsn = self.durable_at(&g, &id.log, id.first_seq)?.lsn;
+        drop(g);
         self.read_batch(lsn)
+    }
+
+    /// A stream's own floor, in RAM or from its summary, remembered in `seen` for the call.
+    fn floor_of(&self, g: &Inner, stream: &str, seen: &mut HashMap<String, Age>) -> Age {
+        if let Some(s) = g.streams.get(stream) {
+            return s.floor;
+        }
+        if let Some(&f) = seen.get(stream) {
+            return f;
+        }
+        let f = self
+            .db
+            .stream(stream)
+            .inspect_err(|e| tracing::error!("{e}"));
+        let f = f.ok().flatten().map_or((0, 0, 0), |s| s.floor);
+        seen.insert(stream.to_string(), f);
+        f
     }
 
     /// Durable batches at LSNs `from..`, optionally only one stream, up to about `max_bytes`.
     /// Returns the batches and the next LSN to ask for.
     pub fn tail(&self, from: u64, stream: Option<&str>, max_bytes: usize) -> (Vec<Batch>, u64) {
         let picks: Vec<(Lsn, bool)> = {
-            let g = self.inner.lock();
+            let mut g = self.inner.lock();
+            if let Some(s) = stream {
+                self.wake(&mut g, s, true);
+            }
             let mut size = 0usize;
             let mut v = vec![];
             // absorbed segments first (a subscriber far behind), from their LSN index: what the
-            // store does not serve is passed over (a pick not wanted)
+            // store does not serve is passed over (a pick not wanted). A dormant stream's floor
+            // comes from its summary.
             let mut at = from.max(self.reader.first_lsn());
             let n = g.cold_end.saturating_sub(at).min(1024) as usize;
             let es = match self.reader.entries(at, n) {
@@ -1246,17 +1760,18 @@ impl Store {
                     return (vec![], from);
                 }
             };
+            let mut floors = HashMap::new();
             for e in es {
                 if size >= max_bytes {
                     break;
                 }
                 at = e.lsn + 1;
-                let log = decode_log_key(&e.meta.key).ok();
-                let want = log.and_then(|l| g.log(&l)).is_some_and(|(ix, l)| {
-                    e.lsn >= g.floor
-                        && (e.meta.time_ms, e.meta.first_seq, e.lsn) >= g.stream_of(ix).floor
+                let want = decode_log_key(&e.meta.key).is_ok_and(|l| {
+                    stream.is_none_or(|s| l.stream == s)
+                        && e.lsn >= g.floor
                         && !g.dead.contains(&e.lsn)
-                        && stream.is_none_or(|s| l.id.stream == s)
+                        && (e.meta.time_ms, e.meta.first_seq, e.lsn)
+                            >= self.floor_of(&g, &l.stream, &mut floors)
                 });
                 if want {
                     size += e.payload_len as usize;
@@ -1300,7 +1815,11 @@ impl Store {
         mut f: impl FnMut(&Inner, Rec) -> bool,
     ) -> Res<()> {
         let r = &self.reader;
-        let v = self.inner.lock().view(stream, hot);
+        let v = {
+            let mut g = self.inner.lock();
+            g.wake(&self.db, r, stream, true)?;
+            g.view(stream, hot)
+        };
         let mut done = false;
         let read = start(&v).and_then(|from| {
             let Some(from) = from else {
@@ -1319,7 +1838,9 @@ impl Store {
         let Some(from) = from.filter(|_| !done) else {
             return Ok(());
         };
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        // it may have left RAM since: back for the rest
+        g.wake(&self.db, r, stream, true)?;
         let upto = if contiguous { g.contiguous } else { Lsn::MAX };
         g.stream_from(r, stream, (from.max(v.cold_end), upto), min_time, |x| {
             f(&g, x)
@@ -1443,7 +1964,8 @@ impl Store {
                 tracing::error!("reading the index of stream {stream}: {e}");
             }
         }
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        self.wake(&mut g, stream, true);
         for &ix in g.streams.get(stream).into_iter().flat_map(|s| &s.logs) {
             let l = &g.logs[ix as usize];
             if !c.contains_key(&l.id) {
@@ -1455,9 +1977,14 @@ impl Store {
 
     /// Where a live feed starting now joins: the LSN its tail starts at and, per log of the
     /// stream, the sequence it is next due (the end of the log's contiguous run below that
-    /// LSN). Read under one lock, so no batch falls between the two.
+    /// LSN). Read under one lock, so no batch falls between the two. A feed of every stream
+    /// (`None`) reads every dormant stream's summary for it.
     pub fn live_start(&self, stream: Option<&str>) -> (Lsn, HashMap<LogId, u64>) {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        if let Some(s) = stream {
+            self.wake(&mut g, s, true);
+        }
+        let dormant = self.dormant_logs(&mut g, stream);
         let pos = g.contiguous;
         // batches durable at or past `pos` (out of LSN order; all in RAM) cut a log's run
         let mut cut: HashMap<u32, u64> = HashMap::new();
@@ -1469,23 +1996,51 @@ impl Store {
                 *c = (*c).min(first);
             }
         }
-        let next = g
+        let mut next: HashMap<LogId, u64> = g
             .logs
             .iter()
-            .enumerate()
             .filter(|(_, l)| stream.is_none_or(|s| l.id.stream == s))
             .map(|(ix, l)| {
                 let end = l.contig.max(l.trimmed);
-                (l.id.clone(), cut.get(&(ix as u32)).copied().unwrap_or(end))
+                (l.id.clone(), cut.get(ix).copied().unwrap_or(end))
             })
             .collect();
+        // a dormant log has no batch in RAM: its run ends at its contiguous end
+        for l in dormant {
+            next.insert(l.id, l.contig.max(l.trimmed));
+        }
         (pos, next)
+    }
+
+    /// The logs of every dormant stream (from their summaries): `stream` None. A stream whose
+    /// summary predates segments retention dropped since is woken instead (`reconcile`): its
+    /// logs are then in RAM. Any other `stream`: nothing.
+    fn dormant_logs(&self, g: &mut Inner, stream: Option<&str>) -> Vec<Log> {
+        let (mut out, mut stale) = (vec![], vec![]);
+        let floor = g.floor;
+        let read = self.db.each(|name, s| {
+            if stream.is_some() || g.streams.contains_key(name) {
+                return;
+            }
+            match s.cold.first().is_some_and(|c| c.0 < floor) {
+                true => stale.push(name.to_string()),
+                false => out.extend(s.logs.into_iter().map(|l| log_of(name, l))),
+            }
+        });
+        if let Err(e) = read {
+            tracing::error!("{e}");
+        }
+        for name in stale {
+            self.wake(g, &name, false);
+        }
+        out
     }
 
     /// The end of the log's durable batch starting at `seq`, if its LSN is below `pos` (a tail
     /// from `pos` does not return it).
     pub fn durable_below(&self, log: &LogId, seq: u64, pos: Lsn) -> Option<u64> {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        self.wake(&mut g, &log.stream, true);
         let e = self.durable_at(&g, log, seq)?;
         (e.lsn < pos).then_some(seq + e.count as u64)
     }
@@ -1513,7 +2068,8 @@ impl Store {
     /// about `max_bytes` (repair).
     pub fn log_batches(&self, log: &LogId, from: u64, max_bytes: usize) -> Vec<bytes::Bytes> {
         let lsns: Vec<Lsn> = {
-            let g = self.inner.lock();
+            let mut g = self.inner.lock();
+            self.wake(&mut g, &log.stream, false);
             let Some((ix, _)) = g.log(log) else {
                 return vec![];
             };
@@ -1539,17 +2095,216 @@ impl Store {
             .collect()
     }
 
+    /// The frontiers of the stream's logs, or of every log (`None`: dormant streams' from their
+    /// summaries, a read of every one of them).
     pub fn frontiers(&self, stream: Option<&str>) -> Vec<Frontier> {
-        let g = self.inner.lock();
+        let mut g = self.inner.lock();
+        if let Some(s) = stream {
+            self.wake(&mut g, s, false);
+        }
+        let dormant = self.dormant_logs(&mut g, stream);
         let mut v: Vec<_> = g
             .logs
-            .iter()
+            .values()
             .filter(|l| stream.is_none_or(|s| l.id.stream == s))
             .map(Self::frontier_of)
-            .filter(|f| f.high > 0)
             .collect();
+        v.extend(dormant.iter().map(Self::frontier_of));
+        v.retain(|f| f.high > 0);
         v.sort_by(|a, b| a.log.cmp(&b.log));
         v
+    }
+
+    /// Repair's view of this node's log from LSN `from`: the next LSN to ask for, the end of what
+    /// is durable here now, and the frontier of every log with a batch logged in between (at most
+    /// `max` records of it). A peer that follows it compares only those logs, not every one.
+    pub fn inventory(&self, from: Lsn, max: usize) -> (Lsn, Lsn, Vec<Frontier>) {
+        let end = self.durable_len();
+        let from = from.max(self.reader.first_lsn());
+        let n = end.saturating_sub(from).min(max as u64) as usize;
+        let es = match self.reader.entries(from, n) {
+            Ok(es) => es,
+            Err(e) => {
+                tracing::error!("reading the log's index at lsn {from}: {e}");
+                return (from, end, vec![]);
+            }
+        };
+        let next = es.last().map_or(from.max(end.min(from)), |e| e.lsn + 1);
+        let logs: BTreeSet<LogId> = es
+            .iter()
+            .filter_map(|e| decode_record_key(&e.meta.key).ok().map(|x| x.0))
+            .collect();
+        let mut g = self.inner.lock();
+        let mut out = vec![];
+        for log in logs {
+            self.wake(&mut g, &log.stream, false);
+            if let Some((_, l)) = g.log(&log) {
+                out.push(Self::frontier_of(l));
+            }
+        }
+        (next, end, out)
+    }
+
+    /// The log's frontier here (contiguous 0 for a log this node has never seen).
+    pub fn frontier(&self, log: &LogId) -> Frontier {
+        let mut g = self.inner.lock();
+        self.wake(&mut g, &log.stream, false);
+        g.log(log).map_or(
+            Frontier {
+                log: log.clone(),
+                contiguous: 0,
+                high: 0,
+            },
+            |(_, l)| Self::frontier_of(l),
+        )
+    }
+
+    /// Repair's position in a peer's log (kept with the checkpoint): its incarnation and the next
+    /// LSN to ask for.
+    pub fn peer(&self, id: u32) -> Option<(u64, Lsn)> {
+        self.inner.lock().peers.get(&id).copied()
+    }
+
+    pub fn set_peer(&self, id: u32, incarnation: u64, next: Lsn) {
+        self.inner.lock().peers.insert(id, (incarnation, next));
+    }
+
+    /// Sets the fault the summaries' database injects (tests: `summary::Db`).
+    pub fn set_failpoint(&self, at: Option<&'static str>) {
+        self.db.set_failpoint(at);
+    }
+
+    /// A boot of this node, `incarnation`, whose log ended at `recovered` when it opened. Kept
+    /// with the checkpoint, at most `BOOTS` of them.
+    pub fn boot(&self, incarnation: u64, recovered: Lsn) {
+        let mut g = self.inner.lock();
+        g.boots.push((incarnation, recovered));
+        let n = g.boots.len().saturating_sub(BOOTS);
+        g.boots.drain(..n);
+    }
+
+    /// Where a peer that followed this node's log up to `from` in its boot `theirs` goes on from
+    /// (`rejoin`).
+    pub fn rejoin(&self, from: Lsn, theirs: u64) -> Lsn {
+        rejoin(from, theirs, &self.inner.lock().boots)
+    }
+
+    /// Every durable batch of the stream, by LSN (a compacted stream's replay at start).
+    pub fn lsns(&self, stream: &str) -> Vec<Lsn> {
+        let mut lsns = vec![];
+        let read = self.visit_stream(
+            stream,
+            |_| vec![],
+            |_| Ok(Some(0)),
+            (false, 0),
+            |_, x| {
+                lsns.push(x.lsn);
+                true
+            },
+        );
+        if let Err(e) = read {
+            tracing::error!("reading the index of stream {stream}: {e}");
+        }
+        lsns
+    }
+
+    /// Takes a checkpoint under the lock: every changed stream's summary and the store's other
+    /// state. The records it covers must be on stable storage before `end_checkpoint` writes it
+    /// (write caching: sync the log in between), or a power loss could leave summaries counting
+    /// batches the log lost.
+    pub fn begin_checkpoint(&self) -> Pending {
+        let mut g = self.inner.lock();
+        self.in_flight.fetch_add(1, Relaxed);
+        let inner = &mut *g;
+        let names: Vec<String> = inner
+            .streams
+            .iter()
+            .filter(|(_, s)| s.dirty)
+            .map(|(n, _)| n.clone())
+            .collect();
+        let streams = names
+            .into_iter()
+            .map(|n| {
+                let v = crate::summary::encode_stream(&inner.summary(&n));
+                inner.streams.get_mut(&n).expect("listed").dirty = false;
+                (n, v)
+            })
+            .collect();
+        // the LSNs of the batches in RAM, as runs
+        let mut ram: Vec<(Lsn, Lsn)> = vec![];
+        for &lsn in inner.order.keys() {
+            match ram.last_mut() {
+                Some(r) if r.1 == lsn => r.1 += 1,
+                _ => ram.push((lsn, lsn + 1)),
+            }
+        }
+        let cp = Checkpoint {
+            cold_end: inner.cold_end,
+            contiguous: inner.contiguous,
+            ram,
+            floor: inner.floor,
+            totals: (inner.batches, inner.events, inner.bytes),
+            segs: inner.segs.iter().map(|(&b, &(e, t))| (b, e, t)).collect(),
+            // what was forgotten in RAM past `contiguous` is never served again either
+            dead: inner.dead.union(&inner.superseded).copied().collect(),
+            peers: inner.peers.iter().map(|(&p, &(i, n))| (p, i, n)).collect(),
+            boots: inner.boots.clone(),
+        };
+        Pending { cp, streams }
+    }
+
+    /// Writes a checkpoint durably once the log `synced` what it covers. On a failure (of either)
+    /// its streams count as changed again.
+    pub fn end_checkpoint(&self, p: Pending, synced: anyhow::Result<()>) -> anyhow::Result<()> {
+        let _w = self.writing.lock();
+        let r = synced.and_then(|()| {
+            self.db
+                .commit(&p.cp, &p.streams)
+                .map_err(anyhow::Error::msg)
+        });
+        // (under the lock: an eviction after this sees the streams changed again, or written)
+        let mut g = self.inner.lock();
+        self.in_flight.fetch_sub(1, Relaxed);
+        if let Err(e) = r {
+            for (n, _) in &p.streams {
+                if let Some(s) = g.streams.get_mut(n) {
+                    s.dirty = true;
+                }
+            }
+            anyhow::bail!(e);
+        }
+        drop(g);
+        self.count_known()
+    }
+
+    /// `begin_checkpoint` and `end_checkpoint` at once, for a log that syncs every write.
+    pub fn checkpoint(&self) -> anyhow::Result<()> {
+        self.end_checkpoint(self.begin_checkpoint(), Ok(()))
+    }
+
+    /// Puts streams out of RAM (see `Inner::evict`), at time `now_ms`. Returns how many.
+    pub fn evict(&self, d: Dormancy, now_ms: u64) -> usize {
+        let mut g = self.inner.lock();
+        let n = match self.in_flight.load(Relaxed) {
+            0 => g.evict(d.idle_ms, d.budget),
+            _ => 0, // a checkpoint in flight counts its streams as written already
+        };
+        g.now = now_ms;
+        n
+    }
+
+    pub fn hot_stats(&self) -> HotStats {
+        let g = self.inner.lock();
+        HotStats {
+            hot: g.streams.len() as u64,
+            dormant: self
+                .known
+                .load(Relaxed)
+                .saturating_sub(g.streams.len() as u64),
+            loads: g.loads,
+            load_ns: g.load_ns,
+            evictions: g.evictions,
+        }
     }
 
     /// Event-time ordered read of locally durable events of one stream with
@@ -1562,7 +2317,8 @@ impl Store {
         // what the read covers, taken before it: batches durable meanwhile may be read too, but
         // are never claimed without being read
         let mut cov: Vec<Frontier> = {
-            let g = self.inner.lock();
+            let mut g = self.inner.lock();
+            self.wake(&mut g, stream, true);
             let logs = g.streams.get(stream).into_iter().flat_map(|s| &s.logs);
             logs.map(|&ix| Self::frontier_of(&g.logs[ix as usize]))
                 .collect()
@@ -1621,6 +2377,23 @@ mod tests {
         /// Run a test with tiny segments, absorbing after each batch: most of its batches are
         /// then read from disk (the `cold` module reruns every test so).
         static COLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// And put every stream that can leave RAM out of it after each batch and before each
+        /// query (the `dormant` module reruns every test so): its state is then the summary.
+        static DOZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Under `DOZE`: a checkpoint, then every stream with no batch in RAM leaves it.
+    fn doze(s: &Store) {
+        if DOZE.get() {
+            s.checkpoint().unwrap();
+            s.evict(
+                Dormancy {
+                    idle_ms: 0,
+                    budget: 0,
+                },
+                now_ms(),
+            );
+        }
     }
 
     fn store() -> T {
@@ -1646,6 +2419,7 @@ mod tests {
             if COLD.get() {
                 self.s.absorb();
             }
+            doze(&self.s);
         }
     }
 
@@ -2542,6 +3316,12 @@ mod tests {
         T { _dir: dir, log, s }
     }
 
+    /// The store as a restart finds it: its checkpoint, and the log past it replayed.
+    fn reopen(t: &T) -> Store {
+        t.s.checkpoint().unwrap();
+        Store::open(t.s.reader.clone(), t.s.db.share()).unwrap()
+    }
+
     fn kind(r: Reserve) -> &'static str {
         match r {
             Reserve::New => "new",
@@ -2555,12 +3335,13 @@ mod tests {
         }
     }
 
-    /// Every query a node serves, as one comparable value.
+    /// Every query a node serves, as one comparable value (each on a dozing store under `DOZE`).
     fn answers(s: &Store, logs: &[LogId], probes: &[Batch]) -> Vec<String> {
-        let mut v = vec![
-            format!("{:?}", s.totals()),
-            format!("{:?}", s.frontiers(None)),
-        ];
+        doze(s);
+        let mut v = vec![format!("{:?}", s.totals())];
+        doze(s);
+        v.push(format!("{:?}", s.frontiers(None)));
+        doze(s);
         let pos = s.durable_len();
         let mut live: Vec<_> = s.live_start(None).1.into_iter().collect();
         live.sort();
@@ -2571,6 +3352,7 @@ mod tests {
                     log: log.clone(),
                     first_seq: seq,
                 };
+                doze(s);
                 v.push(format!(
                     "{seq} {} {} {:?} {:?}",
                     s.has(&id, 0),
@@ -2579,6 +3361,7 @@ mod tests {
                     s.durable_below(log, seq, pos),
                 ));
                 for max in [1, 400, 1 << 20] {
+                    doze(s);
                     let got: Vec<u64> = s
                         .log_batches(log, seq, max)
                         .into_iter()
@@ -2590,25 +3373,31 @@ mod tests {
         }
         for stream in ["s", "t", "none"] {
             for max in [1, 700, 1 << 20] {
+                doze(s);
                 let (got, c) = drain(s, stream, Cursor::new(), max);
                 v.push(format!("{stream} {max} {got:?} {c:?}"));
                 for start in [3, 30, 60] {
                     let c: Cursor = logs.iter().map(|l| (l.clone(), start)).collect();
+                    doze(s);
                     let (got, c) = drain(s, stream, c, max);
                     v.push(format!("{stream} {start} {got:?} {c:?}"));
                 }
+                doze(s);
                 let (got, next) = s.tail(5, Some(stream), max);
                 let ids: Vec<_> = got.iter().map(|b| b.id.clone()).collect();
                 v.push(format!("{stream} tail {ids:?} {next}"));
             }
             for at in [0, 1, 2, u64::MAX] {
+                doze(s);
                 v.push(format!("{stream} at {at} {:?}", s.cursor_at(stream, at)));
             }
+            doze(s);
             let (ev, cov) = s.read(stream, 0, 1000);
             let ev: Vec<_> = ev.iter().map(|e| (e.event_time_us, e.seq)).collect();
             v.push(format!("{stream} read {ev:?} {cov:?}"));
         }
         for p in probes {
+            doze(s);
             let k = kind(s.reserve(p));
             s.mark_failed(&p.id);
             v.push(format!("{:?} {}", p.id, k));
@@ -2665,14 +3454,23 @@ mod tests {
             batch(&log("u", "x"), 0, 1), // a new log
         ];
         let same = |hot: &T, cold: &T, when: &str| {
-            let (a, b) = (
-                answers(&hot.s, &logs, &probes),
-                answers(&cold.s, &logs, &probes),
-            );
-            for (x, y) in a.iter().zip(&b) {
-                assert_eq!(x, y, "{when}");
+            // the absorbed store as it is, and with its streams out of RAM before every query
+            for doze in [false, true] {
+                let a = answers(&hot.s, &logs, &probes);
+                DOZE.set(doze);
+                let b = answers(&cold.s, &logs, &probes);
+                DOZE.set(false);
+                for (x, y) in a.iter().zip(&b) {
+                    assert_eq!(x, y, "{when} (dozing {doze})");
+                }
+                assert_eq!(a.len(), b.len());
             }
-            assert_eq!(a.len(), b.len());
+            // and restarted from its checkpoint: nothing a restart could not know differs
+            let a = answers(&hot.s, &logs, &probes);
+            let b = answers(&reopen(cold), &logs, &probes);
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(x, y, "{when} (restarted from its checkpoint)");
+            }
         };
         same(&hot, &cold, "retained");
         // (the probes made the new log known to both: compare restarts with restarts)
@@ -2983,22 +3781,24 @@ mod tests {
     /// totals, frontiers, has/get, repair's reads, cursors read to the end (each log's batches
     /// in order), seeks by time, the event-time read, and what a retry is.
     fn by_identity(s: &Store, logs: &[LogId], probes: &[Batch]) -> Vec<String> {
-        let mut v = vec![
-            format!("{:?}", s.totals()),
-            format!("{:?}", s.frontiers(None)),
-        ];
+        doze(s);
+        let mut v = vec![format!("{:?}", s.totals())];
+        doze(s);
+        v.push(format!("{:?}", s.frontiers(None)));
         for log in logs {
             for seq in 0..90 {
                 let id = BatchId {
                     log: log.clone(),
                     first_seq: seq,
                 };
+                doze(s);
                 v.push(format!(
                     "{seq} {} {}",
                     s.has(&id, 0),
                     s.get(&id).map_or(0, |b| b.ident)
                 ));
                 for max in [1, 400, 1 << 20] {
+                    doze(s);
                     let got: Vec<u64> = s
                         .log_batches(log, seq, max)
                         .into_iter()
@@ -3014,6 +3814,7 @@ mod tests {
                     let c: Cursor = start.map_or(Cursor::new(), |at| {
                         logs.iter().map(|l| (l.clone(), at)).collect()
                     });
+                    doze(s);
                     let (got, c) = drain(s, stream, c, max);
                     let mut per: BTreeMap<LogId, Vec<u64>> = BTreeMap::new();
                     for id in got {
@@ -3023,13 +3824,16 @@ mod tests {
                 }
             }
             for at in [0, 1_100, 1_500, 1_799, 5_000, u64::MAX] {
+                doze(s);
                 v.push(format!("{stream} at {at} {:?}", s.cursor_at(stream, at)));
             }
+            doze(s);
             let (ev, cov) = s.read(stream, 0, 1000);
             let ev: Vec<_> = ev.iter().map(|e| (e.event_time_us, e.seq)).collect();
             v.push(format!("{stream} read {ev:?} {cov:?}"));
         }
         for p in probes {
+            doze(s);
             let k = kind(s.reserve(p));
             s.mark_failed(&p.id);
             v.push(format!("{:?} {}", p.id, k));
@@ -3040,7 +3844,19 @@ mod tests {
     /// The cleaner's steps (as `Node::apply_retention` takes them) on the oldest `n` sealed
     /// segments: copy forward what streams `keeps` retain there, one record at a time (tiny
     /// segments), and with `drop`, drop the segments. Returns how many batches it copied.
-    fn clean(t: &mut T, n: usize, keeps: impl Fn(&str) -> bool, drop: bool) -> usize {
+    /// Every stream the tests write to.
+    const ALL: &[&str] = &["s", "t", "u", "none"];
+
+    /// Each stream's own retention floor (what an older node kept in `<data_dir>/floors`).
+    fn floors(s: &Store) -> BTreeMap<String, Age> {
+        let g = s.inner.lock();
+        g.streams
+            .iter()
+            .map(|(n, x)| (n.clone(), x.floor))
+            .collect()
+    }
+
+    fn clean(t: &mut T, n: usize, keeps: &[&str], drop: bool) -> usize {
         t.s.absorb();
         let segs = t.log.segments().0;
         let segs = &segs[..n];
@@ -3109,17 +3925,24 @@ mod tests {
             batch(&logs[2], 200), // past everything
         ];
         let same = |a: &T, b: &T, when: &str| {
-            let (x, y) = (
-                by_identity(&a.s, &logs, &probes),
-                by_identity(&b.s, &logs, &probes),
-            );
-            for (x, y) in x.iter().zip(&y) {
-                assert_eq!(x, y, "{when}");
+            // as it is, with its streams out of RAM before every query, restarted from its
+            // checkpoint
+            for how in ["", " dozing", " restarted from its checkpoint"] {
+                let x = by_identity(&a.s, &logs, &probes);
+                DOZE.set(how == " dozing");
+                let y = match how {
+                    " restarted from its checkpoint" => by_identity(&reopen(b), &logs, &probes),
+                    _ => by_identity(&b.s, &logs, &probes),
+                };
+                DOZE.set(false);
+                for (x, y) in x.iter().zip(&y) {
+                    assert_eq!(x, y, "{when}{how}");
+                }
+                assert_eq!(x.len(), y.len(), "{when}{how}");
             }
-            assert_eq!(x.len(), y.len(), "{when}");
         };
         let n = moved.log.segments().0.len() / 2;
-        assert!(clean(&mut moved, n, |_| true, false) > 0);
+        assert!(clean(&mut moved, n, ALL, false) > 0);
         same(&plain, &moved, "copied, its old segments still there");
         let reload = |t: &T| T {
             s: Store::load(t.log.reader()).unwrap(),
@@ -3131,13 +3954,13 @@ mod tests {
             "a restart before the drop: both copies on disk",
         );
         moved.s.vacate(&[]);
-        clean(&mut moved, n, |_| true, true);
+        clean(&mut moved, n, ALL, true);
         assert!(moved.log.first_lsn() > 0, "the old segments went");
         same(&plain, &moved, "copied again and the old segments dropped");
         same(&plain, &reload(&moved), "after a restart");
         // and again: copies of copies, interleaved with what came after them
         let m = moved.log.segments().0.len() / 2;
-        clean(&mut moved, m, |_| true, true);
+        clean(&mut moved, m, ALL, true);
         same(&plain, &moved, "copied twice");
         let one = xs[0].bytes.len() as u64;
         for t in [&plain, &moved] {
@@ -3176,7 +3999,7 @@ mod tests {
         t.s.absorb();
         let base = t.log.segments().0[0].base;
         let kept: Vec<Kept> =
-            t.s.retained(&[base], |_| true, 0)
+            t.s.retained(&[base], ALL, 0)
                 .into_values()
                 .flatten()
                 .collect();
@@ -3207,7 +4030,7 @@ mod tests {
         t.s.absorb();
         let base = t.log.segments().0[0].base;
         let kept: Vec<Kept> =
-            t.s.retained(&[base], |_| true, 0)
+            t.s.retained(&[base], ALL, 0)
                 .into_values()
                 .flatten()
                 .collect();
@@ -3238,7 +4061,7 @@ mod tests {
         t.s.absorb();
         let base = t.log.segments().0[0].base;
         let kept: Vec<Kept> =
-            t.s.retained(&[base], |_| true, 0)
+            t.s.retained(&[base], ALL, 0)
                 .into_values()
                 .flatten()
                 .collect();
@@ -3305,7 +4128,7 @@ mod tests {
         }
         let one = a.bytes.len() as u64;
         assert_eq!(t.s.trim_stream("s", Some(one), None, 0), 1, "A goes");
-        let floors = t.s.floors();
+        let floors = floors(&t.s);
         let back = Store::load(t.log.reader()).unwrap();
         assert!(back.get(&a.id).is_some(), "a restart brings it back");
         back.restore_floors(&floors);
@@ -3359,7 +4182,7 @@ mod tests {
             time_ms: now_ms(),
         };
         let at = t.log.append(&[(m, &late.bytes[..])]).unwrap(); // written, not marked yet
-        assert!(clean(&mut t, 1, |_| true, false) > 0);
+        assert!(clean(&mut t, 1, ALL, false) > 0);
         let w = LogId {
             stream: "s".into(),
             writer: "w".into(),
@@ -3482,7 +4305,7 @@ mod tests {
             t.s.reserve(&x);
             t.durable_at(&x, 1_000 + 10 * seq);
         }
-        assert!(clean(&mut t, 1, |_| true, true) > 0);
+        assert!(clean(&mut t, 1, ALL, true) > 0);
         assert!(!t.s.inner.lock().order.is_empty(), "the copies are in RAM");
         let one = on("s", "w", 0).bytes.len() as u64;
         let keep = t.s.stream_bytes("s") - 2 * one;
@@ -3548,7 +4371,7 @@ mod tests {
         // Why: the node's age limit is a ceiling: a batch logged before it is not copied and
         // goes with its segment (expired, never re-ingested), one logged at it is copied.
         let (mut t, xs) = four_in_a_segment();
-        let keep = t.s.retained(&[0], |_| true, 1_010);
+        let keep = t.s.retained(&[0], ALL, 1_010);
         let lsns: Vec<Lsn> = keep["s"].iter().map(|k| k.lsn).collect();
         assert_eq!(lsns, [1, 2, 3]);
         for k in &keep["s"] {
@@ -3574,7 +4397,7 @@ mod tests {
         // Why: what to copy is read before the copy is written; a batch its stream's retention
         // forgot in between must stay forgotten, not come back through its copy.
         let (mut t, xs) = four_in_a_segment();
-        let keep = t.s.retained(&[0], |_| true, 0);
+        let keep = t.s.retained(&[0], ALL, 0);
         let one = xs[0].bytes.len() as u64;
         assert_eq!(t.s.trim_stream("s", Some(6 * one), None, 0), 2);
         for k in &keep["s"] {
@@ -3613,7 +4436,7 @@ mod tests {
         }
         assert!(lens.iter().all(|&l| l == lens[0]));
         assert_eq!(t.log.reader().sealed()[0], (0, 2), "L/0 and t/x/0");
-        assert_eq!(clean(&mut t, 1, |s| s == "s", false), 1);
+        assert_eq!(clean(&mut t, 1, &["s"], false), 1);
         let ids = |max| {
             let (bs, _) = t.s.read_cursor("s", &Cursor::new(), max);
             bs.into_iter()
@@ -3637,6 +4460,186 @@ mod tests {
         assert_eq!(ids(2 * lens[0]), all[..2], "only what fits");
         let (got, _) = drain(&t.s, "s", Cursor::new(), 2 * lens[0]);
         assert_eq!(got.len(), 5, "and the rest after");
+    }
+
+    #[test]
+    fn idle_streams_leave_ram_and_past_its_budget_the_least_recently_used_go_first() {
+        // Why: the idle time keeps a stream in use in RAM, and the budget bounds RAM whatever
+        // the idle time: past it the streams used longest ago leave first.
+        let mut t = store_with(TINY);
+        for name in ["s", "t", "u"] {
+            let x = on(name, "w", 0);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        t.s.checkpoint().unwrap();
+        let hot = |t: &T| {
+            let mut v: Vec<String> = t.s.inner.lock().streams.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        let keep = Dormancy {
+            idle_ms: u64::MAX,
+            budget: usize::MAX,
+        };
+        // used at 10, 20 and 30 (a use marks a stream with the last pass's clock)
+        for (now, name) in [(10, "s"), (20, "t"), (30, "u")] {
+            assert_eq!(t.s.evict(keep, now), 0);
+            t.s.cursor_at(name, 0);
+        }
+        assert_eq!(
+            t.s.evict(keep, 30),
+            0,
+            "within their idle time and the budget"
+        );
+        // idle for exactly 20 at 30: s goes, t (10) stays
+        let idle = Dormancy {
+            idle_ms: 20,
+            budget: usize::MAX,
+        };
+        assert_eq!(t.s.evict(idle, 30), 1);
+        assert_eq!(hot(&t), ["t", "u"]);
+        assert_eq!(t.s.hot_stats().evictions, 1);
+        // a budget for one stream: the older of t and u goes
+        let one = {
+            let g = t.s.inner.lock();
+            cost("u", &g.streams["u"], &g.logs)
+        };
+        let tight = Dormancy {
+            idle_ms: u64::MAX,
+            budget: one,
+        };
+        assert_eq!(t.s.evict(tight, 30), 1);
+        assert_eq!(hot(&t), ["u"]);
+        assert_eq!(t.s.evict(tight, 30), 0, "within the budget now");
+        // a stream changed since its checkpoint stays until the next one has it
+        for x in [on("u", "w", 1), on("f", "w", 0), on("f", "w", 1)] {
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb(); // u's segment is sealed now, f's batch the active one's
+        let none = Dormancy {
+            idle_ms: 0,
+            budget: 0,
+        };
+        assert_eq!(
+            t.s.evict(none, 40),
+            0,
+            "changed: not out before it is written"
+        );
+        t.s.checkpoint().unwrap();
+        assert_eq!(t.s.evict(none, 40), 1);
+        let h = t.s.hot_stats();
+        assert_eq!((h.hot, h.evictions), (1, 3), "f has a batch in RAM");
+        // and all of them answer from their summaries
+        for name in ["s", "t", "u"] {
+            assert!(t.s.get(&on(name, "w", 0).id).is_some(), "{name}");
+        }
+        assert_eq!(t.s.hot_stats().loads, 3);
+    }
+
+    #[test]
+    fn a_peer_is_followed_again_from_the_first_open_after_the_boot_it_followed() {
+        // Why: a peer under write caching can lose its unsynced tail in a crash and log other
+        // records at those LSNs; after two crashes the boot in between did too
+        // (spec/mesh/Inventory.tla, `MC_inventory_lastboot`). Following on would skip them.
+        let boots = [(3, 0), (5, 400), (7, 100), (9, 300)];
+        assert_eq!(rejoin(500, 9, &boots), 500, "this boot: on from 500");
+        assert_eq!(rejoin(500, 7, &boots), 300, "back to this boot's open");
+        assert_eq!(rejoin(500, 5, &boots), 100, "back to the lowest open since");
+        assert_eq!(rejoin(50, 5, &boots), 50, "below it nothing changed");
+        assert_eq!(
+            rejoin(500, 11, &boots),
+            0,
+            "a boot it does not know: from the start"
+        );
+        let t = store();
+        for i in 0..70 {
+            t.s.boot(i, 10 * i);
+        }
+        assert_eq!(t.s.rejoin(1000, 69), 1000);
+        assert_eq!(t.s.rejoin(1000, 10), 110, "the boots after it");
+        assert_eq!(
+            t.s.rejoin(1000, 5),
+            0,
+            "older than the boots kept: from the start"
+        );
+        let back = reopen(&t);
+        assert_eq!(back.rejoin(1000, 10), 110, "kept with the checkpoint");
+    }
+
+    #[test]
+    fn no_stream_leaves_ram_while_a_checkpoint_of_it_is_in_flight() {
+        // Why: a checkpoint is taken under the lock and written without it; a stream it took
+        // counts as written already. Out of RAM before the write, it would wake from its older
+        // summary; and a write that fails must leave it changed (spec/store/Dormant.tla).
+        let mut t = store_with(TINY);
+        for x in [on("s", "w", 0), on("f", "w", 0), on("f", "w", 1)] {
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        let all = Dormancy {
+            idle_ms: 0,
+            budget: 0,
+        };
+        let p = t.s.begin_checkpoint();
+        assert_eq!(t.s.evict(all, 1), 0, "in flight");
+        assert!(
+            t.s.end_checkpoint(p, Err(anyhow::anyhow!("sync failed")))
+                .is_err()
+        );
+        assert_eq!(t.s.evict(all, 1), 0, "not written: changed still");
+        let p = t.s.begin_checkpoint();
+        t.s.end_checkpoint(p, Ok(())).unwrap();
+        assert_eq!(t.s.evict(all, 1), 1, "s is on disk now");
+        assert!(t.s.get(&on("s", "w", 0).id).is_some());
+    }
+
+    mod dormant {
+        macro_rules! dormant {
+            ($($t:ident),* $(,)?) => {$(
+                #[test]
+                fn $t() {
+                    super::COLD.set(true);
+                    super::DOZE.set(true);
+                    super::$t();
+                }
+            )*};
+        }
+        dormant!(
+            a_replacing_record_takes_a_conflicting_batchs_place_at_load,
+            a_replacement_takes_the_batchs_place_and_the_feed_steps_over_it,
+            a_batch_rewritten_before_its_write_counts_the_bytes_it_logged,
+            trimming_past_a_gap_moves_the_frontier_over_what_follows,
+            duplicate_and_conflict,
+            a_duplicate_of_a_pending_batch_learns_how_it_ends,
+            frontier_gaps,
+            read_orders_by_event_time_with_deterministic_ties,
+            failed_reservation_is_released,
+            trim_forgets_old_batches_but_keeps_frontiers_and_refuses_reingest,
+            tail_never_skips_a_batch_marked_durable_out_of_lsn_order,
+            a_live_feed_joins_each_log_after_its_run_below_the_start,
+            load_rebuilds_from_the_log,
+            load_keeps_a_batch_logged_twice_once_and_refuses_conflicting_ones,
+            trim_keeps_totals_and_the_boundary_batch_exact,
+            has_needs_a_durable_copy_with_the_same_checksum,
+            tail_stops_near_max_bytes_and_frontiers_filter_by_stream,
+            a_stream_trims_to_its_own_byte_budget_and_leaves_others_alone,
+            a_stream_trims_batches_older_than_its_age_limit,
+            a_cursor_reads_every_batch_once_in_writer_order_in_small_steps,
+            a_cursor_from_one_node_resumes_exactly_on_another,
+            a_writers_batch_waits_until_its_predecessor_is_here,
+            the_end_is_past_the_last_durable_batch_of_every_log_not_a_reserved_one,
+            a_cursor_can_start_at_the_end_or_at_a_time,
+            a_logs_batches_from_a_sequence_serve_repair_and_frontiers_track_gaps,
+            a_cursor_read_stops_at_about_max_bytes,
+            a_cursor_inside_a_batch_still_gets_that_batch,
+            a_writer_idle_at_its_cursor_does_not_stall_the_others,
+            a_batch_exactly_its_streams_age_limit_old_is_kept,
+            a_logs_batches_start_at_the_batch_holding_the_sequence,
+        );
     }
 
     mod cold {
@@ -3688,6 +4691,37 @@ mod tests {
 /// and failures against a reference model of the per-node rules spec/mesh/Replication.tla
 /// assumes (identity, overlap = conflict, durable-only visibility) and of frontier arithmetic.
 #[cfg(test)]
+mod props_rejoin {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Why: a follower of a peer's log must not skip a record the peer logged at an LSN a
+        /// crash freed (spec/mesh/Inventory.tla): it goes back no later than where the log ended
+        /// at every open since the boot it followed, and never past where it was.
+        #[test]
+        fn a_follower_goes_back_to_the_lowest_open_since_its_boot(
+            from in 0u64..1000,
+            boots in prop::collection::vec((0u64..6, 0u64..1000), 0..8),
+            theirs in 0u64..7,
+        ) {
+            let got = rejoin(from, theirs, &boots);
+            match boots.iter().rposition(|b| b.0 == theirs) {
+                None => prop_assert_eq!(got, 0, "unknown: from the start"),
+                Some(i) => {
+                    prop_assert!(got <= from);
+                    for b in &boots[i + 1..] {
+                        prop_assert!(got <= b.1, "past the open of a boot since");
+                    }
+                    let low = boots[i + 1..].iter().map(|b| b.1).min();
+                    prop_assert_eq!(got, low.map_or(from, |l| l.min(from)), "no further back");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod model {
     use super::*;
     use crate::proto::{batch_crc, encode_log_key};
@@ -3701,6 +4735,13 @@ mod model {
         Reserve(u64, u32, u8),
         Durable(prop::sample::Index),
         Fail(prop::sample::Index),
+        /// A checkpoint, then every stream that can leave RAM leaves it.
+        Doze,
+        /// A checkpoint only.
+        Checkpoint,
+        /// A crash and a restart: back to the last checkpoint, the log past it replayed; what
+        /// was only reserved is gone.
+        Crash,
     }
 
     fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -3709,6 +4750,9 @@ mod model {
                 3 => (0u64..8, 1u32..4, 0u8..2).prop_map(|(s, n, v)| Op::Reserve(s, n, v)),
                 2 => any::<prop::sample::Index>().prop_map(Op::Durable),
                 1 => any::<prop::sample::Index>().prop_map(Op::Fail),
+                1 => Just(Op::Doze),
+                1 => Just(Op::Checkpoint),
+                1 => Just(Op::Crash),
             ],
             1..30,
         )
@@ -3733,12 +4777,13 @@ mod model {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
         #[test]
-        fn the_store_follows_the_identity_rules_and_frontier_arithmetic(ops in ops()) {
+        fn the_store_follows_the_identity_rules_and_frontier_arithmetic(small: bool, ops in ops()) {
             let dir = tempfile::tempdir().unwrap();
             let mut c = precog_storage::Config::new(dir.path());
-            c.segment_size = 1 << 20;
+            // tiny segments seal every few batches: absorbed, then out of RAM when dozing
+            c.segment_size = if small { 4096 + 200 } else { 1 << 20 };
             let mut log = precog_storage::Log::open(c).unwrap();
-            let s = Store::load(log.reader()).unwrap();
+            let mut s = Store::load(log.reader()).unwrap();
             let mut r = Ref::new();
             let mut pending: Vec<Batch> = vec![];
             for op in ops {
@@ -3783,6 +4828,20 @@ mod model {
                         s.mark_failed(&b.id);
                         r.remove(&b.id.first_seq);
                     }
+                    Op::Doze => {
+                        s.absorb();
+                        s.checkpoint().unwrap();
+                        s.evict(Dormancy { idle_ms: 0, budget: 0 }, 0);
+                    }
+                    Op::Checkpoint => s.checkpoint().unwrap(),
+                    Op::Crash => {
+                        let db = s.db.share();
+                        drop(s);
+                        s = Store::open(log.reader(), db).unwrap();
+                        for b in pending.drain(..) {
+                            r.remove(&b.id.first_seq);
+                        }
+                    }
                     _ => {}
                 }
                 // frontiers: the durable prefix from 0, and one past the highest durable sequence
@@ -3801,6 +4860,471 @@ mod model {
                 let durable = r.values().filter(|x| x.3).count();
                 prop_assert_eq!(s.totals().0 as usize, durable);
             }
+        }
+    }
+}
+
+/// Model-based test of dormant streams: two stores over two logs written alike, one of them
+/// putting its streams out of RAM, failing checkpoints and reads, and crashing back to its last
+/// checkpoint; after every step both answer every query alike (docs/ARCHITECTURE.md, "Dormant
+/// streams"; spec/store/Dormant.tla).
+#[cfg(test)]
+mod model_dormant {
+    use super::*;
+    use crate::proto::{batch_crc, encode_log_key};
+    use precog_storage::record::Meta;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// stream, writer, first_seq, count, content variant
+        Reserve(usize, usize, u64, u32, u8),
+        Durable(usize),
+        /// a reservation written to both logs, not yet marked durable
+        Write(usize),
+        /// a written one marked durable (in any order: past `contiguous` until the earlier are)
+        Mark(usize),
+        Fail(usize),
+        Absorb,
+        /// retention as the node runs it: the second store's checkpoint, then the oldest sealed
+        /// segments dropped from both logs, then the stores trimmed to the new first LSN
+        Retain(usize),
+        /// a floor inside a segment (no drop), and the second store's checkpoint after it; with
+        /// `true` its streams leave RAM first (they catch up when they wake: `reconcile`)
+        TrimMid(usize, bool),
+        /// a stream's own retention to this many batches' bytes, and the second store's
+        /// checkpoint after it (as a retention pass)
+        TrimStream(usize, u64),
+        /// the second store: a checkpoint, then every stream that can leaves RAM
+        Doze,
+        /// the second store: a checkpoint that fails before or after it is durable
+        FailCheckpoint(bool),
+        /// the second store: an eviction while a checkpoint is in flight (none leaves), then
+        /// the checkpoint written, or failed in its sync
+        InFlight(bool),
+        /// the second store: reads of its summaries fail meanwhile
+        FailRead(usize, usize),
+        /// the second store: a crash, back to its checkpoint and the log past it
+        Crash,
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                6 => (0usize..2, 0usize..2, 0u64..8, 1u32..3, 0u8..2)
+                    .prop_map(|(s, w, q, n, v)| Op::Reserve(s, w, q, n, v)),
+                5 => any::<usize>().prop_map(Op::Durable),
+                1 => any::<usize>().prop_map(Op::Fail),
+                2 => Just(Op::Absorb),
+                1 => any::<usize>().prop_map(Op::Retain),
+                1 => (any::<usize>(), any::<bool>()).prop_map(|(i, d)| Op::TrimMid(i, d)),
+                2 => any::<usize>().prop_map(Op::Write),
+                2 => any::<usize>().prop_map(Op::Mark),
+                1 => (0usize..2, 0u64..6).prop_map(|(s, n)| Op::TrimStream(s, n)),
+                3 => Just(Op::Doze),
+                1 => any::<bool>().prop_map(Op::FailCheckpoint),
+                1 => any::<bool>().prop_map(Op::InFlight),
+                1 => (0usize..2, 0usize..2).prop_map(|(s, w)| Op::FailRead(s, w)),
+                2 => Just(Op::Crash),
+            ],
+            1..40,
+        )
+    }
+
+    fn log(s: usize, w: usize) -> LogId {
+        LogId {
+            stream: ["s", "t"][s].into(),
+            writer: ["a", "b"][w].into(),
+            epoch: 1,
+        }
+    }
+
+    fn batch(l: &LogId, seq: u64, n: u32, v: u8) -> Batch {
+        let p = [v; 40];
+        let evs: Vec<(u64, &[u8])> = (0..n).map(|i| (seq + i as u64, &p[..])).collect();
+        Batch::parse(Batch::encode(l, seq, &evs).unwrap()).unwrap()
+    }
+
+    fn kind(r: Reserve) -> &'static str {
+        match r {
+            Reserve::New => "new",
+            Reserve::Duplicate(_) => "dup",
+            Reserve::Conflict(_) => "conflict",
+            Reserve::Expired => "expired",
+            Reserve::Error(_) => "error",
+        }
+    }
+
+    /// What every query answers.
+    fn answers(s: &Store) -> Vec<String> {
+        // first, while dormant streams are dormant: the floors of their absorbed batches
+        let all: Vec<BatchId> = s
+            .tail(0, None, 1 << 20)
+            .0
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        let f = s.frontiers(None);
+        let known: BTreeSet<LogId> = f.iter().map(|f| f.log.clone()).collect();
+        // (a log only a failed reservation made is in RAM until a crash forgets it)
+        let mut live: Vec<_> = s.live_start(None).1.into_iter().collect();
+        live.retain(|x| known.contains(&x.0));
+        live.sort();
+        let mut v = vec![
+            format!("{:?} {f:?}", s.totals()),
+            format!("{} {live:?}", s.durable_len()),
+            format!("{:?}", s.inventory(0, 1 << 10)),
+        ];
+        for l in (0..2).flat_map(|s| (0..2).map(move |w| log(s, w))) {
+            for seq in 0..10 {
+                let id = BatchId {
+                    log: l.clone(),
+                    first_seq: seq,
+                };
+                let got: Vec<u64> = (s.log_batches(&l, seq, 1 << 20).into_iter())
+                    .map(|b| Batch::parse(b).unwrap().id.first_seq)
+                    .collect();
+                v.push(format!(
+                    "{seq} {} {:?} {:?} {got:?}",
+                    s.has(&id, 0),
+                    s.get(&id).map(|b| b.ident),
+                    s.durable_below(&l, seq, s.durable_len()),
+                ));
+            }
+            v.push(format!("{:?}", s.frontier(&l)));
+        }
+        let only = |mut c: Cursor| {
+            c.retain(|l, _| known.contains(l));
+            c
+        };
+        for stream in ["s", "t"] {
+            let (bs, c) = s.read_cursor(stream, &Cursor::new(), 1 << 20);
+            let c = only(c);
+            let ids: Vec<BatchId> = bs
+                .into_iter()
+                .map(|b| Batch::parse(b).unwrap().id)
+                .collect();
+            let tail: Vec<BatchId> = (s.tail(0, Some(stream), 1 << 20).0.into_iter())
+                .map(|b| b.id)
+                .collect();
+            v.push(format!("{stream} {ids:?} {c:?} {tail:?}"));
+            v.push(format!(
+                "{stream} {:?} {:?} {}",
+                only(s.cursor_at(stream, 0)),
+                only(s.cursor_at(stream, u64::MAX)),
+                s.stream_bytes(stream)
+            ));
+            let mut live: Vec<_> = s.live_start(Some(stream)).1.into_iter().collect();
+            live.retain(|x| known.contains(&x.0));
+            live.sort();
+            v.push(format!("{stream} {live:?} {:?}", s.frontiers(Some(stream))));
+            let (ev, mut cov) = s.read(stream, 0, 1000);
+            cov.retain(|f| known.contains(&f.log));
+            v.push(format!(
+                "{stream} {} {cov:?} {:?}",
+                ev.len(),
+                s.lsns(stream)
+            ));
+        }
+        v.push(format!("{all:?}"));
+        v
+    }
+
+    fn open(dir: &tempfile::TempDir, name: &str) -> (precog_storage::Log, Store) {
+        let mut c = precog_storage::Config::new(dir.path().join(name));
+        c.segment_size = 4096 + 700; // sealed every few batches
+        c.spares = 0;
+        let log = precog_storage::Log::open(c).unwrap();
+        let db = Db::open(&dir.path().join(format!("{name}.redb")), 1 << 20).unwrap();
+        let s = Store::open(log.reader(), db).unwrap();
+        (log, s)
+    }
+
+    /// Why: a stream out of RAM must come back exactly as it was, whatever happened while it
+    /// was out, and a crash at any point must come back to what the log and the last checkpoint
+    /// say: an answer that differs is a duplicate accepted, a batch lost, a reader skipping or
+    /// stalling.
+    fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let dir = tempfile::tempdir().unwrap();
+        let ((mut la, a), (mut lb, mut b)) = (open(&dir, "a"), open(&dir, "b"));
+        let mut pending: Vec<Batch> = vec![];
+        let mut written: Vec<(Batch, Lsn)> = vec![];
+        for op in ops {
+            match op {
+                Op::Reserve(s, w, seq, n, v) => {
+                    let x = batch(&log(s, w), seq, n, v);
+                    let (ka, kb) = (kind(a.reserve(&x)), kind(b.reserve(&x)));
+                    prop_assert_eq!(ka, kb, "{:?}", x.id);
+                    if ka == "new" {
+                        pending.push(x);
+                    }
+                }
+                Op::Durable(i) | Op::Write(i) if !pending.is_empty() => {
+                    let x = pending.remove(i % pending.len());
+                    // append times as the WAL gives them, but never equal (a floor of a
+                    // stream's own retention is not compared across logs at one time)
+                    let m = Meta {
+                        key: encode_log_key(&x.id.log),
+                        first_seq: x.id.first_seq,
+                        count: x.count,
+                        tag: batch_crc(&x.bytes),
+                        time_ms: la.next_lsn(),
+                    };
+                    let lsn = la.append(&[(m.clone(), &x.bytes[..])]).unwrap();
+                    prop_assert_eq!(lb.append(&[(m, &x.bytes[..])]).unwrap(), lsn);
+                    if matches!(op, Op::Write(_)) {
+                        written.push((x, lsn));
+                    } else {
+                        a.mark_durable(&x, lsn);
+                        b.mark_durable(&x, lsn);
+                    }
+                }
+                Op::Mark(i) if !written.is_empty() => {
+                    let (x, lsn) = written.remove(i % written.len());
+                    a.mark_durable(&x, lsn);
+                    b.mark_durable(&x, lsn);
+                }
+                Op::Fail(i) if !pending.is_empty() => {
+                    let x = pending.remove(i % pending.len());
+                    a.mark_failed(&x.id);
+                    b.mark_failed(&x.id);
+                }
+                Op::Absorb => {
+                    a.absorb();
+                    b.absorb();
+                }
+                Op::Retain(i) => {
+                    // only absorbed segments, as the node: their batches are all durable
+                    let sealed: Vec<Lsn> = (la.segments().0.into_iter())
+                        .map(|x| x.end)
+                        .filter(|&e| e <= a.absorbed_end().min(b.absorbed_end()))
+                        .collect();
+                    if !sealed.is_empty() {
+                        let end = sealed[i % sealed.len()];
+                        b.checkpoint().unwrap();
+                        let floor = la.drop_until(end).unwrap();
+                        prop_assert_eq!(lb.drop_until(end).unwrap(), floor);
+                        a.trim(floor);
+                        b.trim(floor);
+                    }
+                }
+                Op::TrimMid(i, doze) => {
+                    if doze {
+                        b.checkpoint().unwrap();
+                        b.evict(
+                            Dormancy {
+                                idle_ms: 0,
+                                budget: 0,
+                            },
+                            0,
+                        );
+                    }
+                    // (the node's floor never passes what is durable: it drops absorbed segments)
+                    let floor = (i % (a.durable_len() as usize + 1)) as Lsn;
+                    a.trim(floor);
+                    b.trim(floor);
+                    b.checkpoint().unwrap();
+                }
+                Op::TrimStream(s, n) => {
+                    let max = Some(n * 300);
+                    let stream = ["s", "t"][s];
+                    prop_assert_eq!(
+                        a.trim_stream(stream, max, None, 0),
+                        b.trim_stream(stream, max, None, 0)
+                    );
+                    // the pass ends with a checkpoint (before it, a crash brings them back
+                    // and the next pass forgets them again)
+                    b.checkpoint().unwrap();
+                }
+                Op::Doze => {
+                    b.checkpoint().unwrap();
+                    b.evict(
+                        Dormancy {
+                            idle_ms: 0,
+                            budget: 0,
+                        },
+                        0,
+                    );
+                }
+                Op::InFlight(ok) => {
+                    let p = b.begin_checkpoint();
+                    prop_assert_eq!(
+                        b.evict(
+                            Dormancy {
+                                idle_ms: 0,
+                                budget: 0
+                            },
+                            0
+                        ),
+                        0
+                    );
+                    let synced = if ok {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("sync"))
+                    };
+                    prop_assert_eq!(b.end_checkpoint(p, synced).is_ok(), ok);
+                }
+                Op::FailCheckpoint(after) => {
+                    let at = if after {
+                        "summary:after_commit"
+                    } else {
+                        "summary:before_commit"
+                    };
+                    b.db.set_failpoint(Some(at));
+                    prop_assert!(b.checkpoint().is_err());
+                    b.db.set_failpoint(None);
+                }
+                Op::FailRead(s, w) => {
+                    // a reservation past everything: refused (a dormant stream does not
+                    // read) or new, and failed again on both
+                    let x = batch(&log(s, w), 100, 1, 0);
+                    b.db.set_failpoint(Some("summary:read"));
+                    let _ = (b.tail(0, None, 1 << 20), b.get(&x.id), b.cursor_at("s", 1));
+                    let kb = kind(b.reserve(&x));
+                    let _ = (b.frontiers(None), b.live_start(None));
+                    b.db.set_failpoint(None);
+                    prop_assert!(kb == "error" || kb == kind(a.reserve(&x)), "{}", kb);
+                    a.mark_failed(&x.id);
+                    b.mark_failed(&x.id);
+                }
+                Op::Crash => {
+                    let db = b.db.share();
+                    drop(b);
+                    b = Store::open(lb.reader(), db).unwrap();
+                    // what was only reserved is gone; what was written, recovered
+                    for x in pending.drain(..) {
+                        a.mark_failed(&x.id);
+                    }
+                    for (x, lsn) in written.drain(..) {
+                        a.mark_durable(&x, lsn);
+                    }
+                    a.absorb(); // as the restart does
+                    b.absorb();
+                }
+                _ => {}
+            }
+            let (x, y) = (answers(&a), answers(&b));
+            for (x, y) in x.iter().zip(&y) {
+                prop_assert_eq!(x, y);
+            }
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn a_store_whose_streams_leave_ram_answers_as_one_that_keeps_them(ops in ops()) {
+            run(ops)?;
+        }
+    }
+
+    /// What the model found, and the paths it reaches only now and then.
+    #[test]
+    fn the_cases_the_model_found_and_its_rare_paths() {
+        use Op::*;
+        let cases = [
+            // a dormant log's frontier after the segment of its batches went (5 to a segment)
+            vec![
+                Reserve(0, 0, 1, 1, 0),
+                Durable(0),
+                Reserve(1, 0, 0, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 0, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 1, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 2, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 3, 1, 0),
+                Durable(0),
+                Absorb,
+                Retain(0),
+                Crash,
+            ],
+            // a restart: the segment that went trims a log up to a batch put back in RAM
+            vec![
+                Reserve(1, 0, 5, 1, 0),
+                Durable(0),
+                Reserve(0, 0, 0, 1, 0),
+                Durable(0),
+                Reserve(0, 1, 0, 1, 0),
+                Durable(0),
+                Reserve(0, 1, 1, 1, 0),
+                Durable(0),
+                Reserve(0, 1, 2, 1, 0),
+                Durable(0),
+                Reserve(1, 0, 6, 1, 0),
+                Absorb,
+                Durable(0),
+                Retain(0),
+                Crash,
+            ],
+            // a floor inside a segment while its streams are out of RAM
+            vec![
+                Reserve(0, 0, 0, 1, 0),
+                Durable(0),
+                Reserve(0, 0, 1, 1, 0),
+                Durable(0),
+                Reserve(0, 0, 2, 1, 0),
+                Durable(0),
+                Reserve(1, 0, 0, 1, 0),
+                Durable(0),
+                Reserve(1, 0, 1, 1, 0),
+                Durable(0),
+                Reserve(1, 0, 2, 1, 0),
+                Durable(0),
+                Absorb,
+                TrimMid(2, true),
+            ],
+            // marked past `contiguous`, forgotten, then a crash: the replay leaves it forgotten,
+            // and a feed starting meanwhile joins the log before it
+            vec![
+                Reserve(0, 0, 0, 1, 0),
+                Reserve(0, 0, 1, 1, 0),
+                Write(0),
+                Write(0),
+                Mark(1),
+                TrimStream(0, 0),
+                Crash,
+            ],
+            vec![
+                Reserve(0, 0, 0, 1, 0),
+                Reserve(0, 0, 1, 1, 0),
+                Reserve(0, 0, 2, 1, 0),
+                Durable(0),
+                Write(0),
+                Durable(0),
+                Mark(0),
+                Reserve(1, 0, 0, 2, 0),
+                Write(340),
+                TrimMid(3918277648458073569, true),
+                Absorb,
+                Doze,
+            ],
+            // reads that fail while streams are out of RAM
+            vec![
+                Reserve(0, 0, 0, 1, 0),
+                Durable(0),
+                Reserve(1, 0, 0, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 0, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 1, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 2, 1, 0),
+                Durable(0),
+                Reserve(1, 1, 3, 1, 0),
+                Durable(0),
+                Absorb,
+                Doze,
+                FailRead(0, 0),
+            ],
+        ];
+        for ops in cases {
+            run(ops.clone()).unwrap_or_else(|e| panic!("{ops:?}: {e}"));
         }
     }
 }

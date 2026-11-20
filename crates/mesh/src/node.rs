@@ -86,6 +86,18 @@ pub struct NodeConfig {
     /// others keep what the node-level budget leaves.
     #[serde(default)]
     pub streams: HashMap<String, StreamConfig>,
+    /// A stream with no appends, reads or subscriptions for this long leaves RAM once none of
+    /// its batches is in RAM, and is a summary on disk until it is used again (docs/ARCHITECTURE.md,
+    /// "Dormant streams"). Past `dedup_window_ms`, so its dedup ids have expired by then.
+    #[serde(default = "dormant_after_ms")]
+    pub dormant_after_ms: u64,
+    /// What the streams in RAM may cost (their metadata, about): past it the least recently used
+    /// ones leave RAM before their idle time.
+    #[serde(default = "hot_streams_bytes")]
+    pub hot_streams_bytes: u64,
+    /// The page cache of the dormant streams' database (`<data_dir>/streams.redb`).
+    #[serde(default = "summary_cache_bytes")]
+    pub summary_cache_bytes: u64,
     /// Fault injection for tests.
     #[serde(skip)]
     pub storage_failpoints: precog_storage::Failpoints,
@@ -111,6 +123,9 @@ impl NodeConfig {
             retention_interval_ms: retention_interval_ms(),
             dedup_window_ms: dedup_window_ms(),
             streams: HashMap::new(),
+            dormant_after_ms: dormant_after_ms(),
+            hot_streams_bytes: hot_streams_bytes(),
+            summary_cache_bytes: summary_cache_bytes(),
             dedup_max_entries: dedup_max_entries(),
             tail_cache_bytes: tail_cache_bytes(),
             flush_delay_ms: 0,
@@ -181,6 +196,15 @@ fn dedup_window_ms() -> Option<u64> {
 fn dedup_max_entries() -> usize {
     8_000_000
 }
+fn dormant_after_ms() -> u64 {
+    600_000
+}
+fn hot_streams_bytes() -> u64 {
+    256 << 20
+}
+fn summary_cache_bytes() -> u64 {
+    64 << 20
+}
 fn retention_interval_ms() -> u64 {
     10_000
 }
@@ -231,7 +255,12 @@ pub struct Node {
     copied_batches: AtomicU64,
     /// Batches the node cap cut from streams that still retained them, by stream.
     forced: parking_lot::Mutex<BTreeMap<String, u64>>,
+    /// This boot, for peers following its log (`Control::Inventory`; `Store::boot`).
+    incarnation: u64,
 }
+
+/// Records of a peer's log per inventory request.
+const INVENTORY_PAGE: u32 = 16 << 10;
 
 /// Most bytes the cleaner copies forward in one group (one write to the log, as a client group).
 const COPY_CHUNK: u64 = 4 << 20;
@@ -352,23 +381,9 @@ fn decode_snapshot(b: &[u8]) -> Result<Compacted> {
 
 const FLOORS_MAGIC: &[u8; 4] = b"PCF1";
 
-/// Each stream's own retention floor: magic, count, then (name len u16, name, append time u64,
+/// Each stream's own retention floor, as an older node kept them (`<data_dir>/floors`, read only
+/// to rebuild its streams' summaries): magic, count, then (name len u16, name, append time u64,
 /// first sequence u64, LSN u64) per stream, then CRC-32C of everything before it.
-fn encode_floors(m: &BTreeMap<String, crate::store::Age>) -> Vec<u8> {
-    let mut b = FLOORS_MAGIC.to_vec();
-    b.extend_from_slice(&(m.len() as u64).to_le_bytes());
-    for (name, &(time, seq, lsn)) in m {
-        b.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        b.extend_from_slice(name.as_bytes());
-        for v in [time, seq, lsn] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    let c = crc32c::crc32c(&b);
-    b.extend_from_slice(&c.to_le_bytes());
-    b
-}
-
 fn decode_floors(b: &[u8]) -> Result<BTreeMap<String, crate::store::Age>> {
     let fail = || anyhow!("retention floors are damaged or of an unknown version");
     let (body, crc) = b
@@ -510,35 +525,47 @@ impl Node {
             };
             compact.insert(name.to_string(), m);
         }
-        // the store's one pass over the log's index: the dedup window's batches rebuild its
-        // index, the compacted streams' replay (bounded: those, not the log)
-        let (mut recent, mut replay) = (vec![], vec![]);
-        let store = Store::load_with(wal.reader.clone(), |e| {
-            if since.is_some_and(|s| e.meta.time_ms >= s) {
-                recent.push(e.lsn);
-            }
-            if decode_log_key(&e.meta.key).is_ok_and(|l| compact.contains_key(&l.stream)) {
-                replay.push(e.lsn);
-            }
-        })?;
-        let p = cfg.data_dir.join("floors"); // none until a pass dropped segments
-        if p.exists() {
+        // the store: back to its checkpoint, then the log past it (dormant streams stay on disk)
+        let db = crate::summary::Db::open(
+            &cfg.data_dir.join("streams.redb"),
+            cfg.summary_cache_bytes as usize,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let rebuilt = db.checkpoint().map_err(anyhow::Error::msg)?.is_none();
+        let store = Store::open(wal.reader.clone(), db)?;
+        // an older node's data directory: its streams' floors were in this file
+        let p = cfg.data_dir.join("floors");
+        if rebuilt && p.exists() {
             let floors = decode_floors(&std::fs::read(&p)?);
             store.restore_floors(&floors.with_context(|| format!("{}", p.display()))?);
         }
         let n = store.totals().0;
-        for lsn in replay {
-            if let Some(r) = wal.reader.read(lsn)? {
-                let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
-                apply_compacted(compact.get_mut(&b.id.log.stream).unwrap(), &b, lsn);
-            }
-        }
-        if let Some(d) = dedup.as_mut() {
-            for lsn in recent {
+        // the compacted streams' replay (bounded: those, not the log)
+        for (name, m) in compact.iter_mut() {
+            for lsn in store.lsns(name) {
                 if let Some(r) = wal.reader.read(lsn)? {
                     let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
-                    let ds: Vec<u64> = digests(&b).into_iter().map(|(_, h)| h).collect();
-                    d.record(&b.id.log.stream, &ds, now_s());
+                    apply_compacted(m, &b, lsn);
+                }
+            }
+        }
+        // the dedup window's batches rebuild its index: the segments logged within it
+        if let (Some(d), Some(since)) = (dedup.as_mut(), since) {
+            // append times never go back: a segment's newest is no older than any before it
+            let segs = wal.segments();
+            let older = segs.iter().rev().find(|s| s.max_time < since);
+            let mut at = older.map_or(wal.reader.first_lsn(), |s| s.end);
+            let end = wal.reader.next_lsn();
+            while at < end {
+                let es = wal.reader.entries(at, 1 << 16)?;
+                let Some(last) = es.last() else { break };
+                at = last.lsn + 1;
+                for e in es.iter().filter(|e| e.meta.time_ms >= since) {
+                    if let Some(r) = wal.reader.read(e.lsn)? {
+                        let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
+                        let ds: Vec<u64> = digests(&b).into_iter().map(|(_, h)| h).collect();
+                        d.record(&b.id.log.stream, &ds, now_s());
+                    }
                 }
             }
         }
@@ -556,6 +583,13 @@ impl Node {
             }));
         }
         let cfg_id = cfg.id;
+        // this boot, on disk before any peer follows it
+        let incarnation = rand::random::<u64>() | 1;
+        store.boot(incarnation, wal.reader.next_lsn());
+        let p = store.begin_checkpoint();
+        let synced = wal.sync().await.map(|_| ());
+        store.end_checkpoint(p, synced)?;
+        store.set_failpoint(cfg.storage_failpoints.fail_at); // tests: faults past the open
         let node = Arc::new(Node {
             cfg,
             store,
@@ -579,6 +613,7 @@ impl Node {
             copied_bytes: AtomicU64::new(0),
             copied_batches: AtomicU64::new(0),
             forced: Default::default(),
+            incarnation,
         });
         Ok(node)
     }
@@ -618,7 +653,16 @@ impl Node {
         }
     }
 
+    /// The node's status, with every log's frontier (a read of every dormant stream's summary).
     pub fn status(&self) -> Status {
+        Status {
+            logs: self.store.frontiers(None),
+            ..self.counters()
+        }
+    }
+
+    /// `status` without the frontiers.
+    fn counters(&self) -> Status {
         let (dedup_entries, dedup_window_s) = self
             .dedup
             .lock()
@@ -627,6 +671,7 @@ impl Node {
         use std::sync::atomic::Ordering::Relaxed;
         let (batches, events, bytes) = self.store.totals();
         let w = &self.wal.stats;
+        let h = self.store.hot_stats();
         Status {
             node_id: self.cfg.id,
             domain: self.cfg.domain.clone(),
@@ -640,7 +685,9 @@ impl Node {
             dedup_dropped: self.dedup_dropped.load(Relaxed),
             dedup_entries,
             dedup_window_s,
-            logs: self.store.frontiers(None),
+            logs: vec![],
+            streams_hot: h.hot,
+            streams_dormant: h.dormant,
         }
     }
 
@@ -748,6 +795,30 @@ impl Node {
             self.store
                 .trim_stream(name, s.retention_bytes, s.retention_ms, now);
         }
+        self.retain_segments(now).await?;
+        // what changed goes to disk; then unused streams leave RAM
+        self.checkpoint().await?;
+        let d = crate::store::Dormancy {
+            idle_ms: self.cfg.dormant_after_ms,
+            budget: self.cfg.hot_streams_bytes as usize,
+        };
+        self.store.evict(d, now);
+        if let Some(d) = self.dedup.lock().as_mut() {
+            d.sweep(now / 1000);
+        }
+        Ok(())
+    }
+
+    /// Writes the store's checkpoint once the log has synced what it covers.
+    async fn checkpoint(&self) -> Result<()> {
+        let p = self.store.begin_checkpoint();
+        let synced = self.wal.sync().await.map(|_| ());
+        self.store.end_checkpoint(p, synced)
+    }
+
+    /// The node's bounds: drops the oldest segments, after the cleaner copies forward what
+    /// streams with a retention of their own still retain in them.
+    async fn retain_segments(&self, now: u64) -> Result<()> {
         if self.cfg.retention_bytes.is_none() && self.cfg.retention_ms.is_none() {
             return Ok(());
         }
@@ -769,13 +840,14 @@ impl Node {
         // them need room for
         let (mut n, mut left, mut keep) = (0, total - waiting, HashMap::<String, Vec<Kept>>::new());
         let mut cost = 0;
+        let own: Vec<&str> = (self.cfg.streams.keys())
+            .filter(|s| self.retains(s))
+            .map(|s| s.as_str())
+            .collect();
         while let Some(s) = segs.get(n)
             && (n < want || !fits(cost, limit, cap.saturating_sub(left)))
         {
-            for (stream, v) in self
-                .store
-                .retained(&[s.base], |s| self.retains(s), min_time)
-            {
+            for (stream, v) in self.store.retained(&[s.base], &own, min_time) {
                 cost += v.iter().map(|k| k.cost).sum::<u64>();
                 keep.entry(stream).or_default().extend(v);
             }
@@ -788,15 +860,12 @@ impl Node {
         let bases: Vec<u64> = segs[..n].iter().map(|s| s.base).collect();
         let budget = cap.saturating_sub(left);
         self.fit(&mut keep, budget);
-        // what streams forgot stays forgotten across a restart, though copies of it outlive the
-        // segments about to be dropped
-        let floors = (
-            self.cfg.data_dir.join("floors"),
-            encode_floors(&self.store.floors()),
-        );
-        write_durably(&self.cfg.data_dir, vec![floors])?;
         self.copy_forward(keep).await?;
         self.store.vacate(&bases);
+        // before the drop: what streams forgot stays forgotten across a restart (copies of it
+        // outlive the segments about to be dropped), and the checkpoint then covers the log past
+        // them, so a restart never needs what they held
+        self.checkpoint().await?;
         let floor = self.wal.drop_until(end).await?;
         self.store.trim(floor);
         Ok(())
@@ -901,9 +970,10 @@ impl Node {
 
     /// Prometheus text exposition of `status()`.
     pub fn metrics(&self) -> String {
-        let s = self.status();
+        let s = self.counters();
         let w = &self.wal.stats;
-        let rows: [(&str, &str, u64); 14] = [
+        let h = self.store.hot_stats();
+        let rows: [(&str, &str, u64); 19] = [
             ("precog_batches", "gauge", s.batches),
             ("precog_events", "gauge", s.events),
             ("precog_bytes", "gauge", s.bytes),
@@ -933,6 +1003,16 @@ impl Node {
                 "precog_retention_copied_batches_total",
                 "counter",
                 self.copied_batches.load(Ordering::Relaxed),
+            ),
+            ("precog_streams_hot", "gauge", h.hot),
+            ("precog_streams_dormant", "gauge", h.dormant),
+            ("precog_stream_loads_total", "counter", h.loads),
+            ("precog_stream_evictions_total", "counter", h.evictions),
+            // the time of the loads, in µs (a rate of it over the loads' is their mean)
+            (
+                "precog_stream_load_microseconds_total",
+                "counter",
+                h.load_ns / 1000,
             ),
         ];
         let mut out = String::new();
@@ -1343,6 +1423,21 @@ impl Node {
             }
             Control::Fetch { .. } | Control::ReadCursor { .. } | Control::FetchLog { .. } => {
                 unreachable!()
+            }
+            Control::Inventory {
+                from,
+                max,
+                incarnation,
+            } => {
+                let from = self.store.rejoin(from, incarnation);
+                let max = max.min(INVENTORY_PAGE) as usize;
+                let (next, end, logs) = self.store.inventory(from, max);
+                ControlResp::Inventory(Inventory {
+                    incarnation: self.incarnation,
+                    next,
+                    end,
+                    logs,
+                })
             }
             Control::CursorAt { stream, time_ms } => {
                 let c = self.store.cursor_at(&stream, time_ms);
@@ -1799,23 +1894,41 @@ impl Node {
         (fetched, errors)
     }
 
-    /// Compares the peer's per-log frontiers with ours and fetches only the logs where it holds
-    /// sequences we lack (from our contiguous end on). A healthy cluster's pass costs O(logs).
+    /// Follows the peer's log from where the last pass stopped (`Control::Inventory`): compares
+    /// the frontiers of the logs it wrote since with ours and fetches only where it holds
+    /// sequences we lack. A pass costs O(what the peer logged since), not O(logs): a dormant
+    /// stream is not read unless the peer wrote to it. After a peer's restart its log may have
+    /// lost an unsynced tail (write caching) and logged other records at those LSNs: the peer
+    /// answers from where its log ended when it opened (`rejoin`). This node's position in each
+    /// peer's log is in its checkpoint: a new data directory follows every peer from its start.
     async fn repair_peer(&self, p: &Peer) -> Result<u64> {
-        let f = self.peer_control(p, &Control::Status).await?;
-        let ControlResp::Status(theirs) = serde_json::from_slice(&f.body)? else {
-            bail!("unexpected status response");
-        };
-        let mine: HashMap<LogId, Frontier> = self
-            .store
-            .frontiers(None)
-            .into_iter()
-            .map(|f| (f.log.clone(), f))
-            .collect();
+        let id = p.cfg.id;
+        let (mut incarnation, mut from) = self.store.peer(id).unwrap_or((0, 0));
         let mut fetched = 0;
-        for t in theirs.logs {
+        loop {
+            let req = Control::Inventory {
+                from,
+                max: INVENTORY_PAGE,
+                incarnation,
+            };
+            let f = self.peer_control(p, &req).await?;
+            let inv: Inventory = serde_json::from_slice(&f.body)?;
+            fetched += self.fetch_missing(p, inv.logs).await?;
+            (incarnation, from) = (inv.incarnation, inv.next);
+            self.store.set_peer(id, incarnation, from);
+            if from >= inv.end {
+                return Ok(fetched);
+            }
+        }
+    }
+
+    /// Fetches from the peer what its frontiers `theirs` hold that ours lack (from our
+    /// contiguous end on).
+    async fn fetch_missing(&self, p: &Peer, theirs: Vec<Frontier>) -> Result<u64> {
+        let mut fetched = 0;
+        for t in theirs {
             // from the first sequence we lack up to the peer's high (nothing, if we lack none)
-            let mut from = mine.get(&t.log).map_or(0, |m| m.contiguous);
+            let mut from = self.store.frontier(&t.log).contiguous;
             while from < t.high {
                 let req = Control::FetchLog {
                     log: t.log.clone(),
@@ -1885,6 +1998,8 @@ mod props_cleaner {
         Replace(usize, usize, prop::sample::Index),
         Retain,
         Reopen,
+        /// a pass that crashes at a step (a failpoint), then a restart without it
+        Crash(prop::sample::Index),
     }
 
     fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -1897,6 +2012,7 @@ mod props_cleaner {
                     .prop_map(|(s, w, i)| Op::Replace(s, w, i)),
                 3 => Just(Op::Retain),
                 1 => Just(Op::Reopen),
+                1 => any::<prop::sample::Index>().prop_map(Op::Crash),
             ],
             1..16,
         )
@@ -1939,7 +2055,7 @@ mod props_cleaner {
     /// the cap, every stream holds the newest suffix of what was written to each of its logs
     /// (no holes, each batch once and byte for byte), and a stream with a retention of its own
     /// that the cap did not cut holds all of its retention.
-    fn run(caching: bool, ops: Vec<Op>) -> Result<(), TestCaseError> {
+    fn run(caching: bool, doze: bool, ops: Vec<Op>) -> Result<(), TestCaseError> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -1952,6 +2068,12 @@ mod props_cleaner {
         c.retention_bytes = Some(cap);
         if caching {
             c.flush_delay_ms = 60_000;
+        }
+        if doze {
+            // every stream with no batch in RAM leaves it at each pass: what follows reads them
+            // back from their summaries
+            c.dormant_after_ms = 0;
+            c.hot_streams_bytes = 0;
         }
         let own = [20_000u64, 50_000];
         for (s, m) in own.iter().enumerate() {
@@ -2041,6 +2163,25 @@ mod props_cleaner {
                         node = Node::open(c.clone()).await.unwrap();
                         true
                     }
+                    Op::Crash(i) => {
+                        slow = None;
+                        drop(node);
+                        let at = [
+                            "summary:before_commit",
+                            "summary:after_commit",
+                            "retain:before_manifest",
+                            "retain:after_manifest",
+                        ];
+                        let mut f = c.clone();
+                        f.storage_failpoints.fail_at = Some(at[i.index(at.len())]);
+                        let faulty = Node::open(f).await.unwrap();
+                        let _ = faulty.apply_retention().await; // fails, if it gets there
+                        // what the cap cut before the fault stays cut
+                        cut.extend(faulty.forced.lock().keys().cloned());
+                        drop(faulty);
+                        node = Node::open(c.clone()).await.unwrap();
+                        true
+                    }
                 };
                 if !pass {
                     continue;
@@ -2056,6 +2197,7 @@ mod props_cleaner {
                 prop_assert!(waiting || bytes <= cap, "log {bytes} over the cap {cap}");
                 let metrics = node.metrics();
                 prop_assert!(metrics.contains("precog_retention_copied_batches_total"));
+                prop_assert_eq!(node.status().logs, node.store.frontiers(None));
                 // (the metric starts again with the process)
                 cut.extend(node.forced.lock().keys().cloned());
                 for (s, w) in written.iter().enumerate() {
@@ -2267,6 +2409,8 @@ mod props_cleaner {
                     }
                     node.store.tail(0, Some(s), 1 << 20);
                     node.store.read(s, 0, 1 << 20);
+                    node.store.lsns(s);
+                    node.store.inventory(0, 1 << 16);
                 }
             }
             Ok(())
@@ -2277,8 +2421,8 @@ mod props_cleaner {
         #![proptest_config(ProptestConfig::with_cases(24))]
 
         #[test]
-        fn the_cleaner_keeps_each_stream_s_retention_within_the_cap(caching: bool, ops in ops()) {
-            run(caching, ops)?;
+        fn the_cleaner_keeps_each_stream_s_retention_within_the_cap(caching: bool, doze: bool, ops in ops()) {
+            run(caching, doze, ops)?;
         }
 
         #[test]
@@ -2425,7 +2569,11 @@ mod props_cleaner {
         }
         node.store.absorb();
         let base = node.wal.retirable(None, None).0[0].base;
-        let keep = node.store.retained(&[base], |s| node.retains(s), 0);
+        let own: Vec<&str> = (node.cfg.streams.keys())
+            .filter(|s| node.retains(s))
+            .map(|s| s.as_str())
+            .collect();
+        let keep = node.store.retained(&[base], &own, 0);
         assert!(!keep.is_empty());
         let theirs = Batch::parse(at("low", 0, 2)).unwrap();
         node.replace_with(&theirs).await.unwrap();
@@ -2563,7 +2711,119 @@ mod snapshot_tests {
 }
 
 #[cfg(test)]
+mod props_restart {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn config(dir: &std::path::Path) -> NodeConfig {
+        let mut c = NodeConfig::single(0, "a", dir.into(), "tok".into());
+        c.segment_size = 8 << 10;
+        c.target_copies = 1;
+        c.dormant_after_ms = 0;
+        c
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// Why: a compacted stream keeps its newest value per key through restarts: its snapshot,
+        /// then what the log holds of it, read back through the store even while it is dormant.
+        #[test]
+        fn a_compacted_stream_keeps_its_newest_values_through_restarts(
+            writes in prop::collection::vec((0u8..4, any::<u8>(), any::<bool>()), 1..24),
+        ) {
+            let d = tempfile::tempdir().unwrap();
+            let mut c = config(d.path());
+            c.streams.insert("c".into(), StreamConfig { compacted: true, ..Default::default() });
+            let log = LogId { stream: "c".into(), writer: "w".into(), epoch: 1 };
+            rt().block_on(async {
+                let mut node = Node::open(c.clone()).await.unwrap();
+                let mut newest = BTreeMap::new();
+                for (seq, (k, v, pass)) in writes.into_iter().enumerate() {
+                    let seq = seq as u64;
+                    let b = Batch::encode_keyed(&log, seq, &[(seq, &[k][..], &[v; 300][..])]).unwrap();
+                    prop_assert!(node.append(1, b).await.is_success());
+                    newest.insert(vec![k], vec![v; 300]);
+                    if pass {
+                        node.apply_retention().await.unwrap();
+                        drop(node);
+                        node = Node::open(c.clone()).await.unwrap();
+                    }
+                }
+                drop(node);
+                let node = Node::open(c.clone()).await.unwrap();
+                let got: BTreeMap<Vec<u8>, Vec<u8>> =
+                    node.latest("c").into_iter().map(|(k, v)| (k, v.to_vec())).collect();
+                prop_assert_eq!(got, newest);
+                Ok(())
+            })?;
+        }
+
+        /// Why: an older node's data directory has no streams database, only `<data_dir>/floors`:
+        /// its streams are rebuilt from the log, and what their own retention forgot stays
+        /// forgotten.
+        #[test]
+        fn an_older_data_directory_is_rebuilt_and_keeps_what_retention_forgot(n in 2u64..10, keep in 1u64..4) {
+            let d = tempfile::tempdir().unwrap();
+            let c = config(d.path());
+            let log = LogId { stream: "r".into(), writer: "w".into(), epoch: 1 };
+            rt().block_on(async {
+                let node = Node::open(c.clone()).await.unwrap();
+                for seq in 0..n {
+                    let b = Batch::encode(&log, seq, &[(seq, &[1u8; 100][..])]).unwrap();
+                    prop_assert!(node.append(1, b).await.is_success());
+                }
+                let one = node.store.stream_bytes("r") / n;
+                let gone = node.store.trim_stream("r", Some(keep * one), None, 0) as u64;
+                prop_assert_eq!(gone, n.saturating_sub(keep));
+                // the floor an older node wrote: past the last batch forgotten
+                let es = node.wal.reader.entries(0, 64).unwrap();
+                let last = es.iter().filter(|e| decode_log_key(&e.meta.key).is_ok_and(|l| l == log)).nth(gone.max(1) as usize - 1).unwrap();
+                let floor = (last.meta.time_ms, last.meta.first_seq, last.lsn + gone.min(1));
+                // the last reference: the database closes with it (an append's task may hold one)
+                while Arc::strong_count(&node) > 1 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                drop(node);
+                std::fs::remove_file(d.path().join("streams.redb")).unwrap();
+                let floors = BTreeMap::from([("r".to_string(), floor)]);
+                std::fs::write(d.path().join("floors"), props::encode_floors(&floors)).unwrap();
+                let node = Node::open(c.clone()).await.unwrap();
+                let c0 = node.store.cursor_at("r", 0);
+                let (bs, _) = node.store.read_cursor("r", &c0, 1 << 20);
+                prop_assert_eq!(bs.len() as u64, n - gone);
+                Ok(())
+            })?;
+        }
+    }
+}
+
+#[cfg(test)]
 mod props {
+    /// The older node's writer of `<data_dir>/floors`.
+    pub(super) fn encode_floors(m: &BTreeMap<String, crate::store::Age>) -> Vec<u8> {
+        let mut b = FLOORS_MAGIC.to_vec();
+        b.extend_from_slice(&(m.len() as u64).to_le_bytes());
+        for (name, &(time, seq, lsn)) in m {
+            b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            for v in [time, seq, lsn] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let c = crc32c::crc32c(&b);
+        b.extend_from_slice(&c.to_le_bytes());
+        b
+    }
+
     use super::*;
     use proptest::prelude::*;
 

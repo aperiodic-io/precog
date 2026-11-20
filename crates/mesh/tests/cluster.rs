@@ -1005,3 +1005,70 @@ mod props_majority {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repair_follows_a_peers_log_and_wakes_only_the_streams_it_wrote_to() {
+    // Why: repair must not need every log's frontier in RAM. A node that missed batches gets
+    // them from a peer whose streams are all dormant, waking there only the streams it fetches;
+    // once caught up, a pass reads only what the peer logged since and wakes nothing.
+    let mut c = cluster(2, &["a", "b"]);
+    for cfg in &mut c.cfgs {
+        cfg.dormant_after_ms = 0;
+        cfg.segment_size = 16 << 10;
+    }
+    let n0 = start(&c, 0).await;
+    let log = |i: u64| LogId {
+        stream: format!("d{i}"),
+        writer: "w".into(),
+        epoch: 1,
+    };
+    let mut written = vec![];
+    for i in 0..40 {
+        let b = Batch::encode(&log(i), 0, &[(i, &[i as u8; 600][..])]).unwrap();
+        assert!(n0.append(1, b.clone()).await.is_success(), "node 1 is down");
+        written.push(b);
+    }
+    // the streams leave node 0's RAM: their segments sealed, a pass
+    for seq in 0..4 {
+        let f = LogId {
+            stream: "filler".into(),
+            writer: "f".into(),
+            epoch: 1,
+        };
+        let b = Batch::encode(&f, seq, &[(seq, &[0u8; 9000][..])]).unwrap();
+        assert!(n0.append(1, b).await.is_success());
+    }
+    n0.apply_retention().await.unwrap();
+    assert!(n0.store.hot_stats().dormant >= 40);
+    let n1 = Node::open(c.cfgs[1].clone()).await.unwrap();
+    let (fetched, errors) = n1.repair_pass().await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(fetched, 44, "every batch it lacked");
+    for b in &written {
+        let id = Batch::parse(b.clone()).unwrap().id;
+        assert_eq!(n1.store.get(&id).map(|x| x.bytes), Some(b.clone()));
+    }
+    // caught up: a pass asks for nothing, and node 0 wakes nothing for it
+    n0.apply_retention().await.unwrap();
+    let loads = n0.store.hot_stats().loads;
+    let (fetched, errors) = n1.repair_pass().await;
+    assert_eq!((fetched, errors.len()), (0, 0));
+    assert_eq!(n0.store.hot_stats().loads, loads, "no dormant stream read");
+    // a batch node 0 logs later is the only one the next pass compares and fetches
+    let late = Batch::encode(&log(7), 1, &[(1, &b"late"[..])]).unwrap();
+    let r = n0.store.reserve(&Batch::parse(late.clone()).unwrap());
+    assert!(matches!(r, precog_mesh::store::Reserve::New));
+    assert_eq!(
+        n1.repair_pass().await.0,
+        0,
+        "reserved, not durable: not offered"
+    );
+    n0.store.mark_failed(&Batch::parse(late).unwrap().id);
+    // and its position in node 0's log outlives a restart of node 1 (its checkpoint)
+    n1.apply_retention().await.unwrap();
+    let pos = n1.store.peer(0);
+    drop(n1);
+    let n1 = Node::open(c.cfgs[1].clone()).await.unwrap();
+    assert_eq!(n1.store.peer(0), pos);
+    assert!(pos.is_some_and(|p| p.1 > 0));
+}
