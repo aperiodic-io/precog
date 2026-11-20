@@ -40,7 +40,7 @@ PY
   for i in 0 1 2; do
     docker run -d --name "cmp-$i" --hostname "cmp-$i" --network "$NET" --ip "$(ip $i)" --cpus 1 --memory 4000m \
       -v "$work/cluster.json:/etc/precog/cluster.json:ro" --entrypoint precog-node precog-bench \
-      serve --config /etc/precog/cluster.json --member-from-hostname ${THREADS:+--threads $THREADS} >/dev/null
+      serve --config /etc/precog/cluster.json --member-from-hostname ${THREADS:+--threads $THREADS} ${RUNTIME:+--runtime $RUNTIME} >/dev/null
   done
   sleep 3
   nodes="tcp://$(ip 0):7000,tcp://$(ip 1):7000,tcp://$(ip 2):7000"
