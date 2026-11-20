@@ -89,6 +89,32 @@ async fn status(mc: &MeshClient, node: usize) -> Status {
     }
 }
 
+/// Why: `precog-node serve --runtime current-thread` runs a node's network, replication and
+/// group-commit handoff on one thread. Nothing in the node may block that thread: three nodes
+/// and their client sharing one current-thread runtime still replicate every append to three.
+#[tokio::test(flavor = "current_thread")]
+async fn three_nodes_replicate_on_one_current_thread_runtime() {
+    let c = cluster(3, &["a", "b", "c"]);
+    let _n: Vec<_> = start_all(&c).await;
+    let mc = client(&c).await;
+    let mut w = Writer::new(mc.clone(), "s", "w1", 1, 0, 3);
+    for i in 0..50u64 {
+        let r = w.append(&[(i, format!("e{i}").as_bytes())]).await.unwrap();
+        assert_eq!(r.ack.copies, 3, "{r:?}");
+    }
+    for n in 0..3 {
+        assert_eq!(status(&mc, n).await.events, 50);
+    }
+}
+
+async fn start_all(c: &Cluster) -> Vec<Arc<Node>> {
+    let mut v = Vec::new();
+    for i in 0..3 {
+        v.push(start(c, i).await);
+    }
+    v
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_replication_degraded_and_repair() {
     let c = cluster(3, &["a", "b", "c"]);

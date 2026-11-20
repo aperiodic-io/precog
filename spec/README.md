@@ -463,3 +463,13 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   explicit checking, so symbolic checking buys nothing yet.
 - **Index and segment header round trips under Kani.** They need a `File`; their decoders are
   proved panic-free above and the round trips are unit-tested.
+- **The node on a current-thread runtime** (`precog-node serve --runtime current-thread`,
+  round 3 of `results/protocol.md`). It changes no protocol, format or invariant: the same tasks
+  run, on one thread instead of a worker pool, and the WAL thread hands commits back the same
+  way. What it needs, that nothing in the node blocks its runtime thread, is a property of the
+  code rather than of an interleaving, and is checked by
+  `three_nodes_replicate_on_one_current_thread_runtime` in `crates/mesh/tests/cluster.rs` (three
+  nodes and their client on one current-thread runtime); the property and model tests above run
+  the same node code on multi-thread runtimes.
+- **The round-3 transport POCs** (`crates/lab`). Lab code is evidence, not product: its
+  connection parser is unit-tested (`net::tests`: any cuts, damage refused), nothing of it ships.

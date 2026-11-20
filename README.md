@@ -158,6 +158,10 @@ for i in 0 1 2; do target/release/precog-node serve --config run/demo/node-$i.js
 target/release/precog-node status --cluster run/demo/cluster.json
 ```
 
+`serve --runtime current-thread` runs a node on one thread: about 8% less CPU per record at a
+fixed rate, and lower peak throughput at a fixed number of appends in flight (`RUNTIME=current-thread`
+in `bench/compare/run.sh`; [results/protocol.md](results/protocol.md), round 3).
+
 The Redpanda comparison needs Docker, the release binaries built above (`precog-node` and the `loadgen` example) and live-ingestion's franz-go load generator (`benchmarks/redpanda-dedup/loadgen`
 there). Precog first, then Redpanda at equal durability:
 
