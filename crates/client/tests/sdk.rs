@@ -435,3 +435,36 @@ async fn the_end_of_a_stream_on_four_nodes_merges_enough_ends_to_meet_every_acke
     let end = client.end(&stream).await.unwrap();
     assert_eq!(end.values().sum::<u64>(), 10, "every acked event: {end:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_is_caught_up_only_when_no_node_holds_more_even_when_its_node_is_behind() {
+    // Why: an acked batch is on 2 of 3 nodes. A reader whose node is behind (its producer failed
+    // over past it, it restarted, it repairs) got an empty poll there and took it for the end:
+    // acked events missing from a full read (the client model test found it under load).
+    let mut c = cluster(&[1, 2]).await;
+    let client = Client::connect(&c.addrs, "tok").unwrap();
+    // a stream whose clients ask node 0 first: the node that will be behind
+    let stream = (0..)
+        .map(|i| format!("raw.trades.{i}"))
+        .find(|s| xxhash_rust::xxh3::xxh3_64(s.as_bytes()).is_multiple_of(3))
+        .unwrap();
+    let mut p = client.producer(&stream, "w");
+    for i in 0..40u64 {
+        p.send(i, format!("id{i}").as_bytes(), format!("e{i}").as_bytes());
+    }
+    p.sync().await.unwrap();
+    start(&mut c, 0, 3_600_000).await; // empty, and no repair within the test
+    let mut r = client
+        .consumer(&stream, "all", Start::Beginning)
+        .await
+        .unwrap();
+    let mut got = vec![];
+    loop {
+        let evs = r.poll(1 << 20).await.unwrap();
+        if evs.is_empty() {
+            break;
+        }
+        got.extend(evs);
+    }
+    assert_eq!(got.len(), 40, "every acked event: {:?}", names(&got));
+}
