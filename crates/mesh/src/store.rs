@@ -4513,7 +4513,17 @@ mod tests {
         t.s.checkpoint().unwrap();
         let cp = t.s.db.checkpoint().unwrap().expect("written");
         assert_eq!(cp.ram.len(), 1, "{:?}", cp.ram);
-        assert_eq!(cp.ram[0].1 - cp.ram[0].0, 3);
+        let a = cp.ram[0].0;
+        assert_eq!(cp.ram[0].1 - a, 3);
+        // a batch between them forgotten: two runs, not one over it
+        for x in [on("u", "w", 0), on("s", "w", 3)] {
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        assert!(t.s.trim_stream("u", Some(0), None, 0) > 0);
+        t.s.checkpoint().unwrap();
+        let cp = t.s.db.checkpoint().unwrap().expect("written");
+        assert_eq!(cp.ram, [(a, a + 3), (a + 4, a + 5)]);
     }
 
     #[test]
