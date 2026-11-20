@@ -32,7 +32,7 @@ use crate::proto::{
     Batch, BatchId, Event, Frontier, LogId, decode_log_key, decode_record_key, encode_log_key,
     encode_replacing_key,
 };
-use crate::summary::{Checkpoint, Db, LogSum, StreamSum};
+use crate::summary::{Checkpoint, Db, LogSum, StreamSum, encode_checkpoint};
 use parking_lot::Mutex;
 use precog_storage::record::Meta;
 use precog_storage::{Lsn, Reader};
@@ -1101,14 +1101,16 @@ pub struct HotStats {
 pub struct Pending {
     cp: Checkpoint,
     streams: Vec<(String, Vec<u8>)>,
+    enc: Vec<u8>,
 }
 
 pub struct Store {
     inner: Mutex<Inner>,
     reader: Reader,
     db: Db,
-    /// One checkpoint at a time: the database's view moves only forward.
-    writing: Mutex<()>,
+    /// One checkpoint at a time: the database's view moves only forward. Holds the checkpoint
+    /// on disk, encoded.
+    writing: Mutex<Vec<u8>>,
     /// Checkpoints taken and not yet written: their streams count as written, so none leaves
     /// RAM meanwhile (spec/store/Dormant.tla, `MC_dormant_evict_in_flight`).
     in_flight: AtomicU64,
@@ -1138,7 +1140,7 @@ impl Store {
             inner: Mutex::default(),
             reader,
             db,
-            writing: Mutex::new(()),
+            writing: Mutex::new(cp.as_ref().map(encode_checkpoint).unwrap_or_default()),
             in_flight: AtomicU64::new(0),
             known,
             unlocked_reads: Default::default(),
@@ -2207,13 +2209,24 @@ impl Store {
             peers: inner.peers.iter().map(|(&p, &(i, n))| (p, i, n)).collect(),
             boots: inner.boots.clone(),
         };
-        Pending { cp, streams }
+        let enc = encode_checkpoint(&cp);
+        Pending { cp, streams, enc }
+    }
+
+    /// Nothing to write: no stream changed and the checkpoint is the one on disk (the log need
+    /// not sync for it either).
+    pub fn unchanged(&self, p: &Pending) -> bool {
+        p.streams.is_empty() && *self.writing.lock() == p.enc
     }
 
     /// Writes a checkpoint durably once the log `synced` what it covers. On a failure (of either)
     /// its streams count as changed again.
     pub fn end_checkpoint(&self, p: Pending, synced: anyhow::Result<()>) -> anyhow::Result<()> {
-        let _w = self.writing.lock();
+        let mut w = self.writing.lock();
+        if p.streams.is_empty() && *w == p.enc {
+            self.in_flight.fetch_sub(1, Relaxed);
+            return Ok(());
+        }
         let r = synced.and_then(|()| {
             self.db
                 .commit(&p.cp, &p.streams)
@@ -2231,6 +2244,7 @@ impl Store {
             anyhow::bail!(e);
         }
         drop(g);
+        *w = p.enc;
         self.count_known()
     }
 
@@ -4465,6 +4479,29 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_with_nothing_changed_writes_nothing() {
+        // Why: every node checkpoints at every retention pass (10 s); an idle node must not pay
+        // a database commit and an fsync for each.
+        let mut t = store_with(1 << 20);
+        let x = on("s", "w", 0);
+        t.s.reserve(&x);
+        t.durable(&x);
+        t.s.checkpoint().unwrap();
+        t.s.set_failpoint(Some("summary:before_commit"));
+        t.s.checkpoint().expect("nothing to write: no commit");
+        // and after a reopen, the same
+        let s = reopen(&t);
+        s.checkpoint().expect("as the database holds it");
+        let x = on("s", "w", 1);
+        t.s.reserve(&x);
+        t.durable(&x);
+        assert!(
+            t.s.checkpoint().is_err(),
+            "a change is written (and fails here)"
+        );
+    }
+
+    #[test]
     fn a_checkpoint_keeps_the_batches_in_ram_as_runs_of_lsns() {
         // Why: the checkpoint is rewritten at every pass: one entry per run, not per batch.
         let mut t = store_with(1 << 20);
@@ -5202,7 +5239,9 @@ mod model_dormant {
                     } else {
                         Err(anyhow::anyhow!("sync"))
                     };
-                    prop_assert_eq!(b.end_checkpoint(p, synced).is_ok(), ok);
+                    // nothing changed: nothing to write, whatever the log's sync did
+                    let same = b.unchanged(&p);
+                    prop_assert_eq!(b.end_checkpoint(p, synced).is_ok(), ok || same);
                 }
                 Op::FailCheckpoint(after) => {
                     let at = if after {
@@ -5211,7 +5250,9 @@ mod model_dormant {
                         "summary:before_commit"
                     };
                     b.db.set_failpoint(Some(at));
-                    prop_assert!(b.checkpoint().is_err());
+                    let p = b.begin_checkpoint();
+                    let same = b.unchanged(&p);
+                    prop_assert_eq!(b.end_checkpoint(p, Ok(())).is_err(), !same);
                     b.db.set_failpoint(None);
                 }
                 Op::FailRead(s, w) => {

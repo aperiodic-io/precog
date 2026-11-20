@@ -808,7 +808,10 @@ impl Node {
     /// Writes the store's checkpoint once the log has synced what it covers.
     async fn checkpoint(&self) -> Result<()> {
         let p = self.store.begin_checkpoint();
-        let synced = self.wal.sync().await.map(|_| ());
+        let synced = match self.store.unchanged(&p) {
+            true => Ok(()),
+            false => self.wal.sync().await.map(|_| ()),
+        };
         self.store.end_checkpoint(p, synced)
     }
 
