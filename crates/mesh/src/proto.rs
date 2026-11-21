@@ -217,6 +217,13 @@ impl Batch {
         Ok(b.freeze())
     }
 
+    /// The stream a batch's bytes name, from its header alone: nothing else is validated
+    /// (`parse`). None: too short to name one.
+    pub fn stream_of(bytes: &[u8]) -> Option<&[u8]> {
+        let n = u16::from_le_bytes(bytes.get(4..6)?.try_into().ok()?) as usize;
+        bytes.get(6..6 + n)
+    }
+
     /// Parses and fully validates (checksum, structure, bounds) a batch.
     pub fn parse(bytes: Bytes) -> Result<Batch> {
         ensure!(bytes.len() <= MAX_BATCH_BYTES, "batch too large");
@@ -833,6 +840,12 @@ pub enum Control {
     Latest {
         stream: String,
     },
+    /// Deletes the stream: every writer log of it there is, on every node, for good
+    /// (`Node::delete_stream`). Answered with the epoch it is deleted below: a writer of a new
+    /// stream of that name needs an epoch at or above it.
+    Delete {
+        stream: String,
+    },
     /// Repair: the frontiers of the logs with a batch in this node's log from LSN `from`, at
     /// most `max` records of it (`Store::inventory`). `incarnation`: the boot of this node the
     /// asker last followed; after another, LSNs past where its log ended at that boot's open
@@ -867,6 +880,19 @@ pub enum ControlResp {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
     },
     Inventory(Inventory),
+    Deleted {
+        epoch: u64,
+    },
+}
+
+impl ControlResp {
+    /// The epoch a delete answered with.
+    pub fn deleted(&self) -> Option<u64> {
+        match self {
+            ControlResp::Deleted { epoch } => Some(*epoch),
+            _ => None,
+        }
+    }
 }
 
 /// An answer to `Control::Inventory`.
@@ -1198,6 +1224,14 @@ mod tests {
 mod props {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn only_a_delete_s_answer_has_the_epoch_it_deleted_below() {
+        // Why: the SDK takes a delete's epoch from the answer, and any other answer is an error
+        // to it, not an epoch.
+        assert_eq!(ControlResp::Deleted { epoch: 7 }.deleted(), Some(7));
+        assert_eq!(ControlResp::Committed.deleted(), None);
+    }
 
     fn with_crc(mut body: Vec<u8>) -> Bytes {
         let c = crc32c::crc32c(&body);

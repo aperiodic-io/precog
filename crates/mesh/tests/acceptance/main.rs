@@ -39,6 +39,8 @@ pub struct Mesh {
     subs: Vec<(SubLog, Arc<AtomicBool>)>,
     /// Clients holding a tenant's scoped token, by tenant.
     tenants: std::collections::HashMap<String, Arc<MeshClient>>,
+    /// The epoch each deleted stream was deleted below.
+    floors: std::collections::HashMap<String, u64>,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -864,6 +866,135 @@ async fn no_client_peer(w: &mut Mesh, node: usize) {
             .call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
             .await;
         assert_eq!(r.is_ok(), ok, "{token} as a peer");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream delete (features/delete.feature)
+
+/// A delete through node `i`, asked again until it is acknowledged, as a caller does.
+async fn delete_through(mc: &MeshClient, i: usize, stream: &str) -> anyhow::Result<u64> {
+    let c = Control::Delete {
+        stream: stream.into(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match mc.control(i, &c).await {
+            Ok(r) => return r.deleted().ok_or_else(|| anyhow::anyhow!("{r:?}")),
+            Err(e) if e.to_string().contains("forbidden") => return Err(e),
+            Err(e) if Instant::now() > deadline => return Err(e),
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+#[when(regex = r#"^stream "([\w/-]+)" is deleted through node (\d+)$"#)]
+async fn delete_stream(w: &mut Mesh, stream: String, node: usize) {
+    let floor = delete_through(&w.client(), node, &stream).await.unwrap();
+    w.floors.insert(stream, floor);
+}
+
+#[when(regex = r#"^the tenant "(\w+)" deletes stream "([\w/-]+)" through node (\d+)$"#)]
+async fn tenant_deletes(w: &mut Mesh, tenant: String, stream: String, node: usize) {
+    let floor = delete_through(&w.tenants[&tenant], node, &stream)
+        .await
+        .unwrap();
+    w.floors.insert(stream, floor);
+}
+
+#[then(regex = r#"^the tenant "(\w+)" is refused a delete of stream "([\w/-]+)"$"#)]
+async fn tenant_refused_delete(w: &mut Mesh, tenant: String, stream: String) {
+    for i in 0..w.n {
+        let e = delete_through(&w.tenants[&tenant], i, &stream).await;
+        let e = e.expect_err("refused").to_string();
+        assert!(e.contains("forbidden"), "node {i}: {e}");
+    }
+}
+
+#[then(regex = r#"^stream "([\w/-]+)" holds no batch on (?:node (\d+)|any node)$"#)]
+async fn holds_nothing(w: &mut Mesh, stream: String, node: String) {
+    let nodes: Vec<usize> = match node.parse() {
+        Ok(i) => vec![i],
+        Err(_) => (0..w.n).collect(),
+    };
+    for i in nodes {
+        let held = tenant_read(&w.client(), i, &stream).await.unwrap();
+        assert!(held.is_empty(), "node {i} serves {held:?}");
+        // nor by identity: what a repairing peer would ask for
+        for ws in w.writers.iter().filter(|x| x.stream == stream) {
+            let seqs: Vec<u64> = (0..ws.acked).collect();
+            assert!(w.fetch(i, ws, &seqs).await.is_empty(), "node {i}");
+        }
+    }
+}
+
+#[then(regex = r#"^node (\d+) still serves (\d+) batches of stream "([\w/-]+)"$"#)]
+async fn still_serves(w: &mut Mesh, node: usize, n: usize, stream: String) {
+    let held = tenant_read(&w.client(), node, &stream).await.unwrap();
+    assert_eq!(held.len(), n, "node {node}");
+}
+
+#[then(
+    regex = r#"^a retry of a batch of the deleted stream "([\w/-]+)" is refused by every node$"#
+)]
+async fn retry_refused(w: &mut Mesh, stream: String) {
+    let ws = w.writers.iter().find(|x| x.stream == stream).unwrap();
+    let log = LogId {
+        stream: ws.stream.clone(),
+        writer: ws.name.clone(),
+        epoch: ws.epoch,
+    };
+    // what the writer sent first, byte for byte, and what it would send next
+    for seq in [0, ws.acked] {
+        let b = Batch::encode(&log, seq, &[(seq, &payload(&ws.name, seq, ws.size)[..])]).unwrap();
+        for i in 0..w.n {
+            let e = w.client().append(i, &b, 1).await;
+            assert!(e.is_err(), "node {i} took sequence {seq}");
+        }
+    }
+}
+
+#[then(regex = r#"^a client's own delete record for stream "([\w/-]+)" is refused by every node$"#)]
+async fn forged_delete_refused(w: &mut Mesh, stream: String) {
+    // as a node writes a delete (the floors' stream), with the highest floor there is
+    let log = LogId {
+        stream: precog_mesh::store::FLOORS.into(),
+        writer: "client".into(),
+        epoch: 1,
+    };
+    let e = precog_mesh::store::encode_floor(&stream, u64::MAX);
+    let b = Batch::encode(&log, 0, &[(0, &e[..])]).unwrap();
+    for i in 0..w.n {
+        let r = w.client().append(i, &b, 1).await;
+        assert!(r.is_err(), "node {i} took a client's delete record: {r:?}");
+    }
+}
+
+#[when(
+    regex = r#"^a writer that starts after the delete appends (\d+) batches of (\d+) bytes to stream "([\w/-]+)" with (\d+) copies$"#
+)]
+async fn append_after_delete(w: &mut Mesh, n: u64, size: usize, stream: String, copies: u8) {
+    let i = new_writer(w, size, copies);
+    // an epoch at the delete's floor: the lowest a writer of the new stream can have
+    (w.writers[i].epoch, w.writers[i].stream) = (w.floors[&stream], stream);
+    w.append(i, n).await;
+}
+
+#[then(
+    regex = r#"^every node serves exactly the new writer's (\d+) batches of stream "([\w/-]+)"$"#
+)]
+async fn serves_new(w: &mut Mesh, n: u64, stream: String) {
+    for i in 0..w.n {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let got = tenant_read(&w.client(), i, &stream).await.unwrap();
+            if got == (0..n).collect::<Vec<_>>() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "node {i}: {got:?}");
+            let _ = w.client().control(i, &Control::Repair).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 }
 

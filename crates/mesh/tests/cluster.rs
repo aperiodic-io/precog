@@ -1251,3 +1251,160 @@ mod props_tokens {
         }
     }
 }
+
+/// Deleting a stream on a cluster (spec/mesh/Delete.tla).
+mod props_delete {
+    use super::*;
+
+    fn batch(stream: &str, epoch: u64, seq: u64) -> Bytes {
+        let log = LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch,
+        };
+        Batch::encode(&log, seq, &[(seq, b"x")]).unwrap()
+    }
+
+    fn held(n: &Node, stream: &str) -> usize {
+        n.store
+            .read_cursor(stream, &Default::default(), 1 << 20)
+            .0
+            .len()
+    }
+
+    /// A repair pass against every peer (a peer just started is dialled again after a moment).
+    async fn repair(n: &Node) {
+        let mut errors = n.repair_pass().await.1;
+        for _ in 0..50 {
+            if errors.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            errors = n.repair_pass().await.1;
+        }
+        panic!("{errors:?}");
+    }
+
+    async fn delete(mc: &MeshClient, node: usize, stream: &str) -> anyhow::Result<u64> {
+        let c = Control::Delete {
+            stream: stream.into(),
+        };
+        match mc.control(node, &c).await? {
+            ControlResp::Deleted { epoch } => Ok(epoch),
+            r => anyhow::bail!("{r:?}"),
+        }
+    }
+
+    /// A delete, asked again until it is acknowledged, as a caller does (a peer just started is
+    /// dialled again after a moment; a slow disk can take a replica past the RPC timeout).
+    async fn deleted(mc: &MeshClient, node: usize, stream: &str) -> u64 {
+        let mut done = delete(mc, node, stream).await;
+        for _ in 0..50 {
+            if done.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            done = delete(mc, node, stream).await;
+        }
+        done.unwrap()
+    }
+
+    /// Why: a node that was down during a delete comes back holding the stream. It must not
+    /// hand it back to the nodes that deleted it (repair copies what a peer lacks), and it
+    /// must learn of the delete itself; and the name must work again for new writers, on
+    /// every node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stream_deleted_while_a_node_was_down_is_deleted_there_too_and_never_comes_back() {
+        let c = cluster(3, &["a", "b", "c"]);
+        let (n0, n1) = (start(&c, 0).await, start(&c, 1).await);
+        let mc = client(&c).await;
+        for seq in 0..4 {
+            let r = mc.append(0, &batch("s", 5, seq), 2).await.unwrap();
+            assert!(r.ack.is_success());
+            assert!(
+                mc.append(0, &batch("kept", 5, seq), 2)
+                    .await
+                    .unwrap()
+                    .ack
+                    .is_success()
+            );
+        }
+        // node 2 holds the stream too, and is down (it listens nowhere) while it is deleted
+        let n2 = Node::open(c.cfgs[2].clone()).await.unwrap();
+        for seq in 0..4 {
+            assert!(n2.append(1, batch("s", 5, seq)).await.is_success());
+        }
+        drop(n2);
+        tokio::time::sleep(Duration::from_millis(300)).await; // the WAL thread releases its lock
+        let floor = deleted(&mc, 0, "s").await;
+        assert!(floor > 5);
+        assert_eq!(
+            (held(&n0, "s"), held(&n1, "s")),
+            (0, 0),
+            "deleted on a majority"
+        );
+        assert_eq!(n1.store.floor("s"), floor, "node 1 got the delete's record");
+        // node 2 is back, with the stream and without the delete
+        let n2 = start(&c, 2).await;
+        assert_eq!((held(&n2, "s"), n2.store.floor("s")), (4, 0));
+        // the nodes that deleted it take nothing back: not from repair, not from a client's retry
+        for n in [&n0, &n1] {
+            repair(n).await;
+            assert_eq!(held(n, "s"), 0);
+        }
+        assert!(mc.append(0, &batch("s", 5, 0), 1).await.is_err());
+        assert!(mc.append(1, &batch("s", 5, 9), 1).await.is_err());
+        // node 2 learns of the delete from its peers
+        repair(&n2).await;
+        assert_eq!((held(&n2, "s"), n2.store.floor("s")), (0, floor));
+        // a writer that starts after the delete: a new stream of the name, on every node
+        let r = mc.append(2, &batch("s", floor, 0), 2).await.unwrap();
+        assert!(r.ack.is_success());
+        for n in [&n0, &n1, &n2] {
+            repair(n).await;
+            assert_eq!((held(n, "s"), held(n, "kept")), (1, 4));
+        }
+    }
+
+    /// Why: a reader asks any node, and the SDK's asks them all before it calls a stream read
+    /// to its end. A delete acknowledged while one reachable node had not applied it yet would
+    /// leave the stream readable there for a moment: with every node up, a delete returns
+    /// only once every node has it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn with_every_node_up_a_delete_returns_once_every_node_has_applied_it() {
+        let c = cluster(3, &["a", "b", "c"]);
+        let nodes = [start(&c, 0).await, start(&c, 1).await, start(&c, 2).await];
+        let mc = client(&c).await;
+        for round in 0..20u64 {
+            let stream = format!("s{round}");
+            let r = mc.append(0, &batch(&stream, 5, 0), 3).await.unwrap();
+            assert!(r.ack.is_success());
+            let floor = deleted(&mc, (round % 3) as usize, &stream).await;
+            for (i, n) in nodes.iter().enumerate() {
+                assert_eq!(
+                    (n.store.floor(&stream), held(n, &stream)),
+                    (floor, 0),
+                    "node {i}"
+                );
+            }
+        }
+    }
+
+    /// Why: a delete's floor must be above every acknowledged batch's writer log, so the node
+    /// asks enough nodes that one of them holds any batch acknowledged on two. Alone, it
+    /// cannot know, and must refuse rather than delete less than was asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_alone_does_not_delete() {
+        let c = cluster(3, &["a", "b", "c"]);
+        let n0 = start(&c, 0).await;
+        let mc = client(&c).await;
+        assert!(n0.append(1, batch("s", 5, 0)).await.is_success());
+        let e = delete(&mc, 0, "s").await.err().unwrap().to_string();
+        assert!(e.contains("asks 2 nodes"), "{e}");
+        assert_eq!((held(&n0, "s"), n0.store.floor("s")), (1, 0));
+        // with a second node it does (once node 0 dials it again)
+        let _n1 = start(&c, 1).await;
+        deleted(&mc, 0, "s").await;
+        assert_eq!(held(&n0, "s"), 0);
+    }
+}

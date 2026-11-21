@@ -84,6 +84,12 @@ impl Streams {
         self.of(stream).record(digests, now_s)
     }
 
+    /// Forgets the stream's ids (it was deleted: an event of the new stream of its name is no
+    /// duplicate of one of the old).
+    pub fn forget(&mut self, stream: &str) {
+        self.by_stream.remove(stream);
+    }
+
     pub fn len(&self) -> usize {
         self.by_stream.values().map(Dedup::len).sum()
     }

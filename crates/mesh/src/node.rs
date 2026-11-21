@@ -10,7 +10,7 @@
 use crate::dedup::{self, Streams};
 use crate::proto::*;
 use crate::rpc::{BoxRead, BoxWrite, RpcClient, read_frame, write_loop};
-use crate::store::{Cursor, Kept, Reserve, State, Store};
+use crate::store::{Cursor, FLOORS, Kept, Reserve, State, Store, encode_floor, floors_in};
 use crate::transport::Addr;
 use crate::wal::Wal;
 use anyhow::{Context, Result, anyhow, bail};
@@ -306,6 +306,9 @@ pub struct Node {
     pos_seq: AtomicU64,
     /// The event time (us) of this node's last position commit: it never goes back.
     pos_time: AtomicU64,
+    /// This node's writer log for deletes (`delete_stream`; a new epoch per boot).
+    floor_log: LogId,
+    floor_seq: AtomicU64,
     /// Held while the cleaner copies batches forward and while a replacement takes a batch's
     /// place, so a copy never carries bytes a replacement superseded.
     clean: tokio::sync::Mutex<()>,
@@ -556,6 +559,27 @@ fn apply_compacted(m: &mut Compacted, batch: &Batch, lsn: u64) {
     }
 }
 
+/// The epoch a delete deletes a stream below: just above every writer log the nodes asked hold
+/// of it, and no lower than `held`, the floor it has here. No clock: an epoch is its writer's
+/// choice (the SDK's is its clock in nanoseconds; a counter is as good), and a floor at this
+/// node's clock would refuse every writer with lower epochs, and every new one for as long as
+/// this node's clock is ahead of theirs.
+fn delete_floor(held: u64, epochs: &[u64]) -> Result<u64> {
+    let top = epochs.iter().copied().max();
+    anyhow::ensure!(
+        top != Some(u64::MAX),
+        "a writer log with the last epoch cannot be deleted"
+    );
+    Ok(top.map_or(0, |e| e + 1).max(held))
+}
+
+/// The clock in nanoseconds: the epoch of the node's own writer logs.
+fn now_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
 fn now_s() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -603,6 +627,7 @@ fn need(c: &Control) -> Need<'_> {
         | Control::Position { stream, .. }
         | Control::Latest { stream } => Need::Read(stream),
         Control::FetchLog { log, .. } => Need::Read(&log.stream),
+        Control::Delete { stream } => Need::Write(stream),
         Control::Status | Control::Repair | Control::Fetch { .. } | Control::Inventory { .. } => {
             Need::All
         }
@@ -685,6 +710,10 @@ impl Node {
         let n = store.totals().0;
         // the compacted streams' replay (bounded: those, not the log)
         for (name, m) in compact.iter_mut() {
+            // (a snapshot from before a delete of the stream holds what it deleted, which
+            // would hide a new writer's value with an earlier event time)
+            let floor = store.floor(name);
+            m.retain(|_, ((_, _, epoch, _), ..)| *epoch >= floor);
             for lsn in store.lsns(name) {
                 if let Some(r) = wal.reader.read(lsn)? {
                     let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
@@ -702,6 +731,10 @@ impl Node {
                 for e in es.iter().filter(|e| e.meta.time_ms >= since) {
                     if let Some(r) = wal.reader.read(e.lsn)? {
                         let b = Batch::parse(Bytes::copy_from_slice(&r.payload))?;
+                        // (a deleted log's records are in the log until their segments go)
+                        if b.id.log.epoch < store.floor(&b.id.log.stream) {
+                            continue;
+                        }
                         let ds: Vec<u64> = digests(&b).into_iter().map(|(_, h)| h).collect();
                         d.record(&b.id.log.stream, &ds, now_s());
                     }
@@ -759,6 +792,12 @@ impl Node {
             },
             pos_seq: AtomicU64::new(0),
             pos_time: AtomicU64::new(0),
+            floor_log: LogId {
+                stream: FLOORS.into(),
+                writer: format!("node-{cfg_id}"),
+                epoch: now_ns(),
+            },
+            floor_seq: AtomicU64::new(0),
             clean: Default::default(),
             copied_bytes: AtomicU64::new(0),
             copied_batches: AtomicU64::new(0),
@@ -890,13 +929,110 @@ impl Node {
             seq,
             &[(time, &position_key(group, stream), &payload)],
         )?;
-        let copies = (1 + self.targets().len()).min(2) as u8;
-        let ack = self.append(copies, b).await;
+        let ack = self.append(self.majority(), b).await;
         anyhow::ensure!(
             ack.is_success(),
             "position commit not acknowledged: {ack:?}"
         );
         Ok(())
+    }
+
+    /// The nodes that take a copy of what this node appends: itself and its targets.
+    fn copies(&self) -> u8 {
+        (1 + self.targets().len()) as u8
+    }
+
+    /// The copies the node's own records (reader positions, deletes) are acknowledged at.
+    fn majority(&self) -> u8 {
+        self.copies().min(2)
+    }
+
+    /// Deletes the stream: every writer log of it with an epoch below the one returned, on
+    /// every node, for good (spec/mesh/Delete.tla). The delete is a record of the floors'
+    /// stream, durable on a majority, and on every node this one reaches, before this returns;
+    /// each node applies it when it becomes durable there (`Store`: it forgets what it holds of those logs and takes nothing of
+    /// them again), repair included, so a node that was down is brought along and cannot hand
+    /// the stream back.
+    ///
+    /// The epoch is just above every writer log that enough nodes hold of the stream for one
+    /// of them to hold any batch acknowledged on two (as `Client::end` covers the
+    /// acknowledged): those writers are deleted, and a writer with an epoch at or above it
+    /// writes a new stream of the name (`delete_floor`). 0: no node asked holds anything of
+    /// the stream, and nothing is deleted. Not covered: a batch acknowledged on one node
+    /// alone (`copies` 1) that is down during the delete, of a writer no other node has seen.
+    pub async fn delete_stream(self: &Arc<Self>, stream: &str) -> Result<u64> {
+        anyhow::ensure!(
+            !stream.is_empty() && stream.len() <= MAX_NAME && !stream.starts_with("__"),
+            "cannot delete stream {stream:?}"
+        );
+        let end = |stream: &str| Control::CursorAt {
+            stream: stream.into(),
+            time_ms: u64::MAX,
+        };
+        let n = self.peers.len() + 1;
+        let need = n - n.min(2) + 1;
+        let mut epochs: Vec<u64> = (self.store.cursor_at(stream, u64::MAX).keys())
+            .map(|l| l.epoch)
+            .collect();
+        let mut answered = 1;
+        for p in &self.peers {
+            let f = self.peer_control(p, &end(stream)).await;
+            let cursor = f.and_then(|f| Ok(serde_json::from_slice::<ControlResp>(&f.body)?));
+            if let Ok(ControlResp::Cursor { cursor: Some(c) }) = cursor {
+                epochs.extend(c.iter().map(|x| x.1));
+                answered += 1;
+            }
+        }
+        anyhow::ensure!(
+            answered >= need,
+            "a delete of {stream:?} asks {need} nodes for its writers: {answered} answered"
+        );
+        let epoch = delete_floor(self.store.floor(stream), &epochs)?;
+        if epoch == 0 {
+            return Ok(0);
+        }
+        let seq = self.floor_seq.fetch_add(1, Ordering::Relaxed);
+        let event = encode_floor(stream, epoch);
+        let b = Batch::encode(&self.floor_log, seq, &[(0, &event)])?;
+        // each node this one replicates to (one per failure domain) has applied the delete
+        // when this returns (a reader asks any node, and one a moment behind would still serve
+        // the stream); with one of them down a majority holds it, and repair brings along that
+        // node and any other
+        let ack = self.append(self.copies(), b).await;
+        anyhow::ensure!(
+            ack.copies >= self.majority(),
+            "delete not acknowledged: {ack:?}"
+        );
+        // here at once (the copies may be the peers' while this node's is still being written)
+        self.store.set_floor(stream, epoch);
+        self.forget_deleted(stream, epoch);
+        Ok(epoch)
+    }
+
+    /// What the node keeps of a stream outside its log, deleted below `epoch`: a compacted
+    /// stream's values from the deleted writer logs, and the stream's dedup ids. ponytail: the
+    /// ids of the new stream of its name go too if the delete's record arrives late (repair),
+    /// so an event sent twice across that moment is stored twice; ids per epoch if it matters.
+    fn forget_deleted(&self, stream: &str, epoch: u64) {
+        if let Some(m) = self.compact.lock().get_mut(stream) {
+            m.retain(|_, ((_, _, e, _), ..)| *e >= epoch);
+        }
+        if let Some(d) = self.dedup.lock().as_mut() {
+            d.forget(stream);
+        }
+    }
+
+    /// `batch` is on stable storage at `lsn`: the store indexes it, and the node applies what
+    /// it holds of it itself (a compacted stream's values; a delete, to those and to the
+    /// stream's dedup ids).
+    fn durable(&self, batch: &Batch, lsn: u64) {
+        self.compacted_durable(batch, lsn);
+        self.store.mark_durable(batch, lsn);
+        if batch.id.log.stream == FLOORS {
+            for (stream, epoch) in floors_in(batch) {
+                self.forget_deleted(&stream, epoch);
+            }
+        }
     }
 
     /// A reader group's committed position in a stream, if it has one.
@@ -931,7 +1067,11 @@ impl Node {
     }
 
     fn compacted_durable(&self, batch: &Batch, lsn: u64) {
-        if let Some(m) = self.compact.lock().get_mut(&batch.id.log.stream) {
+        let log = &batch.id.log;
+        // (not one of a deleted log, reserved before its stream's floor arrived)
+        if let Some(m) = self.compact.lock().get_mut(&log.stream)
+            && log.epoch >= self.store.floor(&log.stream)
+        {
             apply_compacted(m, batch, lsn);
         }
     }
@@ -1619,6 +1759,20 @@ impl Node {
         match f.kind {
             Kind::Append => {
                 let (copies, batch) = decode_append(f.body)?;
+                let reject = |crc| {
+                    let ack = Ack {
+                        status: AckStatus::Rejected,
+                        copies: 0,
+                        nodes: 0,
+                        crc,
+                    };
+                    Ok(Frame::new(Kind::Ack, id, ack.encode()))
+                };
+                // the node's own streams (readers' positions, deletes) are written by the node:
+                // `Control::Commit` and `Control::Delete` check what goes into them
+                if Batch::stream_of(&batch).is_some_and(|s| s.starts_with(b"__")) {
+                    return reject(batch_crc(&batch));
+                }
                 // ponytail: a scoped token's batch is parsed twice (here for its stream, then by
                 // `append`); one that does not parse is rejected there
                 if let Ident::Scoped(_) = ident
@@ -1626,13 +1780,7 @@ impl Node {
                     && let Err(e) = self.allow(ident, Need::Write(&b.id.log.stream))
                 {
                     tracing::debug!("append refused: {e}");
-                    let ack = Ack {
-                        status: AckStatus::Rejected,
-                        copies: 0,
-                        nodes: 0,
-                        crc: b.ident,
-                    };
-                    return Ok(Frame::new(Kind::Ack, id, ack.encode()));
+                    return reject(b.ident);
                 }
                 let ack = self.append(copies, batch).await;
                 Ok(Frame::new(Kind::Ack, id, ack.encode()))
@@ -1790,6 +1938,9 @@ impl Node {
                     .position(&group, &stream)
                     .map(|c| crate::store::cursor_to_wire(&c, &stream)),
             },
+            Control::Delete { stream } => ControlResp::Deleted {
+                epoch: self.delete_stream(&stream).await?,
+            },
             Control::Latest { stream } => ControlResp::Latest {
                 entries: self
                     .latest(&stream)
@@ -1850,8 +2001,7 @@ impl Node {
         };
         match Wal::durable(rx).await {
             Ok(lsn) => {
-                self.compacted_durable(batch, lsn);
-                self.store.mark_durable(batch, lsn);
+                self.durable(batch, lsn);
                 Ok(Local::Stored)
             }
             Err(e) => {
@@ -1871,8 +2021,7 @@ impl Node {
                 Reserve::New => {
                     return match self.wal.append(batch.clone()).await {
                         Ok(lsn) => {
-                            self.compacted_durable(batch, lsn);
-                            self.store.mark_durable(batch, lsn);
+                            self.durable(batch, lsn);
                             Ok(Local::Stored)
                         }
                         Err(e) => {
@@ -3422,6 +3571,7 @@ mod props_tokens {
                 read,
             ),
             (Control::Latest { stream: s.clone() }, read),
+            (Control::Delete { stream: s.clone() }, Need::Write("acme/1")),
             (
                 Control::FetchLog {
                     log: log(),
@@ -3756,9 +3906,9 @@ mod props_tokens {
                     let b = batch(stream, seq.fetch_add(1, Ordering::Relaxed));
                     let before = node.store.totals().0;
                     let ack = rt.block_on(append(&node, ident, b));
-                    let own = stream.starts_with("__");
-                    prop_assert_eq!(ack.status == AckStatus::Rejected && node.store.totals().0 == before, !may_write, "{:?} {} {:?}", ident, stream, ack);
-                    prop_assert!(may_write != (ack.status == AckStatus::Rejected) || own, "{:?}", ack);
+                    // (the node's own streams are written by no client: `handle`)
+                    let may = may_write && !stream.starts_with("__");
+                    prop_assert_eq!(ack.status == AckStatus::Rejected && node.store.totals().0 == before, !may, "{:?} {} {:?}", ident, stream, ack);
                 }
                 12 => {
                     // only a peer replicates, whatever a token reaches
@@ -4009,6 +4159,341 @@ mod props_tokens {
         let mut c = base();
         (c.tokens, c.peer_token) = (vec![], None);
         Node::open(c).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod props_delete {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Why: a delete deletes the writer logs below its floor, so the floor must be above
+        /// every one the nodes asked hold (or an acknowledged batch survives its delete), and
+        /// no lower than the floor the stream has here (a second delete never returns less
+        /// than the first deleted). The lowest such, and no clock: a writer's epoch is its
+        /// own choice (a clock in seconds, a counter), and a floor at the node's clock in
+        /// nanoseconds would shut every such writer out of the name for good.
+        #[test]
+        fn a_delete_s_floor_is_just_above_every_writer_log_and_never_below_the_last(
+            held in prop_oneof![Just(0), any::<u64>()],
+            epochs in prop::collection::vec(prop_oneof![0u64..9, any::<u64>()], 0..5),
+            last: bool,
+        ) {
+            let epochs: Vec<u64> = epochs.into_iter().chain(last.then_some(u64::MAX)).collect();
+            match delete_floor(held, &epochs) {
+                Ok(f) => {
+                    prop_assert!(!last && f >= held && epochs.iter().all(|&e| e < f));
+                    prop_assert!(f == held || epochs.contains(&(f - 1)), "the lowest such");
+                }
+                Err(_) => prop_assert!(epochs.contains(&u64::MAX)),
+            }
+        }
+    }
+
+    fn batch(stream: &str, epoch: u64, seq: u64) -> Bytes {
+        let log = LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch,
+        };
+        Batch::encode(&log, seq, &[(seq, b"x")]).unwrap()
+    }
+
+    fn seqs(node: &Node, stream: &str) -> Vec<(u64, u64)> {
+        let (bs, _) = node.store.read_cursor(stream, &Cursor::new(), 1 << 20);
+        (bs.into_iter().map(|b| Batch::parse(b).unwrap().id))
+            .map(|id| (id.log.epoch, id.first_seq))
+            .collect()
+    }
+
+    async fn delete(node: &Arc<Node>, ident: Ident, stream: &str) -> Result<u64> {
+        let c = Control::Delete {
+            stream: stream.into(),
+        };
+        let body = Bytes::from(serde_json::to_vec(&c).unwrap());
+        let f = node
+            .handle(Frame::new(Kind::Control, 1, body), ident)
+            .await?;
+        match serde_json::from_slice(&f.body)? {
+            ControlResp::Deleted { epoch } => Ok(epoch),
+            r => bail!("{r:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_node_s_own_records_are_acknowledged_on_a_majority() {
+        // Why: a delete and a reader's position are acknowledged to their caller once durable
+        // on this many nodes. One fewer, and the loss of one node loses an acknowledged delete.
+        let d = tempfile::tempdir().unwrap();
+        let peer = |id: u32, domain: &str| PeerConfig {
+            id,
+            domain: domain.into(),
+            addr: "tcp://127.0.0.1:1".parse().unwrap(),
+        };
+        for (peers, want) in [
+            (vec![], 1),
+            (vec![peer(1, "b")], 2),
+            (vec![peer(1, "b"), peer(2, "c")], 2),
+        ] {
+            let dir = d.path().join(format!("n{}", peers.len()));
+            let mut c = NodeConfig::single(0, "a", dir, "tok".into());
+            let all = 1 + peers.len() as u8;
+            (c.peers, c.segment_size) = (peers, 1 << 20);
+            let node = Node::open(c).await.unwrap();
+            assert_eq!((node.copies(), node.majority()), (all, want));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deleted_stream_is_gone_for_good_and_a_new_one_of_its_name_works() {
+        // Why: a delete on request (a user's session, erased) must leave nothing of the stream
+        // readable and take nothing of it back, across a restart, while the name stays usable
+        // for writers that start after it and other streams are untouched.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        (c.segment_size, c.peer_token) = (1 << 20, Some("peers".into()));
+        c.tokens = vec![TokenConfig {
+            token: "acme".into(),
+            prefixes: vec!["acme/".into()],
+            read: true,
+            write: true,
+        }];
+        let node = Node::open(c.clone()).await.unwrap();
+        for seq in 0..3 {
+            assert!(node.append(1, batch("acme/s", 1, seq)).await.is_success());
+            assert!(node.append(1, batch("acme/s", 2, seq)).await.is_success());
+            assert!(
+                node.append(1, batch("acme/other", 1, seq))
+                    .await
+                    .is_success()
+            );
+        }
+        // a tenant deletes its own streams and no one else's; the node's own and names that
+        // are no stream's are refused
+        assert!(delete(&node, Ident::Scoped(0), "beta/s").await.is_err());
+        let long = "x".repeat(MAX_NAME + 1);
+        for bad in ["", "__positions", FLOORS, &long] {
+            let e = delete(&node, Ident::Client, bad)
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains("cannot delete"), "{bad:?}: {e}");
+        }
+        assert_eq!(seqs(&node, "acme/s").len(), 6);
+        let floor = delete(&node, Ident::Scoped(0), "acme/s").await.unwrap();
+        assert_eq!(floor, 3, "just above its writers' epochs, 1 and 2");
+        assert_eq!(node.store.floor("acme/s"), floor);
+        assert_eq!(seqs(&node, "acme/s"), []);
+        assert_eq!(seqs(&node, "acme/other").len(), 3);
+        // a retry of what it held, and more of its writers: refused, nothing stored
+        for b in [
+            batch("acme/s", 1, 0),
+            batch("acme/s", 2, 3),
+            batch("acme/s", floor - 1, 0),
+        ] {
+            assert!(!node.append(1, b).await.is_success());
+        }
+        assert_eq!(seqs(&node, "acme/s"), []);
+        // a writer with an epoch at the floor or above writes a new stream of the name: one
+        // whose epoch is a counter, and one whose epoch is its clock
+        let (new, max) = (now_ns(), "y".repeat(MAX_NAME));
+        assert!(node.append(1, batch("acme/s", floor, 0)).await.is_success());
+        assert!(node.append(1, batch("acme/s", new, 0)).await.is_success());
+        assert_eq!(seqs(&node, "acme/s"), [(floor, 0), (new, 0)]);
+        // a second delete takes those too, with a floor above them, and one more changes
+        // nothing; a stream nobody wrote has nothing to delete, whatever its name's length
+        let again = delete(&node, Ident::Client, "acme/s").await.unwrap();
+        assert_eq!(again, new + 1);
+        assert_eq!(seqs(&node, "acme/s"), []);
+        assert_eq!(delete(&node, Ident::Client, "acme/s").await.unwrap(), again);
+        for never in [&max[..], "never"] {
+            assert_eq!(delete(&node, Ident::Client, never).await.unwrap(), 0);
+            assert!(node.append(1, batch(never, 0, 0)).await.is_success());
+        }
+        let records = node.store.lsns(FLOORS).len();
+        assert_eq!(
+            records, 3,
+            "one per delete that deleted, or may have elsewhere"
+        );
+        // across a restart: the floors, what they deleted, and what they did not
+        node.apply_retention().await.unwrap();
+        assert!(node.append(1, batch("acme/s", again, 0)).await.is_success());
+        drop(node);
+        tokio::time::sleep(Duration::from_millis(300)).await; // the WAL thread releases its lock
+        let node = Node::open(c).await.unwrap();
+        assert_eq!(node.store.floor("acme/s"), again);
+        assert_eq!(seqs(&node, "acme/s"), [(again, 0)]);
+        assert_eq!(seqs(&node, "acme/other").len(), 3);
+        assert!(!node.append(1, batch("acme/s", 2, 9)).await.is_success());
+        assert_eq!(seqs(&node, "never"), [(0, 0)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_client_appends_to_the_node_s_own_streams() {
+        // Why: the floors' stream and the readers' positions are the node's own records, and
+        // a delete applies when its record is durable, whoever wrote it. A client that could
+        // append there (the unscoped token could) deleted any stream below any epoch, the
+        // last one included (a name no writer can use again), thousands a batch, past every
+        // check `Control::Delete` makes. Only the node writes them.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 1 << 20;
+        let node = Node::open(c).await.unwrap();
+        assert!(node.append(1, batch("s", 1, 0)).await.is_success());
+        let floors = LogId {
+            stream: FLOORS.into(),
+            writer: "x".into(),
+            epoch: 1,
+        };
+        let forged = Batch::encode(&floors, 0, &[(0, &encode_floor("s", u64::MAX)[..])]).unwrap();
+        for b in [forged, batch(POSITIONS, 1, 0), batch("__anything", 1, 0)] {
+            for ident in [Ident::Client, Ident::Peer(1)] {
+                let f = Frame::new(Kind::Append, 1, encode_append(1, &b));
+                let ack = parse_frame_ack(&node.handle(f, ident).await.unwrap()).unwrap();
+                assert_eq!(ack.status, AckStatus::Rejected, "{ident:?}");
+            }
+        }
+        assert_eq!((node.store.floor("s"), seqs(&node, "s")), (0, vec![(1, 0)]));
+        assert!(node.store.lsns(FLOORS).is_empty() && node.store.lsns("__anything").is_empty());
+        // a name that only looks alike is a stream as any other, and a batch too short to
+        // name one is refused as ever
+        let f = Frame::new(Kind::Append, 1, encode_append(1, &batch("_s", 1, 0)));
+        let ack = parse_frame_ack(&node.handle(f, Ident::Client).await.unwrap()).unwrap();
+        assert!(ack.is_success());
+        for short in [&b"PCB2"[..], b"PCB2\x09", b"PCB2\x02\x00_"] {
+            let f = Frame::new(
+                Kind::Append,
+                1,
+                encode_append(1, &Bytes::from_static(short)),
+            );
+            let ack = parse_frame_ack(&node.handle(f, Ident::Client).await.unwrap()).unwrap();
+            assert_eq!(ack.status, AckStatus::Rejected);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delete_takes_a_compacted_stream_s_values_and_the_stream_s_dedup_ids() {
+        // Why: what the node keeps of a stream outside its log is deleted with it. A compacted
+        // stream's newest values were still served (`latest`), from RAM and after a restart
+        // from the snapshot, and a deleted value with a later event time hid the new
+        // writer's. The stream's dedup ids were kept, so an event written again to the new
+        // stream of the name within the window was acknowledged and dropped; a restart
+        // rebuilt them from the deleted records still in the log.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 1 << 20;
+        let compacted = StreamConfig {
+            compacted: true,
+            ..Default::default()
+        };
+        c.streams.insert("kv".into(), compacted);
+        let keyed = |stream: &str, epoch, seq, time, v: &[u8]| {
+            let log = LogId {
+                stream: stream.into(),
+                writer: "w".into(),
+                epoch,
+            };
+            Batch::encode_keyed(&log, seq, &[(time, b"k", v)]).unwrap()
+        };
+        let dropped = |node: &Node| node.dedup_dropped.load(Ordering::Relaxed);
+        let node = Node::open(c.clone()).await.unwrap();
+        for stream in ["kv", "ev", "ev2"] {
+            assert!(
+                node.append(1, keyed(stream, 1, 0, 900, b"old"))
+                    .await
+                    .is_success()
+            );
+        }
+        // (its ids are known: the same event again is dropped)
+        node.append(1, keyed("ev", 1, 1, 900, b"old")).await;
+        assert_eq!(dropped(&node), 1);
+        node.apply_retention().await.unwrap(); // the snapshot holds the value
+        for stream in ["kv", "ev", "ev2"] {
+            assert_eq!(node.delete_stream(stream).await.unwrap(), 2);
+        }
+        assert_eq!(node.latest("kv"), vec![]);
+        // new writers: an earlier event time than the deleted value's, and the same id
+        assert!(
+            node.append(1, keyed("kv", 5, 0, 1, b"new"))
+                .await
+                .is_success()
+        );
+        let new = vec![(b"k".to_vec(), Bytes::from_static(b"new"))];
+        assert_eq!(node.latest("kv"), new);
+        // (a writer at the floor's own epoch is the new stream's)
+        assert!(
+            node.append(1, keyed("ev", 2, 0, 1, b"new"))
+                .await
+                .is_success()
+        );
+        assert_eq!((seqs(&node, "ev"), dropped(&node)), (vec![(2, 0)], 1));
+        // a batch of the deleted writer, durable after the delete, changes no value
+        node.compacted_durable(&Batch::parse(keyed("kv", 1, 1, 950, b"late")).unwrap(), 0);
+        assert_eq!(node.latest("kv"), new);
+        // across a restart, with the snapshot from before the delete and the deleted records
+        // still in the log
+        drop(node);
+        tokio::time::sleep(Duration::from_millis(300)).await; // the WAL thread releases its lock
+        let node = Node::open(c).await.unwrap();
+        assert_eq!(node.latest("kv"), new);
+        assert!(
+            node.append(1, keyed("ev2", 5, 0, 1, b"new"))
+                .await
+                .is_success()
+        );
+        assert_eq!((seqs(&node, "ev2"), dropped(&node)), (vec![(5, 0)], 0));
+        // and the new stream's ids are known again: its event sent twice is dropped
+        node.append(1, keyed("ev", 2, 1, 1, b"new")).await;
+        assert_eq!(dropped(&node), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_learns_of_a_delete_from_its_record_forgets_values_and_dedup_ids_too() {
+        // Why: only the node that accepts a delete runs `delete_stream`. Every other node
+        // learns of it when the delete's record becomes durable there (a replica, repair): it
+        // must forget the same things then, or it serves a deleted compacted stream's values
+        // and drops the new stream's events as duplicates, for as long as it runs.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 1 << 20;
+        let compacted = StreamConfig {
+            compacted: true,
+            ..Default::default()
+        };
+        c.streams.insert("kv".into(), compacted);
+        let keyed = |stream: &str, epoch, seq| {
+            let log = LogId {
+                stream: stream.into(),
+                writer: "w".into(),
+                epoch,
+            };
+            Batch::encode_keyed(&log, seq, &[(seq, b"k", b"v")]).unwrap()
+        };
+        let node = Node::open(c).await.unwrap();
+        for stream in ["kv", "ev"] {
+            assert!(node.append(1, keyed(stream, 1, 0)).await.is_success());
+        }
+        assert_eq!(node.latest("kv").len(), 1);
+        // the delete's record, as a peer that accepted the delete replicates it
+        let floors = LogId {
+            stream: FLOORS.into(),
+            writer: "node-1".into(),
+            epoch: 1,
+        };
+        let events = [encode_floor("kv", 2), encode_floor("ev", 2)];
+        let events: Vec<(u64, &[u8])> = events.iter().map(|e| (0, &e[..])).collect();
+        let record = Batch::encode(&floors, 0, &events).unwrap();
+        let f = Frame::new(Kind::Replicate, 1, encode_replicate(1, &record));
+        let ack = parse_frame_ack(&node.handle(f, Ident::Peer(1)).await.unwrap()).unwrap();
+        assert!(ack.is_success(), "{ack:?}");
+        assert_eq!((node.store.floor("kv"), node.store.floor("ev")), (2, 2));
+        assert_eq!(node.latest("kv"), vec![]);
+        // the new stream's event with the old one's id is stored, not dropped
+        assert!(node.append(1, keyed("ev", 2, 0)).await.is_success());
+        let dropped = node.dedup_dropped.load(Ordering::Relaxed);
+        assert_eq!((seqs(&node, "ev"), dropped), (vec![(2, 0)], 0));
     }
 }
 

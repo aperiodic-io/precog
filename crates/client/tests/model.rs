@@ -260,6 +260,65 @@ mod model {
         Ok(())
     }
 
+    /// Why: a deleted stream must read as empty through the SDK on a cluster, with a node down
+    /// or not, while the name stays usable: what a producer created after the delete sends is
+    /// read, what one that wrote before it sends is refused.
+    async fn delete(down: Option<usize>, before: u8, after: u8) -> Result<(), TestCaseError> {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cluster::new(dir.path(), down).await;
+        let client = Client::connect(&c.addrs, "tok").unwrap();
+        let mut old = client.producer("sessions/1", "w");
+        let mut kept = client.producer("sessions/2", "w");
+        for i in 0..before {
+            old.send(i as u64, &[], &[i]);
+            kept.send(i as u64, &[], &[i]);
+        }
+        old.sync().await.unwrap();
+        kept.sync().await.unwrap();
+        // (asked again until acknowledged: a replica can be slower than the RPC timeout)
+        let mut floor = client.delete("sessions/1").await;
+        for _ in 0..50 {
+            if floor.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            floor = client.delete("sessions/1").await;
+        }
+        let floor = floor.unwrap();
+        let all = |stream: &'static str| {
+            let client = client.clone();
+            async move { drain(&mut client.consumer_at(stream, Default::default())).await }
+        };
+        prop_assert_eq!(all("sessions/1").await.len(), 0);
+        prop_assert_eq!(all("sessions/2").await.len(), before as usize);
+        // the producer from before the delete is refused, if the stream held anything of it
+        // (a writer no node had seen yet writes the new stream); one created now is not
+        old.send(99, &[], b"late");
+        prop_assert_eq!(old.sync().await.is_err(), before > 0);
+        prop_assert_eq!(floor > 0, before > 0);
+        let mut new = client.producer("sessions/1", "w");
+        for i in 0..after {
+            new.send(i as u64, &[], &[i]);
+        }
+        new.sync().await.unwrap();
+        let got = all("sessions/1").await;
+        prop_assert_eq!(got.len(), after as usize + (before == 0) as usize);
+        prop_assert!(got.iter().all(|e| e.epoch >= floor));
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(8))]
+
+        #[test]
+        fn a_deleted_stream_reads_as_empty_and_its_name_works_for_new_producers(
+            down in prop::option::of(0usize..3), before in 0u8..6, after in 0u8..6,
+        ) {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+            rt.block_on(delete(down, before, after))?;
+        }
+    }
+
     proptest! {
 
         #[test]

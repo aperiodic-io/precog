@@ -33,6 +33,7 @@ use crate::proto::{
     encode_replacing_key,
 };
 use crate::summary::{Checkpoint, Db, LogSum, StreamSum, encode_checkpoint};
+use anyhow::Context;
 use parking_lot::Mutex;
 use precog_storage::record::Meta;
 use precog_storage::{Lsn, Reader};
@@ -206,6 +207,10 @@ struct StreamLog {
     cold: BTreeMap<Lsn, ColdStream>,
     /// Its own retention forgot every one of its batches below this: it trims oldest first.
     floor: Age,
+    /// The stream is deleted below this epoch (`Inner::set_floor`): a writer log of it with a
+    /// lower epoch holds nothing here and takes nothing, for good. With its totals in its
+    /// summary, so a restart finds both or neither.
+    epoch_floor: u64,
     bytes: u64,
     /// When it was last used (`Inner::now`); 0 if only retention or repair woke it.
     used: u64,
@@ -248,6 +253,43 @@ pub struct Kept {
     pub lsn: Lsn,
     pub time: u64,
     pub cost: u64,
+}
+
+/// The node's own stream of deletes: each event is a stream and the epoch it is deleted below
+/// (`encode_floor`). It replicates and is repaired as any stream is; every node applies an
+/// event when its batch becomes durable there (`Inner::settle`).
+pub const FLOORS: &str = "__floors";
+
+/// The version of an event of the floors' stream (its first byte).
+const FLOOR_VERSION: u8 = 1;
+
+/// An event of the floors' stream: its version, the epoch, then the stream's name.
+pub fn encode_floor(stream: &str, epoch: u64) -> Vec<u8> {
+    [
+        &[FLOOR_VERSION][..],
+        &epoch.to_le_bytes(),
+        stream.as_bytes(),
+    ]
+    .concat()
+}
+
+/// The floors a batch of the floors' stream names. An event that is not one (another version,
+/// too short, a name that is no stream's or the node's own) is passed over, and logged: a
+/// newer node's record deletes nothing here until this node knows its version.
+pub(crate) fn floors_in(b: &Batch) -> Vec<(String, u64)> {
+    b.events()
+        .filter_map(|e| {
+            let floor = e.payload.split_first().filter(|x| *x.0 == FLOOR_VERSION);
+            if floor.is_none() {
+                tracing::error!("{:?}: an event of the floors' stream is not a floor", b.id);
+            }
+            let (epoch, name) = floor?.1.split_first_chunk::<8>()?;
+            let name = std::str::from_utf8(name).ok()?;
+            let ok =
+                !name.is_empty() && name.len() <= crate::proto::MAX_NAME && !name.starts_with("__");
+            ok.then(|| (name.to_string(), u64::from_le_bytes(*epoch)))
+        })
+        .collect()
 }
 
 pub enum Reserve {
@@ -338,6 +380,7 @@ fn summary(s: &StreamLog, logs: &Logs) -> StreamSum {
     StreamSum {
         floor: s.floor,
         bytes: s.bytes,
+        epoch_floor: s.epoch_floor,
         cold: s.cold.iter().map(|(&b, &c)| (b, c)).collect(),
         logs: s
             .logs
@@ -428,6 +471,7 @@ impl Inner {
         let mut s = StreamLog {
             cold: sum.cold.into_iter().collect(),
             floor: sum.floor,
+            epoch_floor: sum.epoch_floor,
             bytes: sum.bytes,
             used: if touch { self.now } else { 0 },
             ..Default::default()
@@ -508,6 +552,11 @@ impl Inner {
         seq < gone.fold(l.trimmed, |t, c| t.max(c.hi))
     }
 
+    /// The epoch floor of a stream in RAM (0: never deleted, or not in RAM).
+    fn epoch_floor(&self, stream: &str) -> u64 {
+        self.streams.get(stream).map_or(0, |s| s.epoch_floor)
+    }
+
     fn stream_of(&self, ix: u32) -> &StreamLog {
         &self.streams[&self.logs[ix as usize].id.stream]
     }
@@ -543,6 +592,10 @@ impl Inner {
     /// The log's batches retained in the absorbed segment at `base`, by sequence.
     fn run(&self, r: &Reader, ix: u32, base: Lsn) -> Res<Vec<Rec>> {
         let l = &self.logs[ix as usize];
+        // a deleted log: nothing of it is served, by this rule and not by a list of what it held
+        if l.id.epoch < self.epoch_floor(&l.id.stream) {
+            return Ok(vec![]);
+        }
         let own = self.stream_of(ix).floor;
         self.reads.set(self.reads.get() + 1);
         // a replacement is logged under the log's replacing key (its own run)
@@ -804,6 +857,82 @@ impl Inner {
         self.copied = self.copied.split_off(&self.contiguous);
     }
 
+    /// Deletes the stream below `epoch`: forgets what this node holds of its writer logs with
+    /// a lower epoch, and from now on refuses what it is handed of them (`Store::reserve`) and
+    /// drops what was reserved before (`settle`); a floor never goes down. Returns how many
+    /// batches it forgot. The floor is the stream's state, in its summary with its totals: a
+    /// restart finds both or neither, and then finds the floor's record in the log again.
+    fn set_floor(&mut self, db: &Db, r: &Reader, stream: &str, epoch: u64) -> usize {
+        // a summary that does not read: nothing is known of the stream, so nothing is done (a
+        // floor written over what the summary holds would lose its logs)
+        if let Err(e) = self.wake(db, r, stream, false) {
+            tracing::error!("stream {stream:?} is not deleted below {epoch} here: {e}");
+            return 0;
+        }
+        if epoch <= self.epoch_floor(stream) {
+            return 0;
+        }
+        // (a stream this node never held is known from now on, by its floor)
+        let logs = self.streams.entry(stream.into()).or_default().logs.clone();
+        let mut n = 0;
+        for ix in logs {
+            let l = &self.logs[ix as usize];
+            if l.id.epoch >= epoch {
+                continue;
+            }
+            // while its batches are still visible: what it holds in RAM, then per absorbed
+            // segment (an index that does not read leaves its totals; nothing of it is served)
+            let ram: Vec<Lsn> =
+                (l.batches.values().filter(|e| e.durable()).map(|e| e.lsn)).collect();
+            let (bases, high): (Vec<Lsn>, u64) = (l.cold.iter().map(|c| c.base).collect(), l.high);
+            n += ram.len();
+            for lsn in ram {
+                self.forget(r, lsn);
+            }
+            for base in bases {
+                match self.run(r, ix, base) {
+                    Ok(recs) => {
+                        n += recs.len();
+                        for x in recs {
+                            self.forget_cold(r, x);
+                        }
+                    }
+                    Err(e) => tracing::error!("reading the index of segment at {base}: {e}"),
+                }
+            }
+            // its frontier: nothing is missing below what it held
+            self.trim_log(r, ix, high);
+        }
+        let s = self.streams.get_mut(stream).unwrap();
+        (s.epoch_floor, s.dirty) = (epoch, true);
+        n
+    }
+
+    /// A batch of `log` just indexed at `lsn` (it became durable, or a restart replayed it).
+    /// One of a deleted log (reserved before its stream's floor arrived) is deleted with it,
+    /// as if it had been durable when the floor came (spec/mesh/Delete.tla, Recheck); its
+    /// record is never served (`run`, `live`, `tail`). One of the floors' stream raises the
+    /// floors it names, under the lock it was indexed under, so no checkpoint has one without
+    /// the other.
+    fn settle(
+        &mut self,
+        db: &Db,
+        r: &Reader,
+        log: &LogId,
+        lsn: Lsn,
+        batch: impl FnOnce() -> Option<Batch>,
+    ) {
+        if log.epoch < self.epoch_floor(&log.stream) {
+            self.forget(r, lsn);
+        } else if log.stream == FLOORS
+            && let Some(b) = batch()
+        {
+            for (stream, epoch) in floors_in(&b) {
+                self.set_floor(db, r, &stream, epoch);
+            }
+        }
+    }
+
     /// Forgets the durable batch at `lsn` in RAM (retention): later copies of it are `Expired`.
     fn forget(&mut self, r: &Reader, lsn: Lsn) {
         let Some((ix, len, first)) = self.order.remove(&lsn) else {
@@ -885,6 +1014,7 @@ impl Inner {
             cold: s.cold.clone(),
             // what `run` filters by, with the store's floor
             floor: s.floor,
+            epoch_floor: s.epoch_floor,
             ..Default::default()
         };
         for &ix in &s.logs {
@@ -954,7 +1084,11 @@ impl Inner {
         let (l, _) = decode_record_key(&m.key).ok()?;
         let ix = *self.ix.get(&l)?;
         let age = (m.time_ms, m.first_seq, lsn);
-        (lsn >= self.floor && age >= self.stream_of(ix).floor && !self.dead.contains(&lsn))
+        let deleted = l.epoch < self.epoch_floor(&l.stream);
+        (lsn >= self.floor
+            && age >= self.stream_of(ix).floor
+            && !self.dead.contains(&lsn)
+            && !deleted)
             .then_some(ix)
     }
 
@@ -1286,12 +1420,46 @@ impl Store {
                     inner.logs[ix as usize].batches.insert(first, new);
                     inner.join(ix);
                     inner.index(r, e.lsn, ix, first, new, e.meta.time_ms);
+                    // as when it became durable: deleted with its log. (A floors' record is
+                    // applied once the replay is done, with those below the checkpoint:
+                    // `reapply_floors`; what it deletes of the batches replayed after it goes
+                    // then.)
+                    inner.settle(&s.db, r, &log, e.lsn, || None);
                 }
             }
             inner.absorb(r, end);
         }
+        s.reapply_floors()?;
         s.count_known()?;
         Ok(s)
+    }
+
+    /// The batch of the floors' stream at `lsn`.
+    fn floors_at(&self, lsn: Lsn) -> anyhow::Result<Batch> {
+        let rec = self.reader.read(lsn)?;
+        let rec = rec.with_context(|| format!("the floors' record at lsn {lsn} is gone"))?;
+        Batch::parse(bytes::Bytes::copy_from_slice(&rec.payload))
+    }
+
+    /// Applies the floors' records the log still holds, again: one this node stored and did
+    /// not apply (the stream's summary did not read then; a node of a version before deletes
+    /// stores the record as any batch) lies below the checkpoint, where no replay finds it.
+    /// ponytail: a summary read per delete the log retains, at every start; the checkpoint
+    /// could hold the LSN they are applied up to if starts get slow.
+    fn reapply_floors(&self) -> anyhow::Result<()> {
+        let mut seen = HashMap::new();
+        for lsn in self.lsns(FLOORS) {
+            for (stream, epoch) in floors_in(&self.floors_at(lsn)?) {
+                let mut g = self.inner.lock();
+                // (a stream out of RAM whose summary holds the floor stays there)
+                let known = self.floor_of(&g, &stream, &mut seen);
+                if known.is_ok_and(|f| f.1 < epoch) {
+                    g.set_floor(&self.db, &self.reader, &stream, epoch);
+                    seen.remove(&stream);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn count_known(&self) -> anyhow::Result<()> {
@@ -1326,7 +1494,10 @@ impl Store {
         }
         let first = b.id.first_seq;
         let end = b.end_seq();
-        if inner.trimmed(&self.reader, &b.id.log, first) {
+        // below its log's retention floor, or of a deleted log (spec/mesh/Delete.tla, Refuse)
+        if inner.trimmed(&self.reader, &b.id.log, first)
+            || b.id.log.epoch < inner.epoch_floor(&b.id.log.stream)
+        {
             return Reserve::Expired;
         }
         let ix = inner.intern(&b.id.log);
@@ -1386,6 +1557,7 @@ impl Store {
             tx.send_replace(State::Durable);
         }
         inner.index(&self.reader, lsn, ix, first, e, time);
+        inner.settle(&self.db, &self.reader, &id.log, lsn, || Some(b.clone()));
         inner.advance_contiguous();
         drop(g);
         self.durable_notify.notify_waiters();
@@ -1433,6 +1605,8 @@ impl Store {
         inner.logs[ix as usize].batches.insert(first, e);
         inner.join(ix);
         inner.index(&self.reader, lsn, ix, first, e, time);
+        // as any batch that becomes durable: its log may have been deleted since `replaceable`
+        inner.settle(&self.db, &self.reader, &b.id.log, lsn, || Some(b.clone()));
         inner.advance_contiguous();
         drop(g);
         self.durable_notify.notify_waiters();
@@ -1536,6 +1710,22 @@ impl Store {
             max_bytes.is_some_and(|m| bytes > m)
                 || max_age_ms.is_some_and(|a| now_ms.saturating_sub(x.time) > a)
         })
+    }
+
+    /// Deletes the stream below `epoch`: every writer log of it with a lower epoch, for good
+    /// (see `Inner::set_floor`). Returns how many batches it forgot. A delete is a record of
+    /// the floors' stream (`FLOORS`), which every node applies when it becomes durable there;
+    /// the node that accepted it also calls this once the record is acknowledged, as its own
+    /// copy may still be on its way to the log.
+    pub fn set_floor(&self, stream: &str, epoch: u64) -> usize {
+        (self.inner.lock()).set_floor(&self.db, &self.reader, stream, epoch)
+    }
+
+    /// The epoch the stream is deleted below (0: never deleted, or its summary does not read).
+    /// From its summary if it is out of RAM, where it stays.
+    pub fn floor(&self, stream: &str) -> u64 {
+        let g = self.inner.lock();
+        (self.floor_of(&g, stream, &mut HashMap::new())).map_or(0, |f| f.1)
     }
 
     /// The names of the streams in RAM.
@@ -1759,21 +1949,26 @@ impl Store {
         self.read_batch(lsn)
     }
 
-    /// A stream's own floor, in RAM or from its summary, remembered in `seen` for the call.
-    fn floor_of(&self, g: &Inner, stream: &str, seen: &mut HashMap<String, Age>) -> Age {
+    /// A stream's own floors (its retention's, and the epoch it is deleted below), in RAM or
+    /// from its summary, remembered in `seen` for the call. A summary that does not read is an
+    /// error (logged), not a stream without floors: it may be deleted.
+    fn floor_of(
+        &self,
+        g: &Inner,
+        stream: &str,
+        seen: &mut HashMap<String, (Age, u64)>,
+    ) -> crate::summary::Result<(Age, u64)> {
         if let Some(s) = g.streams.get(stream) {
-            return s.floor;
+            return Ok((s.floor, s.epoch_floor));
         }
         if let Some(&f) = seen.get(stream) {
-            return f;
+            return Ok(f);
         }
-        let f = self
-            .db
-            .stream(stream)
-            .inspect_err(|e| tracing::error!("{e}"));
-        let f = f.ok().flatten().map_or((0, 0, 0), |s| s.floor);
+        let sum = self.db.stream(stream);
+        let sum = sum.inspect_err(|e| tracing::error!("the floors of {stream:?}: {e}"))?;
+        let f = sum.map_or(((0, 0, 0), 0), |s| (s.floor, s.epoch_floor));
         seen.insert(stream.to_string(), f);
-        f
+        Ok(f)
     }
 
     /// Durable batches at LSNs `from..`, optionally only one stream, up to about `max_bytes`.
@@ -1803,14 +1998,22 @@ impl Store {
                 if size >= max_bytes {
                     break;
                 }
-                at = e.lsn + 1;
-                let want = decode_log_key(&e.meta.key).is_ok_and(|l| {
+                // a record of a stream the feed is for, that the node still holds
+                let l = decode_log_key(&e.meta.key).ok().filter(|l| {
                     stream.is_none_or(|s| l.stream == s)
                         && e.lsn >= g.floor
                         && !g.dead.contains(&e.lsn)
-                        && (e.meta.time_ms, e.meta.first_seq, e.lsn)
-                            >= self.floor_of(&g, &l.stream, &mut floors)
                 });
+                // then its stream's own floors: one whose summary does not read may be
+                // deleted, or not, so the feed waits at its record (neither served nor skipped)
+                let want = match l.map(|l| (self.floor_of(&g, &l.stream, &mut floors), l.epoch)) {
+                    Some((Err(_), _)) => break,
+                    Some((Ok((own, deleted_below)), epoch)) => {
+                        (e.meta.time_ms, e.meta.first_seq, e.lsn) >= own && epoch >= deleted_below
+                    }
+                    None => false,
+                };
+                at = e.lsn + 1;
                 if want {
                     size += e.payload_len as usize;
                 }
@@ -5236,6 +5439,477 @@ mod model {
     }
 }
 
+/// Model-based test of deleting a stream (`Store::set_floor`, spec/mesh/Delete.tla) against a
+/// reference: the batches reserved and durable, and the floor.
+#[cfg(test)]
+mod model_delete {
+    use super::*;
+    use crate::proto::{batch_crc, encode_log_key};
+    use precog_storage::record::Meta;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// a batch of the log with this epoch, at this sequence
+        Reserve(u64, u64),
+        Durable(prop::sample::Index),
+        Delete(u64),
+        /// absorbed, a checkpoint, then every stream that can leaves RAM
+        Doze,
+        /// a crash and a restart: the checkpoint, then the log past it. `true`: a reserved
+        /// batch had reached the log, and was not marked durable yet
+        Crash(bool),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                5 => (1u64..4, 0u64..4).prop_map(|(e, q)| Op::Reserve(e, q)),
+                4 => any::<prop::sample::Index>().prop_map(Op::Durable),
+                2 => (0u64..5).prop_map(Op::Delete),
+                2 => Just(Op::Doze),
+                1 => any::<bool>().prop_map(Op::Crash),
+            ],
+            1..40,
+        )
+    }
+
+    fn batch(stream: &str, epoch: u64, seq: u64) -> Batch {
+        let log = LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch,
+        };
+        Batch::parse(Batch::encode(&log, seq, &[(seq, &[7u8; 30][..])]).unwrap()).unwrap()
+    }
+
+    /// Writes the batch to the log, under its log's key or its replacing key.
+    fn write(log: &mut precog_storage::Log, b: &Batch, replacing: bool) -> (Lsn, Meta) {
+        let m = Meta {
+            key: match replacing {
+                true => crate::proto::encode_replacing_key(&b.id.log),
+                false => encode_log_key(&b.id.log),
+            },
+            first_seq: b.id.first_seq,
+            count: b.count,
+            tag: batch_crc(&b.bytes),
+            time_ms: log.next_lsn(),
+        };
+        (log.append(&[(m.clone(), &b.bytes[..])]).unwrap(), m)
+    }
+
+    fn log_it(log: &mut precog_storage::Log, s: &Store, b: &Batch) -> (Lsn, Meta) {
+        let (lsn, m) = write(log, b, false);
+        s.mark_durable(b, lsn);
+        (lsn, m)
+    }
+
+    /// A batch of the floors' stream that deletes `stream` below `epoch`.
+    fn floor_batch(seq: u64, stream: &str, epoch: u64) -> Batch {
+        let log = LogId {
+            stream: FLOORS.into(),
+            writer: "node-0".into(),
+            epoch: 1,
+        };
+        let e = encode_floor(stream, epoch);
+        Batch::parse(Batch::encode(&log, seq, &[(0, &e[..])]).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_delete_counts_what_it_forgot_and_the_cleaner_copies_nothing_of_a_deleted_log() {
+        // Why: the cleaner copies forward what a stream still retains, and asks again for each
+        // record just before it copies (`Store::retains`). A record of a deleted log must not
+        // be copied into a newer segment, where it would outlive the bytes the delete left to
+        // be dropped; one at or above the floor still is.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = precog_storage::Config::new(dir.path().join("log"));
+        c.spares = 0;
+        let mut log = precog_storage::Log::open(c).unwrap();
+        let db = Db::open(&dir.path().join("streams.redb"), 1 << 20).unwrap();
+        let s = Store::open(log.reader(), db).unwrap();
+        let mut at = vec![];
+        for (epoch, seq) in [(1, 0), (1, 1), (2, 0), (3, 0)] {
+            let b = batch("s", epoch, seq);
+            assert!(matches!(s.reserve(&b), Reserve::New));
+            at.push(log_it(&mut log, &s, &b));
+        }
+        assert!(at.iter().all(|(lsn, m)| s.retains(*lsn, m)));
+        assert_eq!(s.set_floor("s", 2), 2, "the two of epoch 1, in RAM");
+        assert_eq!(s.set_floor("s", 2), 0, "once");
+        let live: Vec<bool> = at.iter().map(|(lsn, m)| s.retains(*lsn, m)).collect();
+        assert_eq!(live, [false, false, true, true]);
+    }
+
+    /// A store over tiny segments with `n` batches of s/w epoch 1, all absorbed and out of RAM.
+    fn dormant(dir: &tempfile::TempDir, n: u64) -> (precog_storage::Log, Store) {
+        let mut c = precog_storage::Config::new(dir.path().join("log"));
+        (c.segment_size, c.spares) = (4096 + 400, 0);
+        let mut log = precog_storage::Log::open(c).unwrap();
+        let db = Db::open(&dir.path().join("streams.redb"), 1 << 20).unwrap();
+        let s = Store::open(log.reader(), db).unwrap();
+        // (then another stream's, so the segments holding all of s/w are sealed)
+        for (stream, seq) in (0..n)
+            .map(|q| ("s", q))
+            .chain((0..8).map(|q| ("filler", q)))
+        {
+            let b = batch(stream, 1, seq);
+            assert!(matches!(s.reserve(&b), Reserve::New));
+            log_it(&mut log, &s, &b);
+        }
+        s.absorb();
+        s.checkpoint().unwrap();
+        s.evict(
+            Dormancy {
+                idle_ms: 0,
+                budget: 0,
+            },
+            0,
+        );
+        (log, s)
+    }
+
+    #[test]
+    fn a_stream_whose_summary_does_not_read_is_left_as_it_is() {
+        // Why: a delete of a stream out of RAM reads its summary first. If that read fails,
+        // nothing is known of the stream: writing a floor for it would replace its summary
+        // with an empty one, and its logs and totals would be lost. The delete is not applied
+        // (and logged); the stream answers as before once its summary reads again.
+        let dir = tempfile::tempdir().unwrap();
+        let (_log, s) = dormant(&dir, 12);
+        assert!(!s.streams_in_ram().contains(&"s".to_string()), "out of RAM");
+        s.db.set_failpoint(Some("summary:read"));
+        assert_eq!(s.set_floor("s", 2), 0);
+        s.db.set_failpoint(None);
+        s.checkpoint().unwrap();
+        assert_eq!(
+            (s.floor("s"), s.tail(0, Some("s"), 1 << 20).0.len()),
+            (0, 12)
+        );
+        assert_eq!(s.frontiers(Some("s"))[0].high, 12);
+        // and then it deletes
+        assert_eq!(s.set_floor("s", 2), 12);
+        assert_eq!(
+            (s.floor("s"), s.tail(0, Some("s"), 1 << 20).0.len()),
+            (2, 0)
+        );
+        // a feed of every stream, with both streams out of RAM again: their floors are read
+        // from their summaries, the deleted one's and the other's
+        s.checkpoint().unwrap();
+        s.evict(
+            Dormancy {
+                idle_ms: 0,
+                budget: 0,
+            },
+            0,
+        );
+        assert!(!s.streams_in_ram().contains(&"s".to_string()), "out of RAM");
+        let fed: Vec<String> = (s.tail(0, None, 1 << 20).0.into_iter())
+            .map(|b| b.id.log.stream)
+            .collect();
+        assert!(
+            !fed.is_empty() && fed.iter().all(|x| x == "filler"),
+            "{fed:?}"
+        );
+    }
+
+    #[test]
+    fn a_segment_whose_index_does_not_read_serves_nothing_of_a_deleted_log_all_the_same() {
+        // Why: forgetting a log's absorbed batches reads their segments' indexes, for the
+        // totals. An index that does not read must not leave the batches served: nothing below
+        // a floor is served, by rule. (Their bytes stay counted until the segment is dropped.)
+        let dir = tempfile::tempdir().unwrap();
+        let (_log, s) = dormant(&dir, 12);
+        let before = s.stream_bytes("s");
+        let mut indexes = vec![];
+        for e in std::fs::read_dir(dir.path().join("log")).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|x| x == "idx") {
+                indexes.push((p.clone(), std::fs::read(&p).unwrap()));
+                std::fs::File::options()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            }
+        }
+        let forgot = s.set_floor("s", 2);
+        assert!(forgot < 12, "{forgot}: the sealed segments' did not read");
+        assert_eq!(s.floor("s"), 2);
+        assert!(s.stream_bytes("s") > 0 && s.stream_bytes("s") <= before);
+        assert_eq!(s.tail(0, Some("s"), 1 << 20).0.len(), 0);
+        for seq in 0..12 {
+            assert!(s.get(&batch("s", 1, seq).id).is_none());
+            assert!(matches!(s.reserve(&batch("s", 1, seq)), Reserve::Expired));
+        }
+        // the indexes read again (the fault was passing): the batches the delete could not
+        // forget are still not served, by the reads that walk a segment's index off the lock
+        for (p, bytes) in indexes {
+            std::fs::write(p, bytes).unwrap();
+        }
+        assert_eq!(s.read("s", 0, 1000).0.len(), 0, "the event-time read");
+        assert_eq!(s.read_cursor("s", &Cursor::new(), 1 << 20).0.len(), 0);
+        assert_eq!(s.tail(0, Some("s"), 1 << 20).0.len(), 0);
+        assert_eq!(s.read("filler", 0, 1000).0.len(), 8, "the index reads");
+    }
+
+    #[test]
+    fn a_replacement_logged_across_a_delete_is_deleted_with_its_log() {
+        // Why: repair replaces bytes a majority does not hold: it checks the batch is there
+        // (`replaceable`), awaits the replacement's write, then indexes it (`replace`). A
+        // delete in between forgot the batch; the replacement must not bring it back.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = precog_storage::Config::new(dir.path().join("log"));
+        c.spares = 0;
+        let mut log = precog_storage::Log::open(c).unwrap();
+        let s = Store::load(log.reader()).unwrap();
+        let (old, kept) = (batch("s", 1, 0), batch("s", 2, 0));
+        for b in [&old, &kept] {
+            assert!(matches!(s.reserve(b), Reserve::New));
+            log_it(&mut log, &s, b);
+        }
+        let theirs = |epoch| {
+            let log = LogId {
+                stream: "s".into(),
+                writer: "w".into(),
+                epoch,
+            };
+            Batch::parse(Batch::encode(&log, 0, &[(0, &[9u8; 30][..])]).unwrap()).unwrap()
+        };
+        assert!(s.replaceable(&theirs(1)) && s.replaceable(&theirs(2)));
+        assert_eq!(s.set_floor("s", 2), 1);
+        for epoch in [1, 2] {
+            let lsn = write(&mut log, &theirs(epoch), true).0;
+            s.replace(&theirs(epoch), lsn);
+        }
+        // the deleted log's is gone and counted nowhere; the other log's took its batch's place
+        assert!(s.get(&old.id).is_none());
+        let fed: Vec<u32> = (s.tail(0, Some("s"), 1 << 20).0.iter())
+            .map(|b| b.ident)
+            .collect();
+        assert_eq!(fed, [theirs(2).ident]);
+        assert_eq!(s.stream_bytes("s"), theirs(2).bytes.len() as u64);
+        assert_eq!(s.totals().0, 1);
+    }
+
+    #[test]
+    fn a_delete_across_the_cleaners_copy_leaves_the_copy_dead() {
+        // Why: the cleaner checks a record is retained, awaits its copy's write, then tells
+        // the store the batch moved. A delete in between forgot the batch: its copy has no
+        // place to take. It must not stop the node (`moved` used to index the old record
+        // without looking), nor be served from its new place; another stream's moves as ever.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, s) = dormant(&dir, 12);
+        let copies = ["s", "filler"].map(|stream| {
+            let old = s.lsns(stream)[0];
+            let r = log.reader().read(old).unwrap().unwrap();
+            assert!(s.retains(old, &r.meta));
+            (old, r)
+        });
+        assert_eq!(s.set_floor("s", 2), 12);
+        for (old, r) in &copies {
+            let lsn = log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
+            s.moved([(*old, lsn, &r.meta, r.payload.len() as u32)]);
+        }
+        assert_eq!(s.tail(0, Some("s"), 1 << 20).0.len(), 0);
+        assert_eq!((s.stream_bytes("s"), s.totals().0), (0, 8));
+        assert_eq!(s.tail(0, Some("filler"), 1 << 20).0.len(), 8);
+    }
+
+    #[test]
+    fn a_floors_record_stored_and_not_applied_is_applied_when_the_node_next_starts() {
+        // Why: a node applies a delete when its record becomes durable there. A node that
+        // stored the record and did not apply it (its stream's summary did not read at that
+        // moment; a node of a version before deletes stores the record as any batch) has a
+        // checkpoint that covers the record, so the replay passes over it. Without another
+        // look at the floors' records it holds, that node would serve the stream for good.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut log, s) = dormant(&dir, 12);
+        // (the floors' stream is in RAM from here)
+        let first = floor_batch(0, "elsewhere", 5);
+        assert!(matches!(s.reserve(&first), Reserve::New));
+        log_it(&mut log, &s, &first);
+        s.db.set_failpoint(Some("summary:read"));
+        let f = floor_batch(1, "s", 2);
+        assert!(matches!(s.reserve(&f), Reserve::New));
+        log_it(&mut log, &s, &f);
+        s.db.set_failpoint(None);
+        s.checkpoint().unwrap();
+        assert_eq!(
+            (s.floor("s"), s.tail(0, Some("s"), 1 << 20).0.len()),
+            (0, 12),
+            "stored, not applied"
+        );
+        let db = s.db.share();
+        drop(s);
+        let s = Store::open(log.reader(), db).unwrap();
+        // (a stream whose summary already holds its floor is not loaded to learn so)
+        let in_ram = s.streams_in_ram();
+        assert!(!in_ram.contains(&"elsewhere".to_string()), "{in_ram:?}");
+        assert_eq!(
+            (s.floor("s"), s.tail(0, Some("s"), 1 << 20).0.len()),
+            (2, 0)
+        );
+        assert_eq!((s.floor("elsewhere"), s.floor("filler")), (5, 0));
+        assert!(matches!(s.reserve(&batch("s", 1, 12)), Reserve::Expired));
+    }
+
+    #[test]
+    fn a_feed_waits_at_a_stream_whose_summary_does_not_read() {
+        // Why: the feed of every stream reads a dormant stream's floors from its summary. If
+        // that read fails, the stream may be deleted for all the feed knows, or not: serving
+        // its records could serve what a delete covered, and passing over them would skip
+        // them for a subscriber for good. The feed stops at the record and serves it, or
+        // not, once the summary reads.
+        let dir = tempfile::tempdir().unwrap();
+        let (_log, s) = dormant(&dir, 12);
+        assert_eq!(s.set_floor("s", 2), 12);
+        s.checkpoint().unwrap();
+        s.evict(
+            Dormancy {
+                idle_ms: 0,
+                budget: 0,
+            },
+            0,
+        );
+        s.db.set_failpoint(Some("summary:read"));
+        let (fed, next) = s.tail(0, None, 1 << 20);
+        assert_eq!((fed.len(), next), (0, 0));
+        s.db.set_failpoint(None);
+        let (fed, next) = s.tail(0, None, 1 << 20);
+        assert!(next > 12 && !fed.is_empty());
+        assert!(fed.iter().all(|b| b.id.log.stream == "filler"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        /// Why: a delete must delete exactly the writer logs below its epoch, for good: what
+        /// the node holds of them (in RAM, in absorbed segments, out of RAM), what was reserved
+        /// before it and lands after, what a restart replays, and whatever is handed to the
+        /// node later. And nothing else: the logs at or above it, and other streams.
+        #[test]
+        fn a_delete_forgets_the_logs_below_its_epoch_for_good_and_nothing_else(small: bool, ops in ops()) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = precog_storage::Config::new(dir.path().join("log"));
+            c.segment_size = if small { 4096 + 400 } else { 1 << 20 };
+            c.spares = 0;
+            let mut log_ = precog_storage::Log::open(c).unwrap();
+            let db = Db::open(&dir.path().join("streams.redb"), 1 << 20).unwrap();
+            let mut s = Store::open(log_.reader(), db).unwrap();
+            // another stream, never deleted
+            let other = batch("t", 1, 0);
+            prop_assert!(matches!(s.reserve(&other), Reserve::New));
+            log_it(&mut log_, &s, &other);
+            // the reference: (epoch, seq) -> durable, and the floor
+            let mut held: BTreeMap<(u64, u64), bool> = BTreeMap::new();
+            let (mut floor, mut pending, mut deletes) = (0u64, Vec::<Batch>::new(), 0u64);
+            let size = batch("s", 1, 0).bytes.len() as u64;
+            for op in ops {
+                match op {
+                    Op::Reserve(epoch, seq) => {
+                        let b = batch("s", epoch, seq);
+                        let want = match held.get(&(epoch, seq)) {
+                            _ if epoch < floor => "expired",
+                            Some(_) => "dup",
+                            None => "new",
+                        };
+                        let got = match s.reserve(&b) {
+                            Reserve::New => "new",
+                            Reserve::Duplicate(_) => "dup",
+                            Reserve::Expired => "expired",
+                            _ => "other",
+                        };
+                        prop_assert_eq!(got, want, "epoch {} seq {} floor {}", epoch, seq, floor);
+                        if want == "new" {
+                            held.insert((epoch, seq), false);
+                            pending.push(b);
+                        }
+                    }
+                    Op::Durable(i) if !pending.is_empty() => {
+                        let b = pending.remove(i.index(pending.len()));
+                        log_it(&mut log_, &s, &b);
+                        let k = (b.id.log.epoch, b.id.first_seq);
+                        // reserved before the floor arrived: logged, and deleted with its log
+                        if k.0 < floor {
+                            held.remove(&k);
+                        } else {
+                            held.insert(k, true);
+                        }
+                    }
+                    Op::Delete(epoch) => {
+                        // as the node deletes: a record of the floors' stream, applied as it
+                        // becomes durable (a second stream's too, and events that are none)
+                        let log = LogId { stream: FLOORS.into(), writer: "node-0".into(), epoch: 1 };
+                        let evs = [encode_floor("s", epoch), encode_floor("new", 9), b"short".to_vec(),
+                            encode_floor("", 9), encode_floor("__own", 9)];
+                        let evs: Vec<(u64, &[u8])> = evs.iter().map(|e| (0, &e[..])).collect();
+                        let b = Batch::parse(Batch::encode(&log, 8 * deletes, &evs).unwrap()).unwrap();
+                        let r = s.reserve(&b);
+                        prop_assert!(matches!(r, Reserve::New), "{}", match r {
+                            Reserve::Duplicate(_) => "dup".into(),
+                            Reserve::Conflict(e) | Reserve::Error(e) => e,
+                            _ => "expired".to_string(),
+                        });
+                        log_it(&mut log_, &s, &b);
+                        deletes += 1;
+                        floor = floor.max(epoch);
+                        // (a pending one stays reserved until it is durable or the node restarts)
+                        held.retain(|k, d| !*d || k.0 >= floor);
+                    }
+                    Op::Doze => {
+                        s.absorb();
+                        s.checkpoint().unwrap();
+                        s.evict(Dormancy { idle_ms: 0, budget: 0 }, 0);
+                    }
+                    Op::Crash(logged) => {
+                        // one reserved batch reached the log before the crash: the replay
+                        // finds it, and settles it as if it had become durable
+                        if let Some(b) = pending.first().filter(|_| logged) {
+                            write(&mut log_, b, false);
+                            let k = (b.id.log.epoch, b.id.first_seq);
+                            held.insert(k, k.0 >= floor);
+                        }
+                        let db = s.db.share();
+                        drop(s);
+                        s = Store::open(log_.reader(), db).unwrap();
+                        // (the floor is back: from its summary, or from its record replayed)
+                        pending.clear();
+                        held.retain(|_, d| *d);
+                    }
+                    _ => {}
+                }
+                prop_assert_eq!(s.floor("s"), floor);
+                let durable: Vec<(u64, u64)> = held.iter().filter(|x| *x.1).map(|x| *x.0).collect();
+                // served: by identity, by the feed in log order, by the event-time read
+                for epoch in 1..4 {
+                    for seq in 0..4 {
+                        let id = batch("s", epoch, seq).id;
+                        prop_assert_eq!(s.get(&id).is_some(), durable.contains(&(epoch, seq)), "{:?}", id);
+                    }
+                }
+                let mut fed: Vec<(u64, u64)> = (s.tail(0, Some("s"), 1 << 20).0.iter())
+                    .map(|b| (b.id.log.epoch, b.id.first_seq))
+                    .collect();
+                fed.sort_unstable();
+                prop_assert_eq!(&fed, &durable, "the feed");
+                prop_assert_eq!(s.read("s", 0, 1000).0.len(), durable.len(), "the event-time read");
+                // counted: the stream's bytes, the node's batches (the other stream's one too)
+                prop_assert_eq!(s.stream_bytes("s"), size * durable.len() as u64);
+                prop_assert_eq!(s.totals().0, durable.len() as u64 + 1 + deletes);
+                if deletes > 0 {
+                    prop_assert_eq!((s.floor("new"), s.floor(""), s.floor("__own")), (9, 0, 0));
+                }
+                prop_assert!(s.get(&other.id).is_some(), "another stream's");
+                // a deleted log's frontier lacks nothing: repair asks no peer for it
+                for f in s.frontiers(Some("s")).iter().filter(|f| f.log.epoch < floor) {
+                    prop_assert_eq!(f.contiguous, f.high, "{:?}", f);
+                }
+            }
+        }
+    }
+}
+
 /// Model-based test of a stream's own retention (`Store::trim_stream`) against a reference: its
 /// batches oldest first, and what an age limit or a byte limit forgets of them.
 #[cfg(test)]
@@ -5466,6 +6140,8 @@ mod model_dormant {
         FailRead(usize, usize),
         /// the second store: a crash, back to its checkpoint and the log past it
         Crash,
+        /// a stream deleted below an epoch (writer `a` is epoch 1, `b` epoch 2)
+        Delete(usize, u64),
     }
 
     fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -5473,6 +6149,7 @@ mod model_dormant {
             prop_oneof![
                 6 => (0usize..2, 0usize..2, 0u64..8, 1u32..3, 0u8..2)
                     .prop_map(|(s, w, q, n, v)| Op::Reserve(s, w, q, n, v)),
+                1 => (0usize..2, 1u64..4).prop_map(|(s, e)| Op::Delete(s, e)),
                 5 => any::<usize>().prop_map(Op::Durable),
                 1 => any::<usize>().prop_map(Op::Fail),
                 2 => Just(Op::Absorb),
@@ -5495,7 +6172,7 @@ mod model_dormant {
         LogId {
             stream: ["s", "t"][s].into(),
             writer: ["a", "b"][w].into(),
-            epoch: 1,
+            epoch: 1 + w as u64,
         }
     }
 
@@ -5609,8 +6286,15 @@ mod model_dormant {
         let ((mut la, a), (mut lb, mut b)) = (open(&dir, "a"), open(&dir, "b"));
         let mut pending: Vec<Batch> = vec![];
         let mut written: Vec<(Batch, Lsn)> = vec![];
+        let mut floors: BTreeMap<&str, u64> = BTreeMap::new();
         for op in ops {
             match op {
+                Op::Delete(s, epoch) => {
+                    let stream = ["s", "t"][s];
+                    prop_assert_eq!(a.set_floor(stream, epoch), b.set_floor(stream, epoch));
+                    let f = floors.entry(stream).or_insert(0);
+                    *f = (*f).max(epoch);
+                }
                 Op::Reserve(s, w, seq, n, v) => {
                     let x = batch(&log(s, w), seq, n, v);
                     let (ka, kb) = (kind(a.reserve(&x)), kind(b.reserve(&x)));
@@ -5762,6 +6446,11 @@ mod model_dormant {
                     }
                     for (x, lsn) in written.drain(..) {
                         a.mark_durable(&x, lsn);
+                    }
+                    // (a floor set here is in no record: one set after the last checkpoint is
+                    // set again, as the replay of its record would)
+                    for (stream, &epoch) in &floors {
+                        b.set_floor(stream, epoch);
                     }
                     a.absorb(); // as the restart does
                     b.absorb();

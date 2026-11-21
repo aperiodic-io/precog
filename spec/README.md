@@ -27,6 +27,8 @@ property or model test runs (below).
 | Stream classes: which config a stream has; the cleaner's properties with the streams' retention from classes | proptest | The lookup against the rule spelled out (own entry, else the longest class prefix); the cleaner's invariants do not depend on how a stream got its retention | `node::props_classes`, `node::props_cleaner` (`classes`) |
 | A stream's own retention: what a trim forgets by age and by bytes, of batches in RAM, absorbed, out of RAM and copied forward, and that a trim with nothing to forget reads no index | proptest, model-based | A read asks for a trim before it is served: it must be exact, and free when nothing is due | `store::model_trim` |
 | The cleaner's copy against a batch forgotten meanwhile by another task (a read's trim, a delete) | TLA+ / TLC | An interleaving across the await of the copy's write | `spec/store/Cleaner.tla` |
+| Deleting a stream: an epoch floor that replicates as a record, through batches in flight, crashes, a node down during it and a lost disk | TLA+ / TLC | Its failure modes are interleavings: a batch reserved before the floor and durable after, a restart replaying what was deleted, a stale peer handing the stream back | `spec/mesh/Delete.tla` |
+| Deleting a stream at the code: what a delete forgets and refuses, against a reference, through the floors' stream, streams leaving RAM and restarts; the floor's choice | proptest, model-based | The model's rules are the store's `reserve`, `settle` and `open`; a twin store checks them with dormant streams | `store::model_delete`, `store::model_dormant`, `node::props_delete` |
 | Scoped tokens: what a token reaches, what each request needs, who a connection is | proptest | The scope rule against the rule spelled out; the handshake against a table of every token as a client and as a peer, with and without a peers' token | `node::props_tokens` |
 | The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
@@ -236,6 +238,45 @@ Not a dormancy bug, left as it is: a stream's retention floor compares (append t
 LSN) across its logs, so a batch logged in the same millisecond as a forgotten one with a lower
 sequence, or written before it and marked durable after, is hidden once absorbed (on main too);
 the twin model gives batches distinct append times and absorbs at a restart.
+
+## Deleting a stream: `spec/mesh/Delete.tla`
+
+`Control::Delete` (`Node::delete_stream`, `Inner::set_floor`, `Inner::settle`). One stream; a
+writer log is its epoch and holds one batch; a batch reaches a node from a client or a peer, is
+reserved, then durable; a delete is a floor that reaches peers as batches do; repair replaces a
+batch with the majority's bytes in two steps (found durable, then indexed once written); nodes
+crash (what they had reserved or were replacing may or may not have reached the log) and lose
+disks.
+
+| Config | Bounds | Checks |
+|---|---|---|
+| `MC_delete` | 3 nodes, epochs 1..2, 2 deletes, copies 2 | `DeletedStaysDeleted` (a node holding a floor holds nothing below it), `AckedIsDeleted` (a floor is above every batch acknowledged before it) |
+| `MC_delete_lostdisk` | the same, one disk lost | `DeletedStaysDeleted` |
+| `MC_delete_lostdisk_acked` | the same | expects `AckedIsDeleted` to fail: a known limit (the nodes asked may not hold an acknowledged batch after a disk loss, as for `Client::end`) |
+| `MC_delete_norefuse` | no refusal and no drop at durable | expects `DeletedStaysDeleted` to fail: a peer that was down hands the stream back |
+| `MC_delete_norecheck` | refusal only | expects it to fail: a batch reserved before the floor is indexed after it |
+| `MC_delete_noreapply` | a restart replays without the floor | expects it to fail |
+| `MC_delete_noresettle` | a replacement is indexed without the check at durable | expects it to fail: a delete between the two steps of a replacement, which a review of the code found (`Store::replace`) |
+| `MC_delete_onenode` | the floor from the accepting node alone | expects `AckedIsDeleted` to fail: a batch acknowledged on the two other nodes survives |
+
+What the model found before any code: refusing a batch at reservation is not what keeps a
+deleted stream deleted (with the drop at durable, `DeletedStaysDeleted` holds without it; the
+refusal is for the client); the drop at durable and the floor at restart are. What the model
+tests found in the code: the live feed's own filter of absorbed records served a deleted batch of
+a stream out of RAM, and floors held beside the summaries were applied twice after a restart
+from a checkpoint that already had them (so the floor moved into the summary).
+
+An invariant named `Converged` was removed: its premise assumed what it concluded, so it held
+of any model. Convergence of what nodes hold is repair's (`Replication.tla`).
+
+Not in the model:
+- the floor's value (`delete_floor`, a property test);
+- the record's own replication (it is a batch: `Replication.tla`), and its retention: here a
+  floor reaches a peer at any later time, while a node away for longer than the log keeps the
+  record never gets it (docs/ARCHITECTURE.md, "Deleting a stream", Limits);
+- a record stored and not applied (`Store::reapply_floors`: a unit test in
+  `store::model_delete`), and what the node keeps outside its log (compacted values, dedup ids:
+  `node::props_delete`).
 
 ## The cleaner's copy and a batch forgotten meanwhile: `spec/store/Cleaner.tla`
 

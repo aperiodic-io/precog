@@ -200,6 +200,18 @@ impl Client {
             .with_context(|| format!("the end of {stream} needs {need} nodes, {answered} answered"))
     }
 
+    /// Deletes the stream: every writer log of it there is, on every node, for good. Returns
+    /// the epoch it is deleted below (0: there was nothing of it to delete). A producer created
+    /// after this (its epoch is the clock, above any before it) writes a new stream of the
+    /// name; one created before is refused.
+    pub async fn delete(&self, stream: &str) -> Result<u64> {
+        let c = Control::Delete {
+            stream: stream.into(),
+        };
+        let (_, r) = self.control(self.preferred(stream), &c).await?;
+        r.deleted().with_context(|| format!("unexpected {r:?}"))
+    }
+
     /// A compacted stream's newest value of every key, by key.
     pub async fn latest(&self, stream: &str) -> Result<Vec<(Vec<u8>, Bytes)>> {
         match self
