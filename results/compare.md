@@ -231,6 +231,26 @@ A further attempt to cut CPU, sending each batch to `copies - 1` peers first wit
 | steady state (retention reached: no zero-fill of new segments) | 1.38 us |
 | pace the background zero-fill (fixed 100k/s across a roll) | p99 456 -> 10 ms |
 
+## Dormant streams on disk, before and after #29 (2026-11-20, 23:25-23:40 UTC)
+
+Same harness and standard settings (brokers at 1 CPU / 4000Mi, `RETENTION=600000000 WARMUP=20 BATCH=250 FLUSH_MS=100`,
+20% resends, 2,000 in flight), alternating main before #29 (28c6808) and after (9e13042), 3 rounds, Precog only. A
+4-vCPU cloud container: compare within this section only. Raw runs: `results/dormant-compare.jsonl`.
+
+| | records/s | p50 ack | p99 ack | broker CPU per record |
+|---|---:|---:|---:|---:|
+| Before #29 | 484,500 | 3.68 ms | 8.72 ms | 1.61 us |
+| After #29 | 484,100 | 3.70 ms | 9.10 ms | 1.66 us (+3%) |
+
+Runs (records/s, p50, p99, us/record):
+
+- **Before:** 484k/3.71/8.72/1.609, 504k/3.53/8.28/1.597, 484k/3.68/9.10/1.627.
+- **After:** 491k/3.62/9.09/1.634, 473k/3.76/9.55/1.686, 484k/3.70/9.10/1.659.
+
+Throughput and p50 do not move. CPU per record is higher in every round (+1.5% to +5%), p99 in two of three: each
+node's retention pass (every second here) now writes a checkpoint to the streams database, a redb commit with its
+fsync, when anything changed.
+
 ## Caveats
 
 - The VM is noisy: identical runs differ by up to ~20%; the tables give medians, the runs are in
