@@ -287,9 +287,25 @@ struct Peer {
     down_until: parking_lot::Mutex<Option<Instant>>,
 }
 
+/// What a client token did, for `/metrics`.
+#[derive(Default)]
+struct Traffic {
+    appends: AtomicU64,
+    append_bytes: AtomicU64,
+    requests: AtomicU64,
+    sent_bytes: AtomicU64,
+    refused: AtomicU64,
+}
+
 pub struct Node {
     pub cfg: NodeConfig,
     pub store: Store,
+    /// Per client token: the unscoped one, then the scoped ones as the config lists them.
+    traffic: Vec<Traffic>,
+    /// Batches a stream's own retention forgot, by its config key (its name, or its class).
+    trimmed: parking_lot::Mutex<BTreeMap<String, u64>>,
+    /// Deletes this node accepted (`delete_stream`) that deleted something.
+    deletes: AtomicU64,
     wal: Wal,
     peers: Vec<Arc<Peer>>,
     repair_lock: tokio::sync::Mutex<()>,
@@ -774,6 +790,9 @@ impl Node {
         store.end_checkpoint(p, synced)?;
         store.set_failpoint(cfg.storage_failpoints.fail_at); // tests: faults past the open
         let node = Arc::new(Node {
+            traffic: (0..=cfg.tokens.len()).map(|_| Traffic::default()).collect(),
+            trimmed: Default::default(),
+            deletes: AtomicU64::new(0),
             cfg,
             store,
             wal,
@@ -1006,6 +1025,7 @@ impl Node {
         // here at once (the copies may be the peers' while this node's is still being written)
         self.store.set_floor(stream, epoch);
         self.forget_deleted(stream, epoch);
+        self.deletes.fetch_add(1, Ordering::Relaxed);
         Ok(epoch)
     }
 
@@ -1096,8 +1116,9 @@ impl Node {
     pub async fn apply_retention(&self) -> Result<()> {
         // sealed segments' batches leave RAM (their index is on disk)
         self.store.absorb();
-        self.write_snapshots()?;
         let now = crate::store::now_ms();
+        self.expire_positions(now);
+        self.write_snapshots()?;
         for (name, s) in &self.cfg.streams {
             self.store
                 .trim_stream(name, s.retention_bytes, s.retention_ms, now);
@@ -1130,9 +1151,37 @@ impl Node {
     /// be served: a stream idle on disk is not trimmed by the passes, and nothing older than
     /// its age limit may be served.
     fn expire(&self, stream: &str, now: u64) {
-        if let Some((_, c)) = self.cfg.stream(stream) {
-            self.store
-                .trim_stream(stream, c.retention_bytes, c.retention_ms, now);
+        if let Some((key, c)) = self.cfg.stream(stream) {
+            let n = (self.store).trim_stream(stream, c.retention_bytes, c.retention_ms, now);
+            if n > 0 {
+                *self.trimmed.lock().entry(key.into()).or_default() += n as u64;
+            }
+        }
+    }
+
+    /// Drops the readers' positions that are older than their stream's age limit: everything
+    /// at or before such a position has expired, so a reader that comes back with it reads
+    /// what one without a position reads. One per group and stream would otherwise stay for
+    /// good. (A restart may replay an expired one from the log; the next pass drops it again.
+    /// A position of unknown age, from a snapshot of an older format, stays.)
+    fn expire_positions(&self, now_ms: u64) {
+        if let Some(m) = self.compact.lock().get_mut(POSITIONS) {
+            m.retain(|key, ((time_us, ..), ..)| {
+                let stream = std::str::from_utf8(key)
+                    .ok()
+                    .and_then(|k| k.split_once('\0'));
+                let age = stream.and_then(|(_, s)| self.cfg.stream(s)?.1.retention_ms);
+                *time_us == 0 || age.is_none_or(|a| now_ms.saturating_sub(*time_us / 1000) <= a)
+            });
+        }
+    }
+
+    /// The client token's counters (none for a peer: its requests are the cluster's own).
+    fn traffic(&self, ident: Ident) -> Option<&Traffic> {
+        match ident {
+            Ident::Client => self.traffic.first(),
+            Ident::Scoped(i) => self.traffic.get(i + 1),
+            Ident::Peer(_) => None,
         }
     }
 
@@ -1405,8 +1454,60 @@ impl Node {
                 "precog_retention_forced_total{{stream=\"{stream}\"}} {n}\n"
             ));
         }
-        // per reader group and stream: events not yet covered by its committed position, and how
-        // long ago it committed (what kafka-exporter gives live-ingestion's alerts)
+        out.push_str("# TYPE precog_retention_trimmed_batches_total counter\n");
+        for (key, n) in self.trimmed.lock().iter() {
+            let key = label(key);
+            out.push_str(&format!(
+                "precog_retention_trimmed_batches_total{{stream=\"{key}\"}} {n}\n"
+            ));
+        }
+        let deletes = self.deletes.load(Ordering::Relaxed);
+        out.push_str(&format!(
+            "# TYPE precog_stream_deletes_total counter\nprecog_stream_deletes_total {deletes}\n"
+        ));
+        // per client token, under its prefixes (never the token: a secret); tokens with the
+        // same prefixes count together
+        let mut by_token: BTreeMap<String, [u64; 5]> = BTreeMap::new();
+        for (i, t) in self.traffic.iter().enumerate() {
+            let name = match i.checked_sub(1) {
+                Some(i) => self.cfg.tokens[i].prefixes.join(","),
+                None => "*".into(),
+            };
+            let all = [
+                &t.appends,
+                &t.append_bytes,
+                &t.requests,
+                &t.sent_bytes,
+                &t.refused,
+            ];
+            let sum = by_token.entry(name).or_default();
+            for (s, v) in sum.iter_mut().zip(all) {
+                *s += v.load(Ordering::Relaxed);
+            }
+        }
+        let names = [
+            "appends",
+            "append_bytes",
+            "requests",
+            "sent_bytes",
+            "refused",
+        ];
+        for (i, what) in names.iter().enumerate() {
+            out.push_str(&format!("# TYPE precog_token_{what}_total counter\n"));
+            for (name, v) in &by_token {
+                let (name, v) = (label(name), v[i]);
+                out.push_str(&format!(
+                    "precog_token_{what}_total{{token=\"{name}\"}} {v}\n"
+                ));
+            }
+        }
+        // readers: events not yet covered by a group's committed position, and how long ago it
+        // committed (what kafka-exporter gives live-ingestion's alerts). Per group and stream
+        // for a stream the config names or no class covers; a class's streams are counted
+        // under the class, however many there are, and only those in RAM count towards its
+        // lag (a scrape loads no stream).
+        // ponytail: a scrape still visits every position; counts kept as positions are
+        // committed and expire if that shows.
         let positions: Vec<(Vec<u8>, u64, Bytes)> =
             self.compact.lock().get(POSITIONS).map_or(vec![], |m| {
                 m.iter()
@@ -1417,12 +1518,28 @@ impl Node {
             "# TYPE precog_group_lag_events gauge\n# TYPE precog_group_commit_age_seconds gauge\n",
         );
         let now = crate::store::now_ms();
+        let in_ram: HashSet<String> = match self.classes {
+            true => self.store.streams_in_ram().into_iter().collect(),
+            false => HashSet::new(),
+        };
+        let mut classes: BTreeMap<&str, (u64, u64)> = (self.cfg.streams.keys())
+            .filter(|k| k.ends_with('*'))
+            .map(|k| (k.as_str(), (0, 0)))
+            .collect();
         for (key, lsn, payload) in positions {
             let Some((group, stream)) = std::str::from_utf8(&key)
                 .ok()
                 .and_then(|k| k.split_once('\0'))
             else {
                 continue;
+            };
+            let class = (self.cfg.stream(stream)).and_then(|(k, _)| classes.get_mut(k));
+            let class = match class {
+                Some(c) if !in_ram.contains(stream) => {
+                    c.0 += 1;
+                    continue;
+                }
+                c => c,
             };
             let Ok(entries) = serde_json::from_slice::<Vec<(String, u64, u64)>>(&payload) else {
                 continue;
@@ -1441,6 +1558,10 @@ impl Node {
                     )
                 })
                 .sum();
+            if let Some(c) = class {
+                (c.0, c.1) = (c.0 + 1, c.1 + lag);
+                continue;
+            }
             let labels = format!("group=\"{}\",stream=\"{}\"", label(group), label(stream));
             out.push_str(&format!("precog_group_lag_events{{{labels}}} {lag}\n"));
             let at = self.wal.reader.entries(lsn, 1).unwrap_or_else(|e| {
@@ -1453,6 +1574,14 @@ impl Node {
                     "precog_group_commit_age_seconds{{{labels}}} {age}\n"
                 ));
             }
+        }
+        out.push_str("# TYPE precog_class_positions gauge\n# TYPE precog_class_lag_events gauge\n");
+        for (class, (n, lag)) in classes {
+            let class = label(class);
+            out.push_str(&format!(
+                "precog_class_positions{{stream=\"{class}\"}} {n}\n\
+                 precog_class_lag_events{{stream=\"{class}\"}} {lag}\n"
+            ));
         }
         out
     }
@@ -1601,9 +1730,13 @@ impl Node {
                 let need = sub.stream.as_deref().map_or(Need::All, Need::Read);
                 self.allow(ident, need).map(|()| sub)
             });
+        let traffic = self.traffic(ident);
         let sub = match sub {
             Ok(s) => s,
             Err(e) => {
+                if let Some(t) = traffic {
+                    t.refused.fetch_add(1, Ordering::Relaxed);
+                }
                 let _ = tx
                     .send(Frame::new(
                         Kind::Error,
@@ -1657,6 +1790,10 @@ impl Node {
                     Some((start, next, held)) => self.in_log_order(*start, next, held, b),
                 };
                 for b in out {
+                    if let Some(t) = traffic {
+                        t.sent_bytes
+                            .fetch_add(b.bytes.len() as u64, Ordering::Relaxed);
+                    }
                     if tx
                         .send(Frame::new(Kind::Push, req.req_id, b.bytes))
                         .await
@@ -1754,11 +1891,31 @@ impl Node {
         }
     }
 
+    /// Serves a request, and counts it under its client token.
     async fn handle(self: &Arc<Self>, f: Frame, ident: Ident) -> Result<Frame> {
+        let control = f.kind == Kind::Control;
+        let r = self.serve(f, ident).await;
+        if let Some(t) = self.traffic(ident).filter(|_| control) {
+            t.requests.fetch_add(1, Ordering::Relaxed);
+            match &r {
+                Ok(f) => t
+                    .sent_bytes
+                    .fetch_add(f.body.len() as u64, Ordering::Relaxed),
+                Err(e) => {
+                    let refused = e.to_string().starts_with("forbidden");
+                    t.refused.fetch_add(refused as u64, Ordering::Relaxed)
+                }
+            };
+        }
+        r
+    }
+
+    async fn serve(self: &Arc<Self>, f: Frame, ident: Ident) -> Result<Frame> {
         let id = f.req_id;
         match f.kind {
             Kind::Append => {
                 let (copies, batch) = decode_append(f.body)?;
+                let traffic = self.traffic(ident);
                 let reject = |crc| {
                     let ack = Ack {
                         status: AckStatus::Rejected,
@@ -1766,6 +1923,9 @@ impl Node {
                         nodes: 0,
                         crc,
                     };
+                    if let Some(t) = traffic {
+                        t.refused.fetch_add(1, Ordering::Relaxed);
+                    }
                     Ok(Frame::new(Kind::Ack, id, ack.encode()))
                 };
                 // the node's own streams (readers' positions, deletes) are written by the node:
@@ -1782,7 +1942,12 @@ impl Node {
                     tracing::debug!("append refused: {e}");
                     return reject(b.ident);
                 }
+                let len = batch.len() as u64;
                 let ack = self.append(copies, batch).await;
+                if let Some(t) = traffic.filter(|_| ack.is_success()) {
+                    t.appends.fetch_add(1, Ordering::Relaxed);
+                    t.append_bytes.fetch_add(len, Ordering::Relaxed);
+                }
                 Ok(Frame::new(Kind::Ack, id, ack.encode()))
             }
             Kind::Replicate => {
@@ -4494,6 +4659,325 @@ mod props_delete {
         assert!(node.append(1, keyed("ev", 2, 0)).await.is_success());
         let dropped = node.dedup_dropped.load(Ordering::Relaxed);
         assert_eq!((seqs(&node, "ev"), dropped), (vec![(2, 0)], 0));
+    }
+}
+
+#[cfg(test)]
+mod props_metrics {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    fn config(dir: &std::path::Path) -> NodeConfig {
+        let mut c = NodeConfig::single(0, "a", dir.into(), "tok".into());
+        (c.segment_size, c.peer_token) = (16 << 10, Some("peers".into()));
+        let age = |ms| StreamConfig {
+            retention_ms: ms,
+            ..Default::default()
+        };
+        c.streams.insert("s/*".into(), age(Some(5_000)));
+        c.streams.insert("s/long/*".into(), age(None));
+        c.streams.insert("named".into(), age(Some(10_000)));
+        let token = |token: &str, prefixes: &[&str]| TokenConfig {
+            token: token.into(),
+            prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            read: true,
+            write: true,
+        };
+        c.tokens = vec![
+            token("t0", &["s/"]),
+            token("t1", &["x/", "y/"]),
+            token("t2", &["s/"]),
+        ];
+        c
+    }
+
+    fn log(stream: &str) -> LogId {
+        LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        }
+    }
+
+    async fn write(node: &Arc<Node>, stream: &str, n: u64) {
+        for seq in 0..n {
+            let b = Batch::encode(&log(stream), seq, &[(seq, b"x")]).unwrap();
+            assert!(node.append(1, b).await.is_success());
+        }
+    }
+
+    async fn commit(node: &Arc<Node>, group: &str, stream: &str, at: u64) {
+        let pos: Cursor = [(log(stream), at)].into_iter().collect();
+        node.commit_position(group, stream, &pos).await.unwrap();
+    }
+
+    /// The series of a metric, by their labels.
+    fn series(m: &str, name: &str) -> BTreeMap<String, u64> {
+        (m.lines()
+            .filter_map(|l| l.strip_prefix(name)?.strip_prefix('{')))
+        .map(|l| {
+            let (labels, v) = l.rsplit_once("} ").unwrap();
+            (labels.to_string(), v.parse().unwrap())
+        })
+        .collect()
+    }
+
+    const STREAMS: [&str; 6] = ["named", "free", "s/1", "s/2", "s/long/1", "s/long/2"];
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(12))]
+
+        /// Why: with a stream per session, a series per reader group and stream grows without
+        /// bound, and so does every scrape. The series of a scrape are those of the rule
+        /// spelled out here: a position on a class's stream is counted under its class (one
+        /// series a class, however many streams and groups), with the events its readers lag
+        /// by; a stream the config names keeps a series per group, as an operator's alerts on
+        /// it expect, and so does a stream no config covers (as before classes).
+        #[test]
+        fn a_scrape_s_reader_series_are_per_class_except_for_streams_named_or_uncovered(
+            commits in prop::collection::vec((0usize..3, 0usize..6, 0u64..4), 0..12),
+        ) {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let m = rt.block_on(async {
+                let node = Node::open(config(d.path())).await.unwrap();
+                for stream in STREAMS {
+                    write(&node, stream, 4).await;
+                }
+                for &(g, s, at) in &commits {
+                    commit(&node, &format!("g{g}"), STREAMS[s], at).await;
+                }
+                node.metrics()
+            });
+            // the reference: the last commit of each (group, stream)
+            let last: BTreeMap<(usize, usize), u64> = commits.iter().map(|&(g, s, at)| ((g, s), at)).collect();
+            let (mut own, mut count, mut lag) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+            for (&(g, s), &at) in &last {
+                let class = match STREAMS[s] {
+                    x if x.starts_with("s/long/") => "s/long/*",
+                    x if x.starts_with("s/") => "s/*",
+                    _ => {
+                        own.insert(format!("group=\"g{g}\",stream=\"{}\"", STREAMS[s]), 4 - at);
+                        continue;
+                    }
+                };
+                *count.entry(format!("stream=\"{class}\"")).or_insert(0) += 1;
+                *lag.entry(format!("stream=\"{class}\"")).or_insert(0) += 4 - at;
+            }
+            for class in ["s/*", "s/long/*"] {
+                // (a class without positions has its series all the same: a count of 0)
+                count.entry(format!("stream=\"{class}\"")).or_insert(0);
+                lag.entry(format!("stream=\"{class}\"")).or_insert(0);
+            }
+            prop_assert_eq!(series(&m, "precog_group_lag_events"), own.clone());
+            prop_assert_eq!(series(&m, "precog_group_commit_age_seconds").len(), own.len());
+            prop_assert_eq!(series(&m, "precog_class_positions"), count);
+            prop_assert_eq!(series(&m, "precog_class_lag_events"), lag);
+        }
+
+        /// Why: a reader's position is kept in RAM and in a snapshot, one per group and stream,
+        /// and with a stream per session they would pile up for good. A position older than
+        /// its stream's age limit points at nothing the stream still holds (everything at or
+        /// before it has expired), so a retention pass drops it, and a reader that comes back
+        /// later starts where the stream now starts. Others stay: of a stream without an age
+        /// limit, and younger ones. After a restart the log may give an expired one back; the
+        /// next pass drops it again.
+        #[test]
+        fn a_position_expires_with_its_stream_s_age_limit_and_no_sooner(
+            ops in prop::collection::vec(prop_oneof![
+                4 => (0usize..2, 0usize..6).prop_map(|(g, s)| (g, s, 0)),
+                // a pass, this many seconds from now (ages are 5 s and 10 s); a restart
+                2 => prop_oneof![Just(0u64), Just(2), Just(7), Just(30)].prop_map(|t| (9, 0, t)),
+                1 => Just((8, 0, 0)),
+            ], 1..14),
+        ) {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            rt.block_on(async {
+                let mut node = Node::open(config(d.path())).await.unwrap();
+                for stream in STREAMS {
+                    write(&node, stream, 1).await;
+                }
+                // the reference: each position's commit time, as the node recorded it
+                let mut held = BTreeMap::new();
+                let mut later = 0;
+                for (g, s, t) in ops {
+                    match g {
+                        9 => later = later.max(t), // (time does not go back)
+                        8 => {
+                            drop(node);
+                            tokio::time::sleep(Duration::from_millis(300)).await; // the WAL thread releases its lock
+                            node = Node::open(config(d.path())).await.unwrap();
+                        }
+                        _ => {
+                            let group = format!("g{g}");
+                            commit(&node, &group, STREAMS[s], 1).await;
+                            let key = position_key(&group, STREAMS[s]);
+                            let at_us = node.compact.lock()[POSITIONS][&key].0.0;
+                            held.insert((g, s), at_us / 1000);
+                            continue;
+                        }
+                    }
+                    // (the clock the test runs on moves too: restarts take a while)
+                    let now = crate::store::now_ms() + later * 1000;
+                    node.expire_positions(now);
+                    let limit = |s: usize| match STREAMS[s] {
+                        "named" => Some(10_000),
+                        "s/1" | "s/2" => Some(5_000),
+                        _ => None,
+                    };
+                    held.retain(|&(_, s), at| limit(s).is_none_or(|l| now - *at <= l));
+                    let got: BTreeSet<(usize, usize)> = (0..2)
+                        .flat_map(|g| (0..6).map(move |s| (g, s)))
+                        .filter(|&(g, s)| node.position(&format!("g{g}"), STREAMS[s]).is_some())
+                        .collect();
+                    let want: BTreeSet<(usize, usize)> = held.keys().copied().collect();
+                    assert_eq!(got, want, "{later} s later");
+                }
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn as_many_series_at_ten_sessions_as_at_seventy_and_a_scrape_loads_no_idle_stream() {
+        // Why: `/metrics` is read every few seconds. Its size must not grow with the sessions,
+        // and counting a class's lag must not load its idle streams from disk, or a scrape
+        // costs what the node holds: the class's lag is that of its streams in RAM, and its
+        // positions are counted without their streams.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = config(d.path());
+        (c.dormant_after_ms, c.hot_streams_bytes) = (0, 0);
+        let node = Node::open(c).await.unwrap();
+        let mut lines = vec![];
+        for round in [10usize, 60] {
+            for i in 0..round {
+                let stream = format!("s/{round}-{i}");
+                write(&node, &stream, 4).await;
+                commit(&node, &format!("g{i}"), &stream, 1).await;
+            }
+            lines.push(node.metrics().lines().count());
+        }
+        assert_eq!(lines[0], lines[1], "as many series at 10 streams as at 70");
+        let class = r#"stream="s/*""#.to_string();
+        let m = node.metrics();
+        assert_eq!(series(&m, "precog_class_positions")[&class], 70);
+        assert_eq!(series(&m, "precog_class_lag_events")[&class], 70 * 3);
+        // sealed, absorbed and out of RAM
+        for seq in 0..8 {
+            let b = Batch::encode(&log("filler"), seq, &[(seq, &[0u8; 5_000][..])]).unwrap();
+            assert!(node.append(1, b).await.is_success());
+        }
+        node.apply_retention().await.unwrap();
+        let in_ram = node.store.streams_in_ram();
+        assert!(!in_ram.iter().any(|s| s.starts_with("s/")), "{in_ram:?}");
+        let loads = node.store.hot_stats().loads;
+        let m = node.metrics();
+        assert_eq!(node.store.hot_stats().loads, loads, "no stream loaded");
+        assert_eq!(series(&m, "precog_class_positions")[&class], 70);
+        assert_eq!(series(&m, "precog_class_lag_events")[&class], 0);
+        // one of them written to again: in RAM, and its readers' lag counted
+        let b = Batch::encode(&log("s/10-3"), 4, &[(4, b"x")]).unwrap();
+        assert!(node.append(1, b).await.is_success());
+        assert_eq!(
+            series(&node.metrics(), "precog_class_lag_events")[&class],
+            4
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_token_s_traffic_is_counted_under_its_prefixes_never_its_secret() {
+        // Why: an operator sees who writes and reads how much, and who is being refused, per
+        // tenant: the basis for metering and for finding a noisy neighbour. The label is the
+        // token's prefixes (two tokens of one tenant, as during a rotation, count together):
+        // the token itself is a secret, and `/metrics` is not behind one.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(config(d.path())).await.unwrap();
+        let append = |ident: Ident, stream: &str, seq: u64| {
+            let b = Batch::encode(&log(stream), seq, &[(seq, b"0123456789")]).unwrap();
+            let (node, len) = (node.clone(), b.len() as u64);
+            async move {
+                let f = Frame::new(Kind::Append, 1, encode_append(1, &b));
+                let ack = parse_frame_ack(&node.handle(f, ident).await.unwrap()).unwrap();
+                (ack.is_success(), len)
+            }
+        };
+        let read = |ident: Ident, stream: &str| {
+            let c = Control::Read {
+                stream: stream.into(),
+                from_time_us: 0,
+                limit: 10,
+            };
+            let (node, body) = (node.clone(), Bytes::from(serde_json::to_vec(&c).unwrap()));
+            async move {
+                let r = node.handle(Frame::new(Kind::Control, 1, body), ident).await;
+                r.map(|f| f.body.len() as u64)
+            }
+        };
+        let (mut bytes, mut sent) = (0, 0);
+        for (ident, seq) in [
+            (Ident::Scoped(0), 0),
+            (Ident::Scoped(2), 1),
+            (Ident::Scoped(0), 2),
+        ] {
+            let (ok, len) = append(ident, "s/1", seq).await;
+            assert!(ok);
+            bytes += len;
+        }
+        for stream in ["x/1", "named"] {
+            assert!(!append(Ident::Scoped(0), stream, 0).await.0);
+        }
+        assert!(read(Ident::Scoped(0), "x/1").await.is_err());
+        sent += read(Ident::Scoped(2), "s/1").await.unwrap();
+        let (ok, one) = append(Ident::Scoped(1), "x/1", 0).await;
+        let (ok2, whole) = append(Ident::Client, "named", 0).await;
+        assert!(ok && ok2);
+        // (a peer's requests are the cluster's own: under no token)
+        read(Ident::Peer(1), "s/1").await.unwrap();
+        let m = node.metrics();
+        for secret in ["t0", "t1", "t2", "tok", "peers"] {
+            assert!(!m.contains(&format!("\"{secret}\"")), "a token in\n{m}");
+        }
+        let by = |name: &str| series(&m, name);
+        let (acme, other, all) = ("token=\"s/\"", "token=\"x/,y/\"", "token=\"*\"");
+        let want = |a, b, c| {
+            [(acme, a), (other, b), (all, c)]
+                .map(|(l, v)| (l.to_string(), v))
+                .into()
+        };
+        assert_eq!(by("precog_token_appends_total"), want(3, 1, 1));
+        assert_eq!(
+            by("precog_token_append_bytes_total"),
+            want(bytes, one, whole)
+        );
+        assert_eq!(by("precog_token_requests_total"), want(2, 0, 0));
+        assert_eq!(by("precog_token_sent_bytes_total"), want(sent, 0, 0));
+        assert_eq!(by("precog_token_refused_total"), want(3, 0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trims_and_deletes_are_counted() {
+        // Why: retention by class and deletes act without anyone asking. An operator needs to
+        // see them happen (or not): batches trimmed, by class or by the stream's own name,
+        // and the deletes this node accepted.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(config(d.path())).await.unwrap();
+        for stream in ["named", "s/1", "s/2", "free"] {
+            write(&node, stream, 3).await;
+        }
+        let later = crate::store::now_ms() + 7_000;
+        for stream in ["named", "s/1", "s/2", "free"] {
+            node.expire(stream, later);
+        }
+        node.delete_stream("free").await.unwrap();
+        node.delete_stream("nothing").await.unwrap();
+        let m = node.metrics();
+        let trimmed = series(&m, "precog_retention_trimmed_batches_total");
+        assert_eq!(trimmed, [(r#"stream="s/*""#.to_string(), 6)].into());
+        assert!(
+            m.lines().any(|l| l == "precog_stream_deletes_total 1"),
+            "{m}"
+        );
     }
 }
 
