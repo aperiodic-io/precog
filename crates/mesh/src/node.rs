@@ -3645,12 +3645,35 @@ mod props_delete {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_node_s_own_records_are_acknowledged_on_a_majority() {
+        // Why: a delete and a reader's position are acknowledged to their caller once durable
+        // on this many nodes. One fewer, and the loss of one node loses an acknowledged delete.
+        let d = tempfile::tempdir().unwrap();
+        let peer = |id: u32, domain: &str| PeerConfig {
+            id,
+            domain: domain.into(),
+            addr: "tcp://127.0.0.1:1".parse().unwrap(),
+        };
+        for (peers, want) in [
+            (vec![], 1),
+            (vec![peer(1, "b")], 2),
+            (vec![peer(1, "b"), peer(2, "c")], 2),
+        ] {
+            let dir = d.path().join(format!("n{}", peers.len()));
+            let mut c = NodeConfig::single(0, "a", dir, "tok".into());
+            (c.peers, c.segment_size) = (peers, 1 << 20);
+            assert_eq!(Node::open(c).await.unwrap().majority(), want);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_deleted_stream_is_gone_for_good_and_a_new_one_of_its_name_works() {
         // Why: a delete on request (a user's session, erased) must leave nothing of the stream
         // readable and take nothing of it back, across a restart, while the name stays usable
         // for writers that start after it and other streams are untouched.
         let d = tempfile::tempdir().unwrap();
         let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 1 << 20;
         c.tokens = vec![TokenConfig {
             token: "acme".into(),
             prefixes: vec!["acme/".into()],

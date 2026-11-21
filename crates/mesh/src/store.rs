@@ -5320,7 +5320,7 @@ mod model_delete {
         Batch::parse(Batch::encode(&log, seq, &[(seq, &[7u8; 30][..])]).unwrap()).unwrap()
     }
 
-    fn log_it(log: &mut precog_storage::Log, s: &Store, b: &Batch) {
+    fn log_it(log: &mut precog_storage::Log, s: &Store, b: &Batch) -> (Lsn, Meta) {
         let m = Meta {
             key: encode_log_key(&b.id.log),
             first_seq: b.id.first_seq,
@@ -5328,8 +5328,34 @@ mod model_delete {
             tag: batch_crc(&b.bytes),
             time_ms: log.next_lsn(),
         };
-        let lsn = log.append(&[(m, &b.bytes[..])]).unwrap();
+        let lsn = log.append(&[(m.clone(), &b.bytes[..])]).unwrap();
         s.mark_durable(b, lsn);
+        (lsn, m)
+    }
+
+    #[test]
+    fn a_delete_counts_what_it_forgot_and_the_cleaner_copies_nothing_of_a_deleted_log() {
+        // Why: the cleaner copies forward what a stream still retains, and asks again for each
+        // record just before it copies (`Store::retains`). A record of a deleted log must not
+        // be copied into a newer segment, where it would outlive the bytes the delete left to
+        // be dropped; one at or above the floor still is.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = precog_storage::Config::new(dir.path().join("log"));
+        c.spares = 0;
+        let mut log = precog_storage::Log::open(c).unwrap();
+        let db = Db::open(&dir.path().join("streams.redb"), 1 << 20).unwrap();
+        let s = Store::open(log.reader(), db).unwrap();
+        let mut at = vec![];
+        for (epoch, seq) in [(1, 0), (1, 1), (2, 0), (3, 0)] {
+            let b = batch("s", epoch, seq);
+            assert!(matches!(s.reserve(&b), Reserve::New));
+            at.push(log_it(&mut log, &s, &b));
+        }
+        assert!(at.iter().all(|(lsn, m)| s.retains(*lsn, m)));
+        assert_eq!(s.set_floor("s", 2), 2, "the two of epoch 1, in RAM");
+        assert_eq!(s.set_floor("s", 2), 0, "once");
+        let live: Vec<bool> = at.iter().map(|(lsn, m)| s.retains(*lsn, m)).collect();
+        assert_eq!(live, [false, false, true, true]);
     }
 
     /// A store over tiny segments with `n` batches of s/w epoch 1, all absorbed and out of RAM.
@@ -5383,6 +5409,24 @@ mod model_delete {
         assert_eq!(
             (s.floor("s"), s.tail(0, Some("s"), 1 << 20).0.len()),
             (2, 0)
+        );
+        // a feed of every stream, with both streams out of RAM again: their floors are read
+        // from their summaries, the deleted one's and the other's
+        s.checkpoint().unwrap();
+        s.evict(
+            Dormancy {
+                idle_ms: 0,
+                budget: 0,
+            },
+            0,
+        );
+        assert!(!s.streams_in_ram().contains(&"s".to_string()), "out of RAM");
+        let fed: Vec<String> = (s.tail(0, None, 1 << 20).0.into_iter())
+            .map(|b| b.id.log.stream)
+            .collect();
+        assert!(
+            !fed.is_empty() && fed.iter().all(|x| x == "filler"),
+            "{fed:?}"
         );
     }
 
