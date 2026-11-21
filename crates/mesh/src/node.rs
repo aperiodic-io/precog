@@ -4736,7 +4736,8 @@ mod props_metrics {
                 for stream in STREAMS {
                     write(&node, stream, 1).await;
                 }
-                let mut held = BTreeSet::new();
+                // the reference: each position's commit time, as the node recorded it
+                let mut held = BTreeMap::new();
                 let mut later = 0;
                 for (g, s, t) in ops {
                     match g {
@@ -4747,23 +4748,29 @@ mod props_metrics {
                             node = Node::open(config(d.path())).await.unwrap();
                         }
                         _ => {
-                            commit(&node, &format!("g{g}"), STREAMS[s], 1).await;
-                            held.insert((g, s));
+                            let group = format!("g{g}");
+                            commit(&node, &group, STREAMS[s], 1).await;
+                            let key = position_key(&group, STREAMS[s]);
+                            let at_us = node.compact.lock()[POSITIONS][&key].0.0;
+                            held.insert((g, s), at_us / 1000);
                             continue;
                         }
                     }
-                    node.expire_positions(crate::store::now_ms() + later * 1000);
+                    // (the clock the test runs on moves too: restarts take a while)
+                    let now = crate::store::now_ms() + later * 1000;
+                    node.expire_positions(now);
                     let limit = |s: usize| match STREAMS[s] {
-                        "named" => Some(10),
-                        "s/1" | "s/2" => Some(5),
+                        "named" => Some(10_000),
+                        "s/1" | "s/2" => Some(5_000),
                         _ => None,
                     };
-                    held.retain(|&(_, s)| limit(s).is_none_or(|l| later <= l));
+                    held.retain(|&(_, s), at| limit(s).is_none_or(|l| now - *at <= l));
                     let got: BTreeSet<(usize, usize)> = (0..2)
                         .flat_map(|g| (0..6).map(move |s| (g, s)))
                         .filter(|&(g, s)| node.position(&format!("g{g}"), STREAMS[s]).is_some())
                         .collect();
-                    assert_eq!(got, held, "{later} s later");
+                    let want: BTreeSet<(usize, usize)> = held.keys().copied().collect();
+                    assert_eq!(got, want, "{later} s later");
                 }
             });
         }
