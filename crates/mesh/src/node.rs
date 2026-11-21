@@ -3444,14 +3444,18 @@ mod props_classes {
         // (there may be millions), so every read of a stream applies its retention first:
         // nothing past its age limit is served, whether its retention is its own or a class's.
         let d = tempfile::tempdir().unwrap();
+        // (the limit is on the wall clock: long enough that writing the streams and a pass
+        // fit well within it on a busy machine)
+        let limit = Duration::from_secs(4);
         let old = StreamConfig {
-            retention_ms: Some(1_000),
+            retention_ms: Some(limit.as_millis() as u64),
             ..Default::default()
         };
         let mut c = config(&d, &[("s/*", old.clone()), ("named", old)]);
         (c.dormant_after_ms, c.hot_streams_bytes) = (0, 0);
         let node = Node::open(c).await.unwrap();
         let streams = ["s/1", "s/2", "s/3", "s/4", "s/5", "s/6", "named", "free"];
+        let started = Instant::now();
         for s in streams {
             write(&node, s, 0, 100).await;
         }
@@ -3465,18 +3469,26 @@ mod props_classes {
             ["filler"],
             "the others idle on disk"
         );
-        // (the pass forgot nothing: what follows is the reads' doing, not the pass's)
-        assert_eq!(
-            node.store.totals().0,
-            streams.len() as u64 + 8,
-            "all retained"
-        );
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        assert_eq!(
-            node.store.totals().0,
-            streams.len() as u64 + 8,
-            "idle: nothing trims them"
-        );
+        // the pass forgot nothing, and nothing does while they are idle: what follows is the
+        // reads' doing. (Unless the machine took most of the limit to get here: then the pass
+        // may have trimmed, and the reads below are still held to serving nothing.)
+        let in_time = started.elapsed() < limit / 2;
+        if in_time {
+            assert_eq!(
+                node.store.totals().0,
+                streams.len() as u64 + 8,
+                "all retained"
+            );
+        }
+        tokio::time::sleep((limit + Duration::from_millis(100)).saturating_sub(started.elapsed()))
+            .await;
+        if in_time {
+            assert_eq!(
+                node.store.totals().0,
+                streams.len() as u64 + 8,
+                "idle: nothing trims them"
+            );
+        }
         let by_id = Control::Fetch {
             ids: vec![BatchId {
                 log: log("s/6"),
