@@ -27,7 +27,7 @@ Only what live-ingestion uses is built.
 | **Anti-entropy repair**: every node converges to the union of all copies, so a restarted node catches up by itself | partition replication and recovery |
 | **Cursors valid on every node** and **reader groups** with committed positions: consumers fail over between nodes and resume where they committed | consumer groups and committed offsets |
 | **A stream's end on a quorum** (`Client::end`), for readers that must prove they have read everything acked | high watermark |
-| **Lag and health**: `/metrics` (`precog_group_lag_events`, `precog_group_commit_age_seconds`) and `/health` | Redpanda's metrics endpoint |
+| **Lag and health**: `/metrics` (`precog_group_lag_events`, `precog_group_commit_age_seconds`; per class and per token where configured) and `/health` | Redpanda's metrics endpoint |
 | **Kubernetes deployment**: StatefulSet config from DNS peers, the node id from the pod's ordinal, image `ghcr.io/aperiodic-io/precog` | the Redpanda StatefulSet |
 | **Scoped tokens**: a token confined to stream prefixes, to read, write or both; a separate token for peers | ACLs by topic prefix |
 | **Stream delete** (`Client::delete`): every writer log of the stream, on every node, for good; a node that was down cannot hand it back | `rpk topic delete` |

@@ -41,6 +41,9 @@ pub struct Mesh {
     tenants: std::collections::HashMap<String, Arc<MeshClient>>,
     /// The epoch each deleted stream was deleted below.
     floors: std::collections::HashMap<String, u64>,
+    /// Where node 0's metrics listen, and a number of series a scenario noted.
+    metrics_port: u16,
+    noted: usize,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -224,7 +227,7 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[given(
-    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" retains (\d+) MiB)?(, where idle streams leave RAM)?(?:, where tenant "(\w+)" holds a token for "([\w/]+)" and peers have their own token)?$"#
+    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" (?:retains (\d+) MiB|keeps (\d+) seconds))?(, where idle streams leave RAM)?(?:, where tenant "(\w+)" holds a token for "([\w/]+)" and peers have their own token)?$"#
 )]
 #[allow(clippy::too_many_arguments)]
 async fn cluster(
@@ -234,6 +237,7 @@ async fn cluster(
     retention_mb: String,
     stream: String,
     stream_mb: String,
+    stream_s: String,
     dormant: String,
     tenant: String,
     prefix: String,
@@ -267,9 +271,13 @@ async fn cluster(
         if !dormant.is_empty() {
             v["dormant_after_ms"] = 0.into();
         }
-        if !stream.is_empty() {
-            let mb: u64 = stream_mb.parse().unwrap();
+        // (scraped by the metrics scenarios; the nodes' own ports are the first of the ten)
+        v["listen_metrics"] = format!("127.0.0.1:{}", base + 5 + i as u16).into();
+        if let Ok(mb) = stream_mb.parse::<u64>() {
             v["streams"] = serde_json::json!({ stream.clone(): { "retention_bytes": mb << 20 } });
+        }
+        if let Ok(s) = stream_s.parse::<u64>() {
+            v["streams"] = serde_json::json!({ stream.clone(): { "retention_ms": s * 1000 } });
         }
         if !tenant.is_empty() {
             // as an operator writes it: `read` and `write` left out
@@ -278,6 +286,7 @@ async fn cluster(
         }
         std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     }
+    w.metrics_port = base + 5;
     let cf: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("cluster.json")).unwrap()).unwrap();
     let addrs: Vec<Addr> = cf["nodes"]
@@ -1039,5 +1048,117 @@ async fn oldest_gone_everywhere(w: &mut Mesh, stream: String) {
     let ws = w.writers.iter().find(|x| x.stream == stream).unwrap();
     for i in 0..w.n {
         assert!(w.fetch(i, ws, &[0]).await.is_empty(), "node {i}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metrics and readers' positions (features/metrics.feature)
+
+/// A node's `/metrics`, as a scraper reads it.
+async fn scrape(w: &Mesh, node: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = format!("127.0.0.1:{}", w.metrics_port + node as u16);
+    let mut s = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").await.unwrap();
+    let mut body = String::new();
+    s.read_to_string(&mut body).await.unwrap();
+    body
+}
+
+/// The series of a scrape: its lines that are not comments or headers.
+fn series_of(m: &str) -> Vec<&str> {
+    m.lines().filter(|l| l.starts_with("precog_")).collect()
+}
+
+#[when(
+    regex = r#"^(\d+)(?: more)? sessions of (\d+) batches are written under "([\w/]+)" and a reader group commits a position in each through node (\d+)$"#
+)]
+async fn sessions(w: &mut Mesh, n: usize, batches: u64, prefix: String, node: usize) {
+    for _ in 0..n {
+        let i = new_writer(w, 500, 2);
+        w.writers[i].stream = format!("{prefix}session-{i}");
+        w.append(i, batches).await;
+        let ws = &w.writers[i];
+        let c = Control::Commit {
+            group: "ui".into(),
+            stream: ws.stream.clone(),
+            cursor: vec![(ws.name.clone(), ws.epoch, ws.acked)],
+        };
+        w.client().control(node, &c).await.unwrap();
+    }
+}
+
+#[then(regex = r#"^node (\d+)'s metrics count (\d+) positions under class "([\w/*-]+)"$"#)]
+async fn class_positions(w: &mut Mesh, node: usize, n: usize, class: String) {
+    let m = scrape(w, node).await;
+    let line = format!("precog_class_positions{{stream=\"{class}\"}} {n}");
+    assert!(
+        series_of(&m).contains(&line.as_str()),
+        "no {line:?} in\n{m}"
+    );
+    // and no series of a session's own
+    let own: Vec<&str> = (series_of(&m).into_iter())
+        .filter(|l| l.contains("session-"))
+        .collect();
+    assert!(own.is_empty(), "{own:?}");
+}
+
+#[then(regex = r"^the number of series in node (\d+)'s metrics is noted$")]
+async fn note_series(w: &mut Mesh, node: usize) {
+    w.noted = series_of(&scrape(w, node).await).len();
+}
+
+#[then(regex = r"^node (\d+)'s metrics have as many series as noted$")]
+async fn same_series(w: &mut Mesh, node: usize) {
+    let m = scrape(w, node).await;
+    assert_eq!(series_of(&m).len(), w.noted, "{m}");
+}
+
+#[then(
+    regex = r#"^node (\d+)'s metrics count the tenant's appends under "([\w/]+)" and name no token$"#
+)]
+async fn token_series(w: &mut Mesh, node: usize, prefix: String) {
+    let m = scrape(w, node).await;
+    let head = format!("precog_token_appends_total{{token=\"{prefix}\"}} ");
+    let n: u64 = (series_of(&m).iter())
+        .find_map(|l| l.strip_prefix(head.as_str()))
+        .unwrap_or_else(|| panic!("no {head:?} in\n{m}"))
+        .parse()
+        .unwrap();
+    assert!(n > 0, "{m}");
+    for secret in ["tok-", "peers-only"] {
+        assert!(!m.contains(secret), "a token in\n{m}");
+    }
+}
+
+#[then(
+    regex = r#"^within (\d+) seconds no node holds a position of the reader group in a stream under "([\w/]+)"$"#
+)]
+async fn positions_expire(w: &mut Mesh, secs: u64, prefix: String) {
+    let streams: Vec<String> = (w.writers.iter())
+        .filter(|x| x.stream.starts_with(&prefix))
+        .map(|x| x.stream.clone())
+        .collect();
+    assert!(!streams.is_empty());
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let mut held = vec![];
+        for i in 0..w.n {
+            for stream in &streams {
+                let q = Control::Position {
+                    group: "ui".into(),
+                    stream: stream.clone(),
+                };
+                match w.client().control(i, &q).await {
+                    Ok(ControlResp::Cursor { cursor: None }) => {}
+                    r => held.push((i, stream.clone(), format!("{r:?}"))),
+                }
+            }
+        }
+        if held.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "still held: {held:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }

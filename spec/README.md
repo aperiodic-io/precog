@@ -30,6 +30,7 @@ property or model test runs (below).
 | Deleting a stream: an epoch floor that replicates as a record, through batches in flight, crashes, a node down during it and a lost disk | TLA+ / TLC | Its failure modes are interleavings: a batch reserved before the floor and durable after, a restart replaying what was deleted, a stale peer handing the stream back | `spec/mesh/Delete.tla` |
 | Deleting a stream at the code: what a delete forgets and refuses, against a reference, through the floors' stream, streams leaving RAM and restarts; the floor's choice | proptest, model-based | The model's rules are the store's `reserve`, `settle` and `open`; a twin store checks them with dormant streams | `store::model_delete`, `store::model_dormant`, `node::props_delete` |
 | Scoped tokens: what a token reaches, what each request needs, who a connection is | proptest | The scope rule against the rule spelled out; the handshake against a table of every token as a client and as a peer, with and without a peers' token | `node::props_tokens` |
+| Metrics and positions that do not grow with the sessions: which series a scrape has, and when a reader's position expires | proptest, model-based | The series against the rule spelled out (per class, per named stream, per token); positions against a reference of commit times and age limits, through restarts | `node::props_metrics` |
 | The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
@@ -613,6 +614,10 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
 - **Scoped tokens in TLA+.** Authorization is a pure function of a connection's identity and a
   request, checked once where requests enter; no interleaving of messages or crashes changes
   it. `Replication.tla` already assumes what it enforces (only a node replicates).
+- **Metrics and position expiry in TLA+.** Which series a scrape has is a function of one node's
+  config and positions; a position expires on each node by the commit's own time and the
+  config, with no message between nodes. The one interleaving, a restart that replays an
+  expired position from the log, is an operation of the property test.
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.

@@ -418,13 +418,15 @@ So a commit is bounded: a group's name is 1 to 255 bytes with no NUL, a position
 1 MiB encoded, and a scoped token's position names only writer logs its stream has on the node
 (it holds no more than the stream's writers put there; a stream nobody wrote takes no commit).
 These are checked before the commit takes its number in the node's log, so a refused commit
-leaves no sequence nobody wrote. What stays unbounded is the number of groups on a stream: each
-costs a commit's durable append, and nothing removes a group nobody reads with any more.
+leaves no sequence nobody wrote. The number of groups on a stream is bounded by time where the
+stream has an age limit: a position older than that expires ("Metrics and positions that do not
+grow with the sessions", below). On a stream without one, nothing removes a group nobody reads
+with any more.
 
 **`/metrics` is not behind a token.** It is plain HTTP on its own port (`listen_metrics`) and
-names every reader group and stream with its lag: bind it where only the operator's scraper
-reaches. Names are a client's to choose, so they are escaped as label values (`label`): a quote
-or a newline in a group's name stays inside its label.
+names reader groups and streams with their lag (per class, for a class's streams): bind it where
+only the operator's scraper reaches. Names are a client's to choose, so they are escaped as
+label values (`label`): a quote or a newline in a group's name stays inside its label.
 
 A connection carries at most 1024 live feeds (`MAX_FEEDS_PER_CONN`): a feed is a task that walks
 the node's log for as long as the connection lives, and the next one is refused.
@@ -437,6 +439,55 @@ connection is, with and without a peers' token; each way in, inside and outside 
 `props_tokens` in `tests/cluster.rs` (3 nodes over TCP; the feeds a connection carries), and
 `features/tokens.feature` (real node processes: a tenant within its prefix through a node's
 restart, and refused everything outside it).
+
+## Metrics and positions that do not grow with the sessions
+
+With a stream per session, anything kept or exported per stream grows for as long as the node
+runs. Three things did: a metric series per reader group and stream, a reader's position per
+group and stream, and nothing said who wrote how much.
+
+**Readers, per class** (`Node::metrics`). A position on a class's stream is counted under the
+class: `precog_class_positions{stream="acme/*"}` and `precog_class_lag_events{stream="acme/*"}`,
+one series each however many streams and groups the class has. The lag is that of the class's
+streams in RAM: a scrape loads no stream from disk, and an idle stream's readers are either
+caught up or will show when it is next written or read. A stream the config names keeps
+`precog_group_lag_events{group,stream}` and `precog_group_commit_age_seconds`, as
+live-ingestion's alerts expect, and so does a stream no config covers: a deployment with
+sessions gives them a class (`"*"` covers every stream).
+
+**Traffic, per token.** `precog_token_{appends,append_bytes,requests,sent_bytes,refused}_total`,
+labelled with the token's prefixes (`token="acme/"`; the unscoped token is `token="*"`), never
+the token: it is a secret, and `/metrics` is not behind one. Tokens with the same prefixes count
+together, as two tokens of one tenant do during a rotation. `append_bytes` counts acknowledged
+appends' batches as sent; `sent_bytes` what reads and live feeds returned. A peer's requests
+are the cluster's own and are counted under no token. These are per node: a tenant's total is
+the sum over nodes.
+
+**What retention and deletes did.** `precog_retention_trimmed_batches_total{stream}` counts the
+batches a stream's own retention forgot, under its config key (its name, or its class), and
+`precog_stream_deletes_total` the deletes this node accepted that deleted something.
+
+**A position expires with its stream's age limit** (`Node::expire_positions`, every retention
+pass). A position older than the limit points at nothing the stream still holds, since
+everything at or before it has expired, so a reader that comes back with it reads what a reader
+without a position reads. The position is dropped from RAM and from the next snapshot; each
+node does so by the commit's own time, so they agree without a record. A restart may replay an
+expired position from the log, and the next pass drops it again. Kept: positions on streams
+without an age limit, and positions from a snapshot of the format before commit times.
+
+Limits.
+- A scrape still visits every position the node holds (a prefix match each); the series are
+  bounded, the work is by positions (`ponytail:` in the code).
+- A stream no class covers and no config names keeps a series per group, and its positions do
+  not expire.
+- The counters are since the node started, per node. A cluster-wide total, and a bill, are the
+  gateway's (plan item C4).
+
+Tests: `node::props_metrics` (the series of a scrape against the rule spelled out, as a
+property; position expiry against a reference through restarts; a scrape that loads no stream;
+each token's counters; trims and deletes) and `features/metrics.feature` (real node processes:
+as many series at 25 sessions as at 5, a tenant's traffic under its prefix on each node, a
+position gone from every node after its stream's age limit and after a restart).
 
 ## Guarantees (and what is traded away)
 
