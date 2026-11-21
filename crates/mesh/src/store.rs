@@ -1039,8 +1039,8 @@ impl Inner {
                 if turn || !over(s.bytes, &x) {
                     match base {
                         Some(base) => {
-                            raised = turn && s.cold[&base].min < age;
-                            s.cold.get_mut(&base).unwrap().min = age;
+                            let min = &mut s.cold.get_mut(&base).unwrap().min;
+                            raised = std::mem::replace(min, age) != age;
                             s.dirty = true;
                         }
                         None => s.ram_oldest = x.time,
