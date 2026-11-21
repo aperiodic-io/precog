@@ -19,6 +19,7 @@ Only what live-ingestion uses is built.
 | Feature | What it replaces in Redpanda |
 |---|---|
 | **Streams**, named like the raw topics, each with retention by bytes and by age | topics with `retention.bytes` / `retention.ms` |
+| **Stream classes**: a config key ending in `*` gives every stream with that prefix a retention (`"acme/*"`), for streams no config can name, such as one per agent session | a topic per tenant |
 | **Compacted streams**: the newest value of every key survives retention and restarts | `cleanup.policy=compact` (the collectors' `<name>.state` topics) |
 | **Broker-side dedup** by each event's dedup id, kept for a window (5 minutes on the raw streams) | the dedup fork's `redpanda.dedup.window.ms` keyed by `redpanda-dedup-key` |
 | **Durable acks on 2 of 3 nodes**, fsync before the ack by default | `acks=all` with RF=3 |

@@ -149,6 +149,23 @@ impl NodeConfig {
         Ok(self)
     }
 
+    /// The stream's config and the key it is under: its own entry, else its class, the key
+    /// ending in `*` with the longest prefix the name starts with (`acme/*` is every stream
+    /// named `acme/...`). No class covers a stream named `__...`: those are the node's own
+    /// (reader positions), and a catch-all class must not trim them.
+    /// ponytail: tries every class; a prefix tree if a node has thousands of them
+    pub fn stream(&self, name: &str) -> Option<(&str, &StreamConfig)> {
+        if let Some((k, c)) = self.streams.get_key_value(name) {
+            return Some((k, c));
+        }
+        self.streams
+            .iter()
+            .filter_map(|(k, c)| Some((k.strip_suffix('*')?, k, c)))
+            .filter(|(prefix, ..)| name.starts_with(prefix) && !name.starts_with("__"))
+            .max_by_key(|(prefix, ..)| prefix.len())
+            .map(|(_, k, c)| (k.as_str(), c))
+    }
+
     fn storage(&self) -> precog_storage::Config {
         let mut c = precog_storage::Config::new(self.data_dir.join("log"));
         c.segment_size = self.segment_size;
@@ -257,6 +274,9 @@ pub struct Node {
     forced: parking_lot::Mutex<BTreeMap<String, u64>>,
     /// This boot, for peers following its log (`Control::Inventory`; `Store::boot`).
     incarnation: u64,
+    /// The config has a class (a `streams` key ending in `*`): streams not named in it may
+    /// have a retention too.
+    classes: bool,
 }
 
 /// Records of a peer's log per inventory request.
@@ -501,6 +521,11 @@ impl Node {
     pub async fn open(cfg: NodeConfig) -> Result<Arc<Node>> {
         anyhow::ensure!(cfg.id < 32, "node id must be < 32");
         anyhow::ensure!(cfg.peers.len() <= 31, "too many peers");
+        // a compacted stream's newest values are kept in RAM per configured name
+        if let Some((k, _)) = (cfg.streams.iter()).find(|(k, c)| k.ends_with('*') && c.compacted) {
+            bail!("stream class {k:?} cannot be compacted: name each compacted stream");
+        }
+        let classes = cfg.streams.keys().any(|k| k.ends_with('*'));
         std::fs::create_dir_all(&cfg.data_dir)?;
         let wal = Wal::open(cfg.storage())?;
         let mut dedup = cfg
@@ -579,6 +604,17 @@ impl Node {
             }));
         }
         let cfg_id = cfg.id;
+        // a class's streams the replay loaded, trimmed before this start's checkpoint covers
+        // them: a later start replays nothing of them, and a pass trims only the class's
+        // streams in RAM, so one over its retention would stay so on disk until read or written
+        if classes {
+            let now = crate::store::now_ms();
+            for name in store.streams_in_ram() {
+                if let Some((_, s)) = cfg.stream(&name) {
+                    store.trim_stream(&name, s.retention_bytes, s.retention_ms, now);
+                }
+            }
+        }
         // this boot, on disk before any peer follows it
         let incarnation = rand::random::<u64>().max(1);
         store.boot(incarnation, wal.reader.next_lsn());
@@ -610,6 +646,7 @@ impl Node {
             copied_batches: AtomicU64::new(0),
             forced: Default::default(),
             incarnation,
+            classes,
         });
         Ok(node)
     }
@@ -791,6 +828,16 @@ impl Node {
             self.store
                 .trim_stream(name, s.retention_bytes, s.retention_ms, now);
         }
+        // a class's streams: those in RAM (a stream grows only by appends, which put it there);
+        // an idle one is trimmed when a read loads it (`expire`) and when the cleaner meets it.
+        // (The streams the config names were trimmed above; with no class there is no other.)
+        if self.classes {
+            for name in self.store.streams_in_ram() {
+                if !self.cfg.streams.contains_key(&name) {
+                    self.expire(&name, now);
+                }
+            }
+        }
         self.retain_segments(now).await?;
         // what changed goes to disk; then unused streams leave RAM
         self.checkpoint().await?;
@@ -803,6 +850,49 @@ impl Node {
             d.sweep(now / 1000);
         }
         Ok(())
+    }
+
+    /// Applies the stream's retention (its own or its class's) now, as a read of it is about to
+    /// be served: a stream idle on disk is not trimmed by the passes, and nothing older than
+    /// its age limit may be served.
+    fn expire(&self, stream: &str, now: u64) {
+        if let Some((_, c)) = self.cfg.stream(stream) {
+            self.store
+                .trim_stream(stream, c.retention_bytes, c.retention_ms, now);
+        }
+    }
+
+    /// The streams with batches in the sealed segment that have a retention from a class, each
+    /// trimmed to it: the cleaner asks the segment, not every stream of every class.
+    /// ponytail: decodes every record's key; a segment's key table would name each log once
+    fn class_streams(&self, seg: &precog_storage::Sealed, now: u64) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+        if !self.classes {
+            return vec![];
+        }
+        // LSNs are dense: each chunk is the next 64k (the last may run into the next segment,
+        // whose streams are then trimmed a pass early)
+        for from in (seg.base..seg.end).step_by(1 << 16) {
+            let es = match self.wal.reader.entries(from, 1 << 16) {
+                Ok(es) => es,
+                Err(e) => {
+                    // not copied: retention then drops it, as it did before copying
+                    tracing::error!("reading the index of segment at {}: {e}", seg.base);
+                    break;
+                }
+            };
+            for e in es {
+                if let Ok((l, _)) = decode_record_key(&e.meta.key)
+                    && self.retains(&l.stream)
+                {
+                    names.insert(l.stream);
+                }
+            }
+        }
+        for name in &names {
+            self.expire(name, now);
+        }
+        names.into_iter().collect()
     }
 
     /// Writes the store's checkpoint once the log has synced what it covers.
@@ -846,9 +936,19 @@ impl Node {
         while let Some(s) = segs.get(n)
             && (n < want || !fits(cost, limit, cap.saturating_sub(left)))
         {
-            for (stream, v) in self.store.retained(&[s.base], &own, min_time) {
-                cost += v.iter().map(|k| k.cost).sum::<u64>();
-                keep.entry(stream).or_default().extend(v);
+            // each once: a stream named in the config may also be under a class
+            let of_classes = self.class_streams(s, now);
+            let own: std::collections::BTreeSet<&str> = (own.iter().copied())
+                .chain(of_classes.iter().map(|s| s.as_str()))
+                .collect();
+            let own: Vec<&str> = own.into_iter().collect();
+            // a few hundred streams at a time: `retained` reads their index runs under the
+            // store's lock, and a segment may hold a class's streams by the hundred thousand
+            for some in own.chunks(256) {
+                for (stream, v) in self.store.retained(&[s.base], some, min_time) {
+                    cost += v.iter().map(|k| k.cost).sum::<u64>();
+                    keep.entry(stream).or_default().extend(v);
+                }
             }
             left -= s.bytes;
             n += 1;
@@ -873,7 +973,7 @@ impl Node {
     /// The stream has a retention of its own, kept through the node cap (a compacted stream
     /// keeps its newest values in its snapshot instead).
     fn retains(&self, stream: &str) -> bool {
-        self.cfg.streams.get(stream).is_some_and(|c| {
+        self.cfg.stream(stream).is_some_and(|(_, c)| {
             !c.compacted && (c.retention_bytes.is_some() || c.retention_ms.is_some())
         })
     }
@@ -886,6 +986,10 @@ impl Node {
     /// `budget` bytes, cuts the oldest batches of the stream furthest over its share of the cap.
     /// Every stream with a retention of its own has an equal share, so that is the one
     /// retaining the most bytes; cut it down to the next one, then both, and so on. Counts them.
+    /// ponytail: each round asks every stream still kept for its bytes and cuts one down to the
+    /// next, so it is quadratic in the streams being cut. Fine for the handful a config names;
+    /// with a class's streams by the thousand, size the cap above what they retain (a
+    /// per-class byte quota would keep them from reaching it: docs/SESSION-LOG.md).
     fn fit(&self, keep: &mut HashMap<String, Vec<Kept>>, budget: u64) {
         let limit = self.copy_limit();
         let mut cost: u64 = keep.values().flatten().map(|k| k.cost).sum();
@@ -914,7 +1018,9 @@ impl Node {
                 tracing::error!("retention: stream {stream} could not be cut");
                 break;
             }
-            *self.forced.lock().entry(stream).or_default() += cut as u64;
+            // by the config's key: a class is one series, however many streams it has
+            let key = self.cfg.stream(&stream).map_or(stream.as_str(), |(k, _)| k);
+            *self.forced.lock().entry(key.into()).or_default() += cut as u64;
         }
     }
 
@@ -1211,6 +1317,10 @@ impl Node {
                 return;
             }
         };
+        // (a feed of every stream is in log order: it does not load idle streams to trim them)
+        if let Some(stream) = &sub.stream {
+            self.expire(stream, crate::store::now_ms());
+        }
         // A live feed sends each log in sequence from where it stood when the feed began (a
         // log new to this node: from its start), holding a batch that lands before its
         // predecessor: the client joins a log at the first batch it sees.
@@ -1351,6 +1461,11 @@ impl Node {
                 let c: Control = serde_json::from_slice(&f.body)?;
                 if let Control::Fetch { ids } = &c {
                     let mut out = BytesMut::new();
+                    let streams: HashSet<&str> =
+                        ids.iter().map(|i| i.log.stream.as_str()).collect();
+                    for stream in streams {
+                        self.expire(stream, crate::store::now_ms());
+                    }
                     for bid in ids {
                         if let Some(b) = self.store.get(bid) {
                             if out.len() + b.bytes.len() > MAX_FRAME_BYTES - 1024 {
@@ -1370,6 +1485,7 @@ impl Node {
                 {
                     let max = (*max_bytes as usize).min(MAX_FRAME_BYTES / 2);
                     let mut out = BytesMut::new();
+                    self.expire(&log.stream, crate::store::now_ms());
                     for b in self.store.log_batches(log, *from_seq, max) {
                         out.put_u32_le(b.len() as u32);
                         out.put_slice(&b);
@@ -1384,6 +1500,7 @@ impl Node {
                 {
                     let cursor = crate::store::cursor_from_wire(cursor.clone(), stream);
                     let max = (*max_bytes as usize).min(MAX_FRAME_BYTES / 2);
+                    self.expire(stream, crate::store::now_ms());
                     let (batches, _) = self.store.read_cursor(stream, &cursor, max);
                     let mut out = BytesMut::new();
                     for b in batches {
@@ -1411,6 +1528,7 @@ impl Node {
                 from_time_us,
                 limit,
             } => {
+                self.expire(&stream, crate::store::now_ms());
                 let (events, coverage) =
                     self.store
                         .read(&stream, from_time_us, limit.min(10_000) as usize);
@@ -1439,6 +1557,7 @@ impl Node {
                 })
             }
             Control::CursorAt { stream, time_ms } => {
+                self.expire(&stream, crate::store::now_ms());
                 let c = self.store.cursor_at(&stream, time_ms);
                 ControlResp::Cursor {
                     cursor: Some(crate::store::cursor_to_wire(&c, &stream)),
@@ -2028,9 +2147,16 @@ mod props_cleaner {
 
     const STREAMS: [&str; 4] = ["low", "mid", "high", "bare"];
 
+    /// The same four streams where the first two get their retention from a class.
+    const IN_CLASSES: [&str; 4] = ["low/a", "mid/b", "high", "bare"];
+
     fn log(stream: usize, writer: usize) -> LogId {
+        log_of(STREAMS, stream, writer)
+    }
+
+    fn log_of(names: [&str; 4], stream: usize, writer: usize) -> LogId {
         LogId {
-            stream: STREAMS[stream].into(),
+            stream: names[stream].into(),
             writer: ["w1", "w2"][writer].into(),
             epoch: 1,
         }
@@ -2062,8 +2188,16 @@ mod props_cleaner {
     /// the writes, passes, batches slow to be marked and restarts: after a pass the log is within
     /// the cap, every stream holds the newest suffix of what was written to each of its logs
     /// (no holes, each batch once and byte for byte), and a stream with a retention of its own
-    /// that the cap did not cut holds all of its retention.
-    fn run(caching: bool, doze: bool, ops: Vec<Op>) -> Result<(), TestCaseError> {
+    /// that the cap did not cut holds all of its retention. `classes`: the streams with a
+    /// retention of their own have it from a class (`low/*`, `mid/*`) instead of by name.
+    fn run(caching: bool, doze: bool, classes: bool, ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let names = if classes { IN_CLASSES } else { STREAMS };
+        let keys = if classes {
+            ["low/*", "mid/*"]
+        } else {
+            ["low", "mid"]
+        };
+        let log = |s, w| log_of(names, s, w);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -2086,7 +2220,7 @@ mod props_cleaner {
         let own = [20_000u64, 50_000];
         for (s, m) in own.iter().enumerate() {
             c.streams.insert(
-                STREAMS[s].into(),
+                keys[s].into(),
                 StreamConfig {
                     retention_bytes: Some(*m),
                     ..Default::default()
@@ -2209,9 +2343,9 @@ mod props_cleaner {
                 // (the metric starts again with the process)
                 cut.extend(node.forced.lock().keys().cloned());
                 for (s, w) in written.iter().enumerate() {
-                    let got = cursor(&node, STREAMS[s]);
+                    let got = cursor(&node, names[s]);
                     let (mut held, mut held_bytes) = (0, 0u64);
-                    let whole = !replaced.iter().any(|l: &LogId| l.stream == STREAMS[s]);
+                    let whole = !replaced.iter().any(|l: &LogId| l.stream == names[s]);
                     for (l, seqs) in &got {
                         if replaced.contains(l) {
                             for &seq in seqs {
@@ -2253,7 +2387,7 @@ mod props_cleaner {
                         continue;
                     }
                     prop_assert_eq!(
-                        node.store.read(STREAMS[s], 0, 1 << 20).0.len(),
+                        node.store.read(names[s], 0, 1 << 20).0.len(),
                         held,
                         "once each"
                     );
@@ -2265,16 +2399,16 @@ mod props_cleaner {
                         prop_assert!(
                             held_bytes <= own[s].max(total.min(own[s])),
                             "{} over its own",
-                            STREAMS[s]
+                            names[s]
                         );
-                        if !cut.contains(STREAMS[s]) {
+                        if !cut.contains(keys[s]) {
                             if total <= own[s] {
-                                prop_assert_eq!(held, w.len(), "{} keeps all", STREAMS[s]);
+                                prop_assert_eq!(held, w.len(), "{} keeps all", names[s]);
                             } else {
                                 prop_assert!(
                                     held_bytes + most > own[s],
                                     "{} keeps its own retention",
-                                    STREAMS[s]
+                                    names[s]
                                 );
                             }
                         }
@@ -2282,7 +2416,7 @@ mod props_cleaner {
                 }
                 for (s, w) in written.iter().enumerate() {
                     // a live feed from the start: what it is served is what was written
-                    let (bs, _) = node.store.tail(0, Some(STREAMS[s]), 1 << 20);
+                    let (bs, _) = node.store.tail(0, Some(names[s]), 1 << 20);
                     for b in bs {
                         let x = w.iter().find(|x| x.0 == b.id.log && x.1 == b.id.first_seq);
                         prop_assert_eq!(x.map(|x| &x.2), Some(&b.bytes), "{:?}", b.id);
@@ -2331,9 +2465,11 @@ mod props_cleaner {
         c.tail_cache_bytes = 0; // reads go to the disk
         let cap = 6 * (16 << 10);
         c.retention_bytes = Some(cap);
-        for (s, m) in [(0, 20_000u64), (1, 50_000)] {
+        // (the second has its retention from a class: the cleaner then reads each segment's
+        // index for the class's streams too)
+        for (key, m) in [("low", 20_000u64), ("mi*", 50_000)] {
             c.streams.insert(
-                STREAMS[s].into(),
+                key.into(),
                 StreamConfig {
                     retention_bytes: Some(m),
                     ..Default::default()
@@ -2429,8 +2565,8 @@ mod props_cleaner {
         #![proptest_config(ProptestConfig::with_cases(24))]
 
         #[test]
-        fn the_cleaner_keeps_each_stream_s_retention_within_the_cap(caching: bool, doze: bool, ops in ops()) {
-            run(caching, doze, ops)?;
+        fn the_cleaner_keeps_each_stream_s_retention_within_the_cap(caching: bool, doze: bool, classes: bool, ops in ops()) {
+            run(caching, doze, classes, ops)?;
         }
 
         #[test]
@@ -2676,6 +2812,316 @@ mod props_cleaner {
         // a copy fits exactly when the room is what it reserves
         assert!(fits(1, 1000, 1 + precog_storage::SEG_HEADER));
         assert!(!fits(1, 1000, precog_storage::SEG_HEADER));
+    }
+}
+
+#[cfg(test)]
+mod props_classes {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Why: every part of the node (the passes, the cleaner, the reads) asks one function
+        /// which retention a stream has. Against the rule spelled out: its own entry, else the
+        /// class with the longest prefix it starts with, else none.
+        #[test]
+        fn a_stream_s_config_is_its_own_entry_else_its_longest_class(
+            keys in prop::collection::btree_set("[a_/]{0,3}\\*?", 0..8),
+            name in "[a_/]{0,5}\\*?",
+        ) {
+            let mut c = NodeConfig::single(0, "a", "unused".into(), "tok".into());
+            for (i, k) in keys.iter().enumerate() {
+                let own = StreamConfig { retention_bytes: Some(i as u64), ..Default::default() };
+                c.streams.insert(k.clone(), own);
+            }
+            let class = keys
+                .iter()
+                .filter(|k| k.ends_with('*') && name.starts_with(&k[..k.len() - 1]))
+                .filter(|_| !name.starts_with("__"))
+                .max_by_key(|k| k.len());
+            let want = keys.get(&name).or(class);
+            let got = c.stream(&name).map(|(k, s)| (k.to_string(), s.retention_bytes));
+            let at = |k: &String| keys.iter().position(|x| x == k).map(|i| i as u64);
+            prop_assert_eq!(got, want.map(|k| (k.clone(), at(k))));
+        }
+    }
+
+    #[test]
+    fn a_class_of_every_stream_leaves_the_node_s_own_alone() {
+        // Why: reader groups' positions are a stream of the node's own (`__positions`). A
+        // catch-all class with a short age limit would trim their batches before repair has
+        // spread them; only an entry that names such a stream configures it.
+        let mut c = NodeConfig::single(0, "a", "unused".into(), "tok".into());
+        c.streams.insert("*".into(), Default::default());
+        assert_eq!(c.stream("any").map(|x| x.0), Some("*"));
+        assert_eq!(c.stream("_one").map(|x| x.0), Some("*"));
+        assert!(c.stream(POSITIONS).is_none());
+        c.streams.insert(POSITIONS.into(), Default::default());
+        assert_eq!(c.stream(POSITIONS).map(|x| x.0), Some(POSITIONS));
+    }
+
+    fn config(dir: &tempfile::TempDir, streams: &[(&str, StreamConfig)]) -> NodeConfig {
+        let mut c = NodeConfig::single(0, "a", dir.path().into(), "tok".into());
+        c.segment_size = 16 << 10;
+        for (k, s) in streams {
+            c.streams.insert(k.to_string(), s.clone());
+        }
+        c
+    }
+
+    fn log(stream: &str) -> LogId {
+        LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        }
+    }
+
+    async fn write(node: &Arc<Node>, stream: &str, seq: u64, size: usize) {
+        let b = Batch::encode(&log(stream), seq, &[(seq, &vec![seq as u8; size][..])]).unwrap();
+        assert!(node.append(1, b).await.is_success());
+    }
+
+    /// The first sequences of the batches a control request is answered with.
+    async fn batches(node: &Arc<Node>, c: &Control) -> Vec<u64> {
+        let body = Bytes::from(serde_json::to_vec(c).unwrap());
+        let f = node
+            .handle(Frame::new(Kind::Control, 1, body), Ident::Client)
+            .await
+            .unwrap();
+        assert_eq!(f.kind, Kind::Batches);
+        let (mut b, mut out) = (f.body, vec![]);
+        while !b.is_empty() {
+            let len = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+            out.push(Batch::parse(b.slice(4..4 + len)).unwrap().id.first_seq);
+            b = b.slice(4 + len..);
+        }
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_class_cannot_be_compacted() {
+        // Why: a compacted stream's newest values live in RAM per configured name; a class of
+        // them would be accepted and then compact nothing.
+        let d = tempfile::tempdir().unwrap();
+        let compacted = StreamConfig {
+            compacted: true,
+            ..Default::default()
+        };
+        let e = Node::open(config(&d, &[("state/*", compacted.clone())])).await;
+        assert!(e.err().unwrap().to_string().contains("state/*"));
+        // a stream named so, and a class that is not compacted beside a compacted stream
+        let ok = [("state", compacted), ("s/*", Default::default())];
+        Node::open(config(&d, &ok)).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_read_serves_what_is_past_a_stream_s_age_limit_though_no_pass_ran() {
+        // Why: the passes trim the streams in RAM. A stream idle on disk is not walked by them
+        // (there may be millions), so every read of a stream applies its retention first:
+        // nothing past its age limit is served, whether its retention is its own or a class's.
+        let d = tempfile::tempdir().unwrap();
+        // (the limit is on the wall clock: long enough that writing the streams and a pass
+        // fit well within it on a busy machine)
+        let limit = Duration::from_secs(4);
+        let old = StreamConfig {
+            retention_ms: Some(limit.as_millis() as u64),
+            ..Default::default()
+        };
+        let mut c = config(&d, &[("s/*", old.clone()), ("named", old)]);
+        (c.dormant_after_ms, c.hot_streams_bytes) = (0, 0);
+        let node = Node::open(c).await.unwrap();
+        let streams = ["s/1", "s/2", "s/3", "s/4", "s/5", "s/6", "named", "free"];
+        let started = Instant::now();
+        for s in streams {
+            write(&node, s, 0, 100).await;
+        }
+        // sealed, absorbed and out of RAM, as a session stream is a while after its last event
+        for seq in 0..8 {
+            write(&node, "filler", seq, 5_000).await;
+        }
+        node.apply_retention().await.unwrap();
+        assert_eq!(
+            node.store.streams_in_ram(),
+            ["filler"],
+            "the others idle on disk"
+        );
+        // the pass forgot nothing, and nothing does while they are idle: what follows is the
+        // reads' doing. (Unless the machine took most of the limit to get here: then the pass
+        // may have trimmed, and the reads below are still held to serving nothing.)
+        let in_time = started.elapsed() < limit / 2;
+        if in_time {
+            assert_eq!(
+                node.store.totals().0,
+                streams.len() as u64 + 8,
+                "all retained"
+            );
+        }
+        tokio::time::sleep((limit + Duration::from_millis(100)).saturating_sub(started.elapsed()))
+            .await;
+        if in_time {
+            assert_eq!(
+                node.store.totals().0,
+                streams.len() as u64 + 8,
+                "idle: nothing trims them"
+            );
+        }
+        let by_id = Control::Fetch {
+            ids: vec![BatchId {
+                log: log("s/6"),
+                first_seq: 0,
+            }],
+        };
+        assert_eq!(batches(&node, &by_id).await, [0u64; 0]);
+        let cursor = |stream: &str| Control::ReadCursor {
+            stream: stream.into(),
+            cursor: vec![],
+            max_bytes: 1 << 20,
+        };
+        let fetch = |stream: &str| Control::FetchLog {
+            log: log(stream),
+            from_seq: 0,
+            max_bytes: 1 << 20,
+        };
+        assert_eq!(batches(&node, &cursor("s/1")).await, [0u64; 0]);
+        assert_eq!(batches(&node, &fetch("s/2")).await, [0u64; 0]);
+        let read = Control::Read {
+            stream: "s/3".into(),
+            from_time_us: 0,
+            limit: 10,
+        };
+        match node.control(read, Ident::Client).await.unwrap() {
+            ControlResp::Read { events, .. } => assert!(events.is_empty()),
+            r => panic!("{r:?}"),
+        }
+        // a seek to the stream's oldest finds its log already past the batch
+        let at = Control::CursorAt {
+            stream: "s/4".into(),
+            time_ms: 0,
+        };
+        match node.control(at, Ident::Client).await.unwrap() {
+            ControlResp::Cursor { cursor } => assert_eq!(cursor.unwrap(), [("w".into(), 1, 1)]),
+            r => panic!("{r:?}"),
+        }
+        // a live feed of the stream from its start
+        let (tx, mut rx) = mpsc::channel(8);
+        let sub = Subscribe {
+            stream: Some("s/5".into()),
+            from_start: true,
+        };
+        let body = Bytes::from(serde_json::to_vec(&sub).unwrap());
+        let feed = tokio::spawn(
+            node.clone()
+                .push_loop(Frame::new(Kind::Subscribe, 7, body), tx),
+        );
+        assert!(rx.recv().await.unwrap().body.is_empty(), "the feed's start");
+        write(&node, "s/5", 1, 100).await;
+        let pushed = Batch::parse(rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(pushed.id.first_seq, 1, "not the batch past its age limit");
+        drop(rx);
+        feed.await.unwrap();
+        // a stream's own retention holds for a read just the same, and none means all is kept
+        assert_eq!(batches(&node, &cursor("named")).await, [0u64; 0]);
+        assert_eq!(batches(&node, &cursor("free")).await, [0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_trims_a_class_s_streams_in_ram_and_loads_no_idle_one() {
+        // Why: a class may have millions of streams, most of them idle on disk. A pass must
+        // cost nothing per idle stream, and still hold every stream being written to its
+        // class's bytes.
+        let d = tempfile::tempdir().unwrap();
+        let small = StreamConfig {
+            retention_bytes: Some(1_000),
+            ..Default::default()
+        };
+        let mut c = config(&d, &[("s/*", small)]);
+        (c.dormant_after_ms, c.hot_streams_bytes) = (0, 0);
+        let node = Node::open(c).await.unwrap();
+        write(&node, "s/idle", 0, 100).await;
+        for seq in 0..8 {
+            write(&node, "filler", seq, 5_000).await;
+        }
+        node.apply_retention().await.unwrap();
+        let loads = node.store.hot_stats().loads;
+        for seq in 0..4 {
+            write(&node, "s/busy", seq, 400).await;
+        }
+        node.apply_retention().await.unwrap();
+        assert_eq!(
+            node.store.hot_stats().loads,
+            loads,
+            "the idle stream stayed on disk"
+        );
+        let held = node.store.stream_bytes("s/busy");
+        assert!(
+            held <= 1_000 && held > 400,
+            "within its class's bytes: {held}"
+        );
+        let idle = Batch::encode(&log("s/idle"), 0, &[(0, &[0u8; 100][..])]).unwrap();
+        assert_eq!(node.store.stream_bytes("s/idle"), idle.len() as u64, "kept");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_segment_whose_index_does_not_read_goes_with_the_cap_as_before_classes() {
+        // Why: the cap protects the disk. The cleaner reads a segment's index for the class
+        // streams in it; an index that does not read must not fail the pass (every later pass
+        // would fail at it too): what that segment holds is not copied and goes with it.
+        let d = tempfile::tempdir().unwrap();
+        let all = StreamConfig {
+            retention_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        let mut c = config(&d, &[("s/*", all)]);
+        let cap = 3 * (16 << 10);
+        (c.retention_bytes, c.tail_cache_bytes) = (Some(cap), 0);
+        let node = Node::open(c).await.unwrap();
+        for seq in 0..40 {
+            write(&node, "s/1", seq, 3_000).await;
+        }
+        for e in std::fs::read_dir(d.path().join("log")).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|x| x == "idx") {
+                std::fs::File::options()
+                    .write(true)
+                    .open(p)
+                    .unwrap()
+                    .set_len(0)
+                    .unwrap();
+            }
+        }
+        for _ in 0..2 {
+            node.apply_retention().await.unwrap();
+        }
+        let bytes = node.wal.stats.log_bytes.load(Ordering::Relaxed);
+        assert!(bytes <= cap, "log {bytes} over the cap {cap}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cap_s_forced_cuts_of_a_class_are_one_series() {
+        // Why: a metric labelled by stream grows without bound with a stream per session. What
+        // the node cap cuts from streams that still retained it is counted under their class.
+        let d = tempfile::tempdir().unwrap();
+        let all = StreamConfig {
+            retention_bytes: Some(1 << 30),
+            ..Default::default()
+        };
+        let mut c = config(&d, &[("s/*", all.clone()), ("named", all)]);
+        c.retention_bytes = Some(4 * (16 << 10));
+        let node = Node::open(c).await.unwrap();
+        for seq in 0..40 {
+            for s in ["s/1", "s/2", "named"] {
+                write(&node, s, seq, 3_000).await;
+            }
+            node.apply_retention().await.unwrap();
+        }
+        let forced: Vec<String> = node.forced.lock().keys().cloned().collect();
+        assert_eq!(forced, ["named", "s/*"]);
+        assert!(node.forced.lock().values().all(|&n| n > 0 && n < 120));
+        assert!(
+            node.metrics()
+                .contains("precog_retention_forced_total{stream=\"s/*\"}")
+        );
     }
 }
 
