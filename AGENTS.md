@@ -1,12 +1,14 @@
 # Agent instructions
 
-Coding agents working in this repository develop test first (below), verify every new feature
-formally (below), respect the storage and protocol invariants, keep every CI gate green, and follow the Ponytail skill at the default
+Coding agents working in this repository develop test first (below), cover every feature with an
+acceptance scenario (below), verify every new feature formally (below), respect the storage and
+protocol invariants, keep every CI gate green, and follow the Ponytail skill at the default
 **full** intensity. Ponytail source:
 [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail/blob/main/skills/ponytail/SKILL.md) (MIT),
 as adopted in aperiodic-io/brrrrr.
 
-The plan of record is [`docs/PLAN.md`](docs/PLAN.md). Read it before starting a milestone.
+The plan of record is [`docs/PLAN.md`](docs/PLAN.md); for the session-log product it is
+[`docs/SESSION-LOG.md`](docs/SESSION-LOG.md). Read them before starting a milestone.
 
 ## Test-driven development
 
@@ -22,6 +24,28 @@ Every change is test-driven, fixes and review findings included:
 Say in the commit or pull request which test failed first. Where a test cannot fail first (a pure
 refactor, a performance change), say so and say what covers it. Performance changes are covered by
 the bench and perf gates.
+
+## Acceptance tests
+
+Every feature a client or an operator can observe has an acceptance scenario, in the same pull
+request: a request or an answer on the wire, a config field, what a node does across a crash, a
+restart or a peer's absence, what an operator reads in `/metrics` or the node's log. The scenarios
+are `crates/mesh/tests/acceptance/features/*.feature`, run against real `precog-node` processes
+(`cargo test -p precog-mesh --test acceptance`); their steps are in `tests/acceptance/main.rs`.
+
+1. **Write the scenario with the feature's first test**, in the words of whoever uses it (what
+   they configure, do and see), and watch it fail before the feature exists.
+2. **One scenario per promise**, with the fault that would break it where there is one: the node
+   killed, a peer down during the step, a file damaged, the log turned over by retention.
+3. **Use the real path**: the node binary, its config file as an operator writes it, the client
+   over TCP. A step never reaches into a node's memory.
+4. **Slow or large scenarios** are tagged `@nightly` or `@stress` and run in `nightly.yml`; the
+   rest run on every pull request and must stay in the job's minutes.
+
+Unit, property and model tests are what mutation testing runs, so a scenario is never the only
+test of a branch in the code. A change no scenario can observe (a refactor, an internal
+optimisation) says so in the pull request, and says which scenarios would notice if it broke
+what they cover.
 
 ## Formal verification
 
@@ -41,6 +65,19 @@ is checked, with which tool, to what bound, what is not and why.
    (`#[cfg(kani)] mod proofs`): it never panics and accepts only what it should.
 4. **A bug a model finds keeps its counterexample**: a config whose first line is
    `\* expect: <Invariant>` with the old behaviour, plus the failing test first (above).
+5. **A protocol is modelled before it is built.** Write the TLA+ spec and its invariants first,
+   with a switch per rule of the design, and a config that turns each rule off and must fail:
+   the model then says which rules the code needs and what each is for. Name the code in the
+   spec's comments (the function each action is) and the spec in the code's (the rule each
+   check keeps), and give the code a model test against a reference that takes the same steps.
+6. **Run the gates before pushing**: the formal-coverage gate against the pull request's base
+   (Commands, below), `spec/check.sh`, and the diff's mutants. Run mutants from a checkout
+   nothing else touches (`git worktree add`): cargo-mutants copies the tree more than once
+   while it runs, and a branch switched under it makes mutants fail to build, which it reports
+   as unviable, not as missed.
+7. **A gate's finding is a finding about the code first.** A line no formal check runs, a
+   mutant no test catches and a model test's counterexample have each been real defects here;
+   read the line before writing the test that covers it.
 
 Where a part cannot be verified this way, say so in `spec/README.md` (Not verified, and why) and
 in the pull request.
