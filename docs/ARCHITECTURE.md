@@ -254,24 +254,38 @@ A class may have millions of streams, most of them idle on disk, so nothing walk
 | When | What is trimmed |
 |---|---|
 | Every retention pass | The streams in RAM (`Store::streams_in_ram`). A stream grows only by appends, which put it in RAM, so every stream over its bytes is among them |
-| Before a read is served (`Node::expire`: a cursor read, a seek, the event-time read, a repair fetch of one log, a live feed of one stream) | That stream, loaded if it was idle. Nothing past a stream's age limit is served, whether a pass saw it or not. This holds for a stream named in the config too |
+| Before a read is served (`Node::expire`: a cursor read, a seek, the event-time read, a fetch of one log or by batch ids, a live feed of one stream) | That stream, loaded if it was idle, to its bytes and its age limit. Nothing past a stream's age limit is served, whether a pass saw it or not. This holds for a stream named in the config too |
 | Before the node cap drops a segment (`Node::class_streams`) | The class streams with batches in that segment, which its index names. What they still retain is copied forward like a named stream's |
 
-A trim with nothing to forget reads no index (`Store::trim_stream`: the stream's bytes and the
-oldest each absorbed segment may hold of it are in RAM), so a read pays for expiry only when
-something expired.
+A trim with nothing to forget reads no index and walks no batches (`Store::trim_stream`): the
+stream's bytes, the oldest each absorbed segment still holds of it (where the last trim
+stopped) and a bound on the oldest of its batches in RAM are kept, so a read pays for expiry
+only when something expired. It does take the store's lock once more than before.
 
-Limits. A live feed of every stream is in log order and does not load idle streams: it can serve a
-batch past its class's age limit until that stream is next read or its segment is dropped. When
-streams retain more than the node cap, the cap wins as before, cutting the stream furthest over
-its share; that loop asks every stream being cut for its bytes each round, so it is quadratic in
-their number. `precog_retention_forced_total` counts a class's cuts under the class's key, one
+A read's trim runs on the reader's task, so it can forget a batch between the cleaner's check
+that the batch is still retained and the end of its copy's write. The store takes such a copy as
+a record it never serves (`Store::moved`; `spec/store/Cleaner.tla`), where it used to require
+the batch to be there.
+
+Limits.
+- A live feed of every stream is in log order and does not load idle streams: it can serve a
+  batch past its class's age limit until that stream is next read or its segment is dropped.
+- **Size the node cap above what the classes retain.** A named stream over the cap is an
+  operator's choice; a class gets there by its tenants writing. When streams retain more than
+  the cap, the cap wins as before, cutting the stream furthest over its share, but then every
+  pass takes every absorbed segment, loads every class stream in them, cuts in a loop that is
+  quadratic in the streams being cut, and rewrites what is left. Nothing limits what a class
+  holds in all (a per-class quota is not built): watch `precog_retention_forced_total`.
+- The cleaner reads the whole index of each segment it is about to drop for the class streams
+  in it, and loads each of them (about 1.6 KB of RAM until the pass ends). `precog_retention_forced_total` counts a class's cuts under the class's key, one
 series however many streams it has.
 
 Tests: `node::props_classes` (the lookup against the rule; every read of an idle stream past its
 age limit; a pass that loads no idle stream; the metric), `node::props_cleaner` rerun with the
-streams' retention from classes, `store::tests::a_trim_with_nothing_to_forget_reads_no_index`,
-and `features/storage.feature` (3 nodes, a class stream through the node cap).
+streams' retention from classes, `store::model_trim` (a trim against a reference, and asked
+again it reads nothing), `store::tests::a_trim_with_nothing_to_forget_reads_no_index`,
+`a_batch_forgotten_while_its_copy_was_being_written_is_never_served_and_holds_nothing_up`, and
+`features/storage.feature` (3 nodes, a class stream through the node cap).
 
 ## Deleting a stream
 
@@ -349,8 +363,15 @@ A node knows three kinds of token (`NodeConfig`):
 
 A connection's `Hello` decides who it is for good (`Node::authenticate`): a `node_id` with the
 peers' token is a peer; without one, the unscoped token or a scoped one is a client. Every
-configured token is compared, in constant time, so a miss takes as long as a hit. A scoped token
-equal to another token, or empty, is refused when the node opens.
+configured token is compared, each without stopping at the first byte that differs, so a miss
+takes as long as a hit (a token's length is not hidden).
+
+A config that would not confine a token is refused when the node opens, so its mistakes fail
+closed: an empty token (anyone's), a peers' token that is the clients', scoped tokens without a
+peers' token (the unscoped token would make a peer), a scoped token that is empty or another
+token, an empty prefix (every stream: that is the unscoped token), and a field of a token
+mistyped (`"writes": false` is not a token that reads and writes). A prefix is a prefix of
+bytes: `"acme"` also reaches `acmecorp/...`, so end it with the separator (`"acme/"`).
 
 What a request needs is decided in one place (`need`, `Node::allow`), where requests enter
 (`Node::handle`, `Node::push_loop`):
@@ -365,13 +386,31 @@ What a request needs is decided in one place (`need`, `Node::allow`), where requ
 A scoped token never reaches the node's own `__` streams (reader positions), whatever its
 prefixes. Reader groups are scoped by the stream they are on: a group's name is not a secret.
 
+**A commit is a write a reader makes.** A token that may only read still commits its position,
+and a position is durable, replicated, kept in RAM on every node and removed by no retention.
+So a commit is bounded: a group's name is 1 to 255 bytes with no NUL, a position is at most
+1 MiB encoded, and a scoped token's position names only writer logs its stream has on the node
+(it holds no more than the stream's writers put there; a stream nobody wrote takes no commit).
+These are checked before the commit takes its number in the node's log, so a refused commit
+leaves no sequence nobody wrote. What stays unbounded is the number of groups on a stream: each
+costs a commit's durable append, and nothing removes a group nobody reads with any more.
+
+**`/metrics` is not behind a token.** It is plain HTTP on its own port (`listen_metrics`) and
+names every reader group and stream with its lag: bind it where only the operator's scraper
+reaches. Names are a client's to choose, so they are escaped as label values (`label`): a quote
+or a newline in a group's name stays inside its label.
+
+A connection carries at most 1024 live feeds (`MAX_FEEDS_PER_CONN`): a feed is a task that walks
+the node's log for as long as the connection lives, and the next one is refused.
+
 Not built: tokens issued, expired or revoked without a restart (they are static config), quotas,
 and TLS; the token crosses the network in the clear, as the shared one did.
 
 Tests: `node::props_tokens` (the scope rule as a property; every request kind's need; who a
 connection is, with and without a peers' token; each way in, inside and outside a scope) and
-`a_tenant_s_token_reaches_its_streams_on_every_node_and_only_peers_replicate`
-(`tests/cluster.rs`, 3 nodes over TCP).
+`props_tokens` in `tests/cluster.rs` (3 nodes over TCP; the feeds a connection carries), and
+`features/tokens.feature` (real node processes: a tenant within its prefix through a node's
+restart, and refused everything outside it).
 
 ## Guarantees (and what is traded away)
 
