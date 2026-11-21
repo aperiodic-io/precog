@@ -38,7 +38,16 @@ pub struct NodeConfig {
     pub id: u32,
     pub domain: String,
     pub data_dir: PathBuf,
+    /// The unscoped token: its holder reaches every stream and every request a client can make.
+    /// Peers present it too unless `peer_token` is set.
     pub token: String,
+    /// Tokens confined to stream prefixes and to reading or writing (a tenant's).
+    #[serde(default)]
+    pub tokens: Vec<TokenConfig>,
+    /// What a peer presents. Set it wherever `tokens` are given out, or whoever learns the
+    /// unscoped token can also replicate. Unset: `token`.
+    #[serde(default)]
+    pub peer_token: Option<String>,
     pub listen_tcp: Option<SocketAddr>,
     /// Prometheus `/metrics` and `/health` (503 once storage is fenced) over plain HTTP.
     #[serde(default)]
@@ -111,6 +120,8 @@ impl NodeConfig {
             domain: domain.into(),
             data_dir,
             token,
+            tokens: vec![],
+            peer_token: None,
             listen_tcp: None,
             listen_metrics: None,
             peers: vec![],
@@ -191,6 +202,35 @@ pub fn ordinal(hostname: &str) -> Result<u32> {
         .with_context(|| format!("no ordinal in hostname {hostname:?}"))?;
     n.parse()
         .with_context(|| format!("no ordinal in hostname {hostname:?}"))
+}
+
+/// A client token that reaches only the streams whose name starts with one of `prefixes`, to
+/// read them, write them or both. It never reaches the node's own `__` streams, a request that
+/// is not about one stream (status, repair, a feed of every stream), or replication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenConfig {
+    pub token: String,
+    pub prefixes: Vec<String>,
+    #[serde(default = "yes")]
+    pub read: bool,
+    #[serde(default = "yes")]
+    pub write: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl TokenConfig {
+    fn allows(&self, need: Need<'_>) -> bool {
+        let (stream, may) = match need {
+            Need::Read(s) => (s, self.read),
+            Need::Write(s) => (s, self.write),
+            Need::All => return false,
+        };
+        let reaches = self.prefixes.iter().any(|p| stream.starts_with(p.as_str()));
+        may && reaches && !stream.starts_with("__")
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -511,10 +551,39 @@ enum Local {
     Conflict(String),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ident {
+    /// The unscoped token's holder.
     Client,
+    /// The holder of `cfg.tokens[i]`.
+    Scoped(usize),
     Peer(u32),
+}
+
+/// What a request needs of its connection's token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Need<'a> {
+    Read(&'a str),
+    Write(&'a str),
+    /// Not about one stream: no scoped token has it.
+    All,
+}
+
+/// What a control request needs: its stream to read (a commit moves a reader's position, which
+/// is its to read), or everything.
+fn need(c: &Control) -> Need<'_> {
+    match c {
+        Control::Read { stream, .. }
+        | Control::ReadCursor { stream, .. }
+        | Control::CursorAt { stream, .. }
+        | Control::Commit { stream, .. }
+        | Control::Position { stream, .. }
+        | Control::Latest { stream } => Need::Read(stream),
+        Control::FetchLog { log, .. } => Need::Read(&log.stream),
+        Control::Status | Control::Repair | Control::Fetch { .. } | Control::Inventory { .. } => {
+            Need::All
+        }
+    }
 }
 
 impl Node {
@@ -526,6 +595,14 @@ impl Node {
             bail!("stream class {k:?} cannot be compacted: name each compacted stream");
         }
         let classes = cfg.streams.keys().any(|k| k.ends_with('*'));
+        // a scoped token that is also the unscoped or the peer token would not be confined
+        let mut all = vec![&cfg.token];
+        all.extend(&cfg.peer_token);
+        for t in &cfg.tokens {
+            anyhow::ensure!(!t.token.is_empty(), "a scoped token is empty");
+            anyhow::ensure!(!all.contains(&&t.token), "a scoped token is given twice");
+            all.push(&t.token);
+        }
         std::fs::create_dir_all(&cfg.data_dir)?;
         let wal = Wal::open(cfg.storage())?;
         let mut dedup = cfg
@@ -1254,7 +1331,7 @@ impl Node {
                 _ => break,
             };
             if f.kind == Kind::Subscribe {
-                tokio::spawn(self.clone().push_loop(f, tx.clone()));
+                tokio::spawn(self.clone().push_loop(f, ident, tx.clone()));
                 continue;
             }
             let Ok(permit) = per_conn.clone().acquire_owned().await else {
@@ -1279,8 +1356,14 @@ impl Node {
     /// subscription keeps its own cursor into the node's log, so a slow
     /// subscriber only slows its own connection (bounded channel + transport
     /// flow control) and never drops data or blocks writers.
-    async fn push_loop(self: Arc<Self>, req: Frame, tx: mpsc::Sender<Frame>) {
-        let sub: Subscribe = match serde_json::from_slice(&req.body) {
+    async fn push_loop(self: Arc<Self>, req: Frame, ident: Ident, tx: mpsc::Sender<Frame>) {
+        let sub = serde_json::from_slice::<Subscribe>(&req.body)
+            .map_err(anyhow::Error::from)
+            .and_then(|sub| {
+                let need = sub.stream.as_deref().map_or(Need::All, Need::Read);
+                self.allow(ident, need).map(|()| sub)
+            });
+        let sub = match sub {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx
@@ -1397,13 +1480,18 @@ impl Node {
 
     fn authenticate(&self, body: &[u8]) -> Result<Ident> {
         let h: Hello = serde_json::from_slice(body)?;
-        if !constant_time_eq(h.token.as_bytes(), self.cfg.token.as_bytes()) {
-            bail!("bad token");
-        }
+        let is = |t: &str| constant_time_eq(h.token.as_bytes(), t.as_bytes());
         match h.node_id {
-            None => Ok(Ident::Client),
+            None => {
+                // every token is compared: a miss takes as long as a hit
+                let scoped = (self.cfg.tokens.iter().enumerate()).fold(None, |found, (i, t)| {
+                    is(&t.token).then_some(Ident::Scoped(i)).or(found)
+                });
+                (is(&self.cfg.token).then_some(Ident::Client).or(scoped)).context("bad token")
+            }
             Some(id) => {
-                // A token holder may claim any configured peer id.
+                // A holder of the peers' token may claim any configured peer id.
+                anyhow::ensure!(is(self.peer_token()), "bad token");
                 anyhow::ensure!(
                     self.peers.iter().any(|p| p.cfg.id == id),
                     "unknown peer {id}"
@@ -1413,11 +1501,41 @@ impl Node {
         }
     }
 
+    /// What this node's peers present, and it to them.
+    fn peer_token(&self) -> &str {
+        self.cfg.peer_token.as_deref().unwrap_or(&self.cfg.token)
+    }
+
+    /// Whether the connection may do what the request needs. The unscoped token and peers may
+    /// do anything a client can ask (replication has its own check); a scoped token only reads
+    /// or writes, as it is allowed, streams under its prefixes that are not the node's own.
+    fn allow(&self, ident: Ident, need: Need<'_>) -> Result<()> {
+        match ident {
+            Ident::Scoped(i) if !self.cfg.tokens[i].allows(need) => bail!("forbidden: {need:?}"),
+            _ => Ok(()),
+        }
+    }
+
     async fn handle(self: &Arc<Self>, f: Frame, ident: Ident) -> Result<Frame> {
         let id = f.req_id;
         match f.kind {
             Kind::Append => {
                 let (copies, batch) = decode_append(f.body)?;
+                // ponytail: a scoped token's batch is parsed twice (here for its stream, then by
+                // `append`); one that does not parse is rejected there
+                if let Ident::Scoped(_) = ident
+                    && let Ok(b) = Batch::parse(batch.clone())
+                    && let Err(e) = self.allow(ident, Need::Write(&b.id.log.stream))
+                {
+                    tracing::debug!("append refused: {e}");
+                    let ack = Ack {
+                        status: AckStatus::Rejected,
+                        copies: 0,
+                        nodes: 0,
+                        crc: b.ident,
+                    };
+                    return Ok(Frame::new(Kind::Ack, id, ack.encode()));
+                }
                 let ack = self.append(copies, batch).await;
                 Ok(Frame::new(Kind::Ack, id, ack.encode()))
             }
@@ -1435,6 +1553,7 @@ impl Node {
             }
             Kind::Control => {
                 let c: Control = serde_json::from_slice(&f.body)?;
+                self.allow(ident, need(&c))?;
                 if let Control::Fetch { ids } = &c {
                     let mut out = BytesMut::new();
                     for bid in ids {
@@ -1876,7 +1995,7 @@ impl Node {
         let res: Result<Arc<RpcClient>> = async {
             let c = crate::transport::connect(&p.addr, timeout).await?;
             let hello = Hello {
-                token: self.cfg.token.clone(),
+                token: self.peer_token().into(),
                 node_id: Some(self.cfg.id),
             };
             c.call(
@@ -2951,10 +3070,11 @@ mod props_classes {
             from_start: true,
         };
         let body = Bytes::from(serde_json::to_vec(&sub).unwrap());
-        let feed = tokio::spawn(
-            node.clone()
-                .push_loop(Frame::new(Kind::Subscribe, 7, body), tx),
-        );
+        let feed = tokio::spawn(node.clone().push_loop(
+            Frame::new(Kind::Subscribe, 7, body),
+            Ident::Client,
+            tx,
+        ));
         assert!(rx.recv().await.unwrap().body.is_empty(), "the feed's start");
         write(&node, "s/5", 1, 100).await;
         let pushed = Batch::parse(rx.recv().await.unwrap().body).unwrap();
@@ -3063,6 +3183,324 @@ mod props_classes {
             node.metrics()
                 .contains("precog_retention_forced_total{stream=\"s/*\"}")
         );
+    }
+}
+
+#[cfg(test)]
+mod props_tokens {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn token(token: &str, prefixes: &[&str], read: bool, write: bool) -> TokenConfig {
+        TokenConfig {
+            token: token.into(),
+            prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            read,
+            write,
+        }
+    }
+
+    proptest! {
+        /// Why: a tenant's token must reach its own streams and nothing else. Against the rule
+        /// spelled out: only a read or a write, only if the token has that, only of a stream
+        /// under one of its prefixes, never of the node's own streams.
+        #[test]
+        fn a_scoped_token_reaches_only_its_prefixes_to_read_or_write(
+            prefixes in prop::collection::vec("[a_/]{0,3}", 0..4),
+            read: bool, write: bool,
+            stream in "[a_/]{0,5}", kind in 0..3,
+        ) {
+            let t = TokenConfig { token: "t".into(), prefixes: prefixes.clone(), read, write };
+            let under = prefixes.iter().any(|p| stream.len() >= p.len() && stream[..p.len()] == p[..]);
+            let own = stream.len() >= 2 && &stream[..2] == "__";
+            let (need, want) = match kind {
+                0 => (Need::Read(&stream), read && under && !own),
+                1 => (Need::Write(&stream), write && under && !own),
+                _ => (Need::All, false),
+            };
+            prop_assert_eq!(t.allows(need), want);
+        }
+    }
+
+    #[test]
+    fn every_request_about_one_stream_needs_that_stream_and_the_others_everything() {
+        // Why: a request classified wrongly is a hole in every tenant's wall. Each kind of
+        // control request, with what it must need (a new kind does not compile until `need`
+        // names it).
+        let (s, log) = ("acme/1".to_string(), || LogId {
+            stream: "acme/1".into(),
+            writer: "w".into(),
+            epoch: 1,
+        });
+        let read = Need::Read("acme/1");
+        let cases = [
+            (
+                Control::Read {
+                    stream: s.clone(),
+                    from_time_us: 0,
+                    limit: 1,
+                },
+                read,
+            ),
+            (
+                Control::ReadCursor {
+                    stream: s.clone(),
+                    cursor: vec![],
+                    max_bytes: 1,
+                },
+                read,
+            ),
+            (
+                Control::CursorAt {
+                    stream: s.clone(),
+                    time_ms: 0,
+                },
+                read,
+            ),
+            (
+                Control::Commit {
+                    group: "g".into(),
+                    stream: s.clone(),
+                    cursor: vec![],
+                },
+                read,
+            ),
+            (
+                Control::Position {
+                    group: "g".into(),
+                    stream: s.clone(),
+                },
+                read,
+            ),
+            (Control::Latest { stream: s.clone() }, read),
+            (
+                Control::FetchLog {
+                    log: log(),
+                    from_seq: 0,
+                    max_bytes: 1,
+                },
+                read,
+            ),
+            (Control::Status, Need::All),
+            (Control::Repair, Need::All),
+            (
+                Control::Fetch {
+                    ids: vec![BatchId {
+                        log: log(),
+                        first_seq: 0,
+                    }],
+                },
+                Need::All,
+            ),
+            (
+                Control::Inventory {
+                    from: 0,
+                    max: 1,
+                    incarnation: 0,
+                },
+                Need::All,
+            ),
+        ];
+        for (c, want) in &cases {
+            assert_eq!(need(c), *want, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_token_reads_and_writes_unless_its_config_says_otherwise_and_an_older_config_still_reads() {
+        // Why: a config is written by hand. Leaving `read` and `write` out must not make a
+        // token that can do nothing, and a node config from before tokens must still load.
+        let t: TokenConfig = serde_json::from_str(r#"{"token":"t","prefixes":["a/"]}"#).unwrap();
+        assert_eq!(t, token("t", &["a/"], true, true));
+        let t: TokenConfig =
+            serde_json::from_str(r#"{"token":"t","prefixes":["a/"],"write":false}"#).unwrap();
+        assert_eq!(t, token("t", &["a/"], true, false));
+        let c = NodeConfig::single(0, "a", "unused".into(), "tok".into());
+        let mut v = serde_json::to_value(&c).unwrap();
+        for field in ["tokens", "peer_token"] {
+            assert!(v.as_object_mut().unwrap().remove(field).is_some());
+        }
+        let c: NodeConfig = serde_json::from_value(v).unwrap();
+        assert_eq!((c.tokens, c.peer_token), (vec![], None));
+    }
+
+    fn config(dir: &std::path::Path, peer_token: Option<&str>) -> NodeConfig {
+        let mut c = NodeConfig::single(0, "a", dir.into(), "admin".into());
+        c.peer_token = peer_token.map(Into::into);
+        c.tokens = vec![
+            token("acme", &["acme/"], true, true),
+            token("reader", &["acme/", "beta/"], true, false),
+        ];
+        c.peers = vec![PeerConfig {
+            id: 1,
+            domain: "b".into(),
+            addr: "tcp://127.0.0.1:1".parse().unwrap(),
+        }];
+        c.rpc_timeout_ms = 50; // nobody listens there
+        c
+    }
+
+    #[test]
+    fn a_connection_is_who_its_token_says_and_only_the_peers_token_makes_a_peer() {
+        // Why: the handshake decides what every later request may do. A tenant's token must
+        // never make a peer (a peer replicates into any stream), and with a peers' token set
+        // the unscoped one must not either.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let own = rt
+            .block_on(Node::open(config(d1.path(), Some("peers"))))
+            .unwrap();
+        let shared = rt.block_on(Node::open(config(d2.path(), None))).unwrap();
+        let pool = [
+            "admin", "peers", "acme", "reader", "other", "", "acm", "acmee",
+        ];
+        proptest!(|(t in 0..pool.len(), node_id in prop::option::of(0u32..3))| {
+            let token = pool[t];
+            let hello = serde_json::to_vec(&Hello { token: token.into(), node_id }).unwrap();
+            for (node, peers) in [(&own, "peers"), (&shared, "admin")] {
+                let want = match (node_id, token) {
+                    (Some(1), t) if t == peers => Some(Ident::Peer(1)),
+                    (Some(_), _) => None,
+                    (None, "admin") => Some(Ident::Client),
+                    (None, "acme") => Some(Ident::Scoped(0)),
+                    (None, "reader") => Some(Ident::Scoped(1)),
+                    (None, _) => None,
+                };
+                prop_assert_eq!(node.authenticate(&hello).ok(), want, "{:?} {:?}", token, node_id);
+            }
+        });
+        assert_eq!(own.peer_token(), "peers");
+        assert_eq!(shared.peer_token(), "admin");
+        assert!(own.authenticate(b"not json").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scoped_token_that_is_another_token_is_refused_at_the_open() {
+        // Why: a tenant's token equal to the unscoped or the peers' token would be read as
+        // that one, or the other way round: not confined, or not working.
+        let d = tempfile::tempdir().unwrap();
+        for (dup, why) in [
+            ("admin", "twice"),
+            ("peers", "twice"),
+            ("acme", "twice"),
+            ("", "empty"),
+        ] {
+            let mut c = config(d.path(), Some("peers"));
+            c.tokens.push(token(dup, &["x/"], true, true));
+            let e = Node::open(c).await.err().unwrap().to_string();
+            assert!(e.contains(why), "{dup:?}: {e}");
+        }
+        Node::open(config(d.path(), Some("peers"))).await.unwrap();
+    }
+
+    fn batch(stream: &str, seq: u64) -> Bytes {
+        let log = LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        Batch::encode(&log, seq, &[(seq, b"x")]).unwrap()
+    }
+
+    async fn append(node: &Arc<Node>, ident: Ident, batch: Bytes) -> Ack {
+        let f = Frame::new(Kind::Append, 1, encode_append(1, &batch));
+        parse_frame_ack(&node.handle(f, ident).await.unwrap()).unwrap()
+    }
+
+    async fn control(node: &Arc<Node>, ident: Ident, c: &Control) -> Result<Frame> {
+        let body = Bytes::from(serde_json::to_vec(c).unwrap());
+        node.handle(Frame::new(Kind::Control, 1, body), ident).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scoped_token_s_requests_stop_at_its_prefixes() {
+        // Why: the wall holds only if every way in checks it: appends, every control request,
+        // live feeds and replication. Each is tried inside and outside the token's scope.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(config(d.path(), Some("peers"))).await.unwrap();
+        let (acme, reader) = (Ident::Scoped(0), Ident::Scoped(1));
+        // appends: its prefix and nothing else; a refusal stores nothing
+        assert!(append(&node, acme, batch("acme/1", 0)).await.is_success());
+        for (ident, stream) in [
+            (acme, "beta/1"),
+            (acme, "acm"),
+            (reader, "acme/1"),
+            (reader, "beta/1"),
+        ] {
+            let b = batch(stream, 7);
+            let ack = append(&node, ident, b.clone()).await;
+            assert_eq!(ack.status, AckStatus::Rejected, "{ident:?} {stream}");
+            assert_eq!((ack.copies, ack.nodes, ack.crc), (0, 0, batch_crc(&b)));
+        }
+        assert!(
+            append(&node, Ident::Client, batch("beta/1", 0))
+                .await
+                .is_success()
+        );
+        assert_eq!(
+            node.store.frontiers(None).len(),
+            2,
+            "acme/1 and beta/1, once each"
+        );
+        // bytes that are no batch are rejected as from anyone
+        let junk = append(&node, acme, Bytes::from_static(b"junk")).await;
+        assert_eq!(junk.status, AckStatus::Rejected);
+        // control requests about a stream
+        let cursor = |stream: &str| Control::ReadCursor {
+            stream: stream.into(),
+            cursor: vec![],
+            max_bytes: 1 << 20,
+        };
+        assert!(
+            !control(&node, acme, &cursor("acme/1"))
+                .await
+                .unwrap()
+                .body
+                .is_empty()
+        );
+        assert!(
+            !control(&node, reader, &cursor("beta/1"))
+                .await
+                .unwrap()
+                .body
+                .is_empty()
+        );
+        let e = control(&node, acme, &cursor("beta/1")).await.err().unwrap();
+        assert!(e.to_string().contains("forbidden"), "{e}");
+        // and those about the node
+        for c in [Control::Status, Control::Repair] {
+            assert!(control(&node, acme, &c).await.is_err(), "{c:?}");
+            assert!(control(&node, Ident::Client, &c).await.is_ok(), "{c:?}");
+            assert!(control(&node, Ident::Peer(1), &c).await.is_ok(), "{c:?}");
+        }
+        // only a peer replicates
+        let rep = || Frame::new(Kind::Replicate, 1, encode_replicate(1, &batch("acme/1", 1)));
+        assert!(node.handle(rep(), acme).await.is_err());
+        assert!(node.handle(rep(), Ident::Client).await.is_err());
+        assert!(node.handle(rep(), Ident::Peer(1)).await.is_ok());
+        // live feeds: one of its streams, not another's, not every stream's
+        for (ident, stream, ok) in [
+            (acme, Some("acme/1"), true),
+            (acme, Some("beta/1"), false),
+            (acme, None, false),
+            (Ident::Client, None, true),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let sub = Subscribe {
+                stream: stream.map(Into::into),
+                from_start: true,
+            };
+            let body = Bytes::from(serde_json::to_vec(&sub).unwrap());
+            let feed = node
+                .clone()
+                .push_loop(Frame::new(Kind::Subscribe, 7, body), ident, tx);
+            let feed = tokio::spawn(feed);
+            let first = rx.recv().await.unwrap();
+            let want = if ok { Kind::Push } else { Kind::Error };
+            assert_eq!(first.kind, want, "{ident:?} {stream:?}");
+            drop(rx);
+            feed.await.unwrap();
+        }
     }
 }
 
