@@ -335,6 +335,8 @@ mod model {
         let client = Client::connect(&c.addrs, "tok").unwrap();
         let mut p = client.producer("big", "w");
         p.set_chunked(true);
+        // (as sent or compressed: the chunks are the same events either way)
+        p.set_compression(down.is_some());
         for (i, &n) in sizes.iter().enumerate() {
             p.send(i as u64, format!("id{i}").as_bytes(), &large_payload(i, n));
         }
@@ -381,6 +383,42 @@ mod model {
         prop_assert_eq!(raw.len() > sizes.len(), cut);
         prop_assert!(raw.iter().all(|e| e.payload[0] <= 3));
         Ok(())
+    }
+
+    /// Why: a chunked reader pointed at a stream that is not chunked, or at an event it cannot
+    /// hold, must say so and go on: the events it can read still come, the error is the next
+    /// poll's (the events of this one are not lost to it), and it is reported once. A `put`
+    /// on a chunked producer is a whole event, tagged like any other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_chunked_reader_reports_what_it_passes_over_once_and_reads_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cluster::new(dir.path(), None).await;
+        let client = Client::connect(&c.addrs, "tok").unwrap();
+        // an event with no tag at all, from a producer that is not chunked
+        let mut plain = client.producer("mixed", "plain");
+        plain.send(0, &[], &[]);
+        plain.sync().await.unwrap();
+        let mut chunked = client.producer("mixed", "chunked");
+        chunked.set_chunked(true);
+        chunked.put(1, b"key", b"a value");
+        chunked.send(2, &[], b"an event");
+        chunked.sync().await.unwrap();
+        let mut r = client.consumer_at("mixed", Default::default());
+        r.set_chunked(true);
+        let mut got: Vec<Vec<u8>> = vec![];
+        let mut errors = 0;
+        for _ in 0..6 {
+            match r.poll(1 << 20).await {
+                Ok(evs) => got.extend(evs.into_iter().map(|e| e.payload.to_vec())),
+                Err(e) => {
+                    assert!(e.to_string().contains("without a chunk tag"), "{e}");
+                    errors += 1;
+                }
+            }
+        }
+        got.sort();
+        assert_eq!(got, [b"a value".to_vec(), b"an event".to_vec()]);
+        assert_eq!(errors, 1, "reported once");
     }
 
     proptest! {
