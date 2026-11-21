@@ -1175,8 +1175,13 @@ mod props_tokens {
             "new to the node"
         );
         assert!(read(tenant.clone(), 0, "other/s").await.is_err());
-        assert!(tenant.subscribe(0, Some("other/s"), true).await.is_err());
-        assert!(tenant.subscribe(0, None, true).await.is_err());
+        // a feed refused is told so at once, with the node's reason (not by a timeout)
+        let t = std::time::Instant::now();
+        for stream in [Some("other/s"), None] {
+            let e = tenant.subscribe(0, stream, true).await.err().unwrap();
+            assert!(e.to_string().contains("forbidden"), "{e}");
+        }
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         assert!(tenant.control(0, &Control::Status).await.is_err());
         assert!(status(&admin, 0).await.batches >= 2);
         // no client token makes a peer, and no token at all gets in
@@ -1199,6 +1204,50 @@ mod props_tokens {
                 .call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
                 .await;
             assert_eq!(r.is_ok(), ok, "{token} as {node_id:?}");
+        }
+    }
+
+    /// Why: a live feed is not a request that ends: it is a task that walks the node's log for
+    /// as long as its connection lives. A connection that could open them without bound could
+    /// take a node's CPU for one tenant's streams; it carries a bounded number, and the next is
+    /// refused, not queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_connection_carries_a_bounded_number_of_live_feeds() {
+        let c = cluster(1, &["a"]);
+        start(&c, 0).await;
+        let t = Duration::from_secs(5);
+        let conn = precog_mesh::transport::connect(&c.addrs[0], t)
+            .await
+            .unwrap();
+        let hello = Hello {
+            token: "secret-token".into(),
+            node_id: None,
+        };
+        conn.call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
+            .await
+            .unwrap();
+        let sub = serde_json::to_vec(&Subscribe {
+            stream: Some("s".into()),
+            from_start: false,
+        })
+        .unwrap();
+        let mut feeds = vec![];
+        for i in 0..=precog_mesh::node::MAX_FEEDS_PER_CONN {
+            let mut rx = conn
+                .subscribe(Kind::Subscribe, sub.clone().into(), 8)
+                .await
+                .unwrap();
+            let first = tokio::time::timeout(t, rx.recv()).await;
+            let first = first
+                .unwrap_or_else(|_| panic!("feed {i} got no answer"))
+                .unwrap();
+            let want = if i < precog_mesh::node::MAX_FEEDS_PER_CONN {
+                Kind::Push
+            } else {
+                Kind::Error
+            };
+            assert_eq!(first.kind, want, "feed {i}");
+            feeds.push(rx);
         }
     }
 }

@@ -285,8 +285,15 @@ A node knows three kinds of token (`NodeConfig`):
 
 A connection's `Hello` decides who it is for good (`Node::authenticate`): a `node_id` with the
 peers' token is a peer; without one, the unscoped token or a scoped one is a client. Every
-configured token is compared, in constant time, so a miss takes as long as a hit. A scoped token
-equal to another token, or empty, is refused when the node opens.
+configured token is compared, each without stopping at the first byte that differs, so a miss
+takes as long as a hit (a token's length is not hidden).
+
+A config that would not confine a token is refused when the node opens, so its mistakes fail
+closed: an empty token (anyone's), a peers' token that is the clients', scoped tokens without a
+peers' token (the unscoped token would make a peer), a scoped token that is empty or another
+token, an empty prefix (every stream: that is the unscoped token), and a field of a token
+mistyped (`"writes": false` is not a token that reads and writes). A prefix is a prefix of
+bytes: `"acme"` also reaches `acmecorp/...`, so end it with the separator (`"acme/"`).
 
 What a request needs is decided in one place (`need`, `Node::allow`), where requests enter
 (`Node::handle`, `Node::push_loop`):
@@ -301,13 +308,31 @@ What a request needs is decided in one place (`need`, `Node::allow`), where requ
 A scoped token never reaches the node's own `__` streams (reader positions), whatever its
 prefixes. Reader groups are scoped by the stream they are on: a group's name is not a secret.
 
+**A commit is a write a reader makes.** A token that may only read still commits its position,
+and a position is durable, replicated, kept in RAM on every node and removed by no retention.
+So a commit is bounded: a group's name is 1 to 255 bytes with no NUL, a position is at most
+1 MiB encoded, and a scoped token's position names only writer logs its stream has on the node
+(it holds no more than the stream's writers put there; a stream nobody wrote takes no commit).
+These are checked before the commit takes its number in the node's log, so a refused commit
+leaves no sequence nobody wrote. What stays unbounded is the number of groups on a stream: each
+costs a commit's durable append, and nothing removes a group nobody reads with any more.
+
+**`/metrics` is not behind a token.** It is plain HTTP on its own port (`listen_metrics`) and
+names every reader group and stream with its lag: bind it where only the operator's scraper
+reaches. Names are a client's to choose, so they are escaped as label values (`label`): a quote
+or a newline in a group's name stays inside its label.
+
+A connection carries at most 1024 live feeds (`MAX_FEEDS_PER_CONN`): a feed is a task that walks
+the node's log for as long as the connection lives, and the next one is refused.
+
 Not built: tokens issued, expired or revoked without a restart (they are static config), quotas,
 and TLS; the token crosses the network in the clear, as the shared one did.
 
 Tests: `node::props_tokens` (the scope rule as a property; every request kind's need; who a
 connection is, with and without a peers' token; each way in, inside and outside a scope) and
-`a_tenant_s_token_reaches_its_streams_on_every_node_and_only_peers_replicate`
-(`tests/cluster.rs`, 3 nodes over TCP).
+`props_tokens` in `tests/cluster.rs` (3 nodes over TCP; the feeds a connection carries), and
+`features/tokens.feature` (real node processes: a tenant within its prefix through a node's
+restart, and refused everything outside it).
 
 ## Guarantees (and what is traded away)
 

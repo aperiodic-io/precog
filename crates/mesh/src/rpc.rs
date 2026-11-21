@@ -125,8 +125,16 @@ impl RpcClient {
                             }
                         }
                         Ok(Some(f)) => {
-                            if let Some(tx) = pending.lock().remove(&f.req_id) {
+                            let call = pending.lock().remove(&f.req_id);
+                            if let Some(tx) = call {
                                 let _ = tx.send(f);
+                            } else if f.kind == Kind::Error {
+                                // a feed the node refused: its answer, then its end (the
+                                // subscriber is told at once, not by a timeout)
+                                let sub = subs.lock().remove(&f.req_id);
+                                if let Some(tx) = sub {
+                                    let _ = tx.send(f).await;
+                                }
                             }
                         }
                         Ok(None) => break,
