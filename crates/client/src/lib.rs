@@ -53,8 +53,12 @@ pub enum Start {
     },
 }
 
+/// Trusts the CA certificates in a PEM file for every `tls://` node this process connects to:
+/// call it before `Client::connect` to a cluster that serves TLS.
+pub use precog_mesh::transport::trust as trust_ca;
+
 impl Client {
-    /// `nodes`: `tcp://host:port` of every node.
+    /// `nodes`: `tcp://host:port` of every node, or `tls://host:port` (see `trust_ca`).
     pub fn connect(nodes: &[impl AsRef<str>], token: &str) -> Result<Client> {
         let addrs = nodes
             .iter()
