@@ -29,6 +29,8 @@ gungraun = "0.19.4"
 proptest = "1"
 cucumber = "0.23"
 tempfile = "3"
+# (the SDK depends on this crate: a dev-dependency back, for the acceptance scenarios it drives)
+precog-client = { path = "../client" }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 # Feature files under tests/acceptance/features driven against real precog-node processes.

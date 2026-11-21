@@ -3054,6 +3054,7 @@ dependencies = [
  "gungraun",
  "lz4_flex",
  "parking_lot",
+ "precog-client",
  "precog-storage",
  "proptest",
  "rand 0.9.5",

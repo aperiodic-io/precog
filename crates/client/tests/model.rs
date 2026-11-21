@@ -314,4 +314,86 @@ mod model {
             rt.block_on(run(down, ops))?;
         }
     }
+    /// An event's bytes: its own, so that no mix of two events equals a third.
+    fn large_payload(i: usize, n: usize) -> Vec<u8> {
+        (0..n).map(|j| (i * 31 + j / 7) as u8).collect()
+    }
+
+    /// Why: an agent session's events run to megabytes, and the broker takes a batch of at
+    /// most 8 MiB. Through the SDK on a cluster, with a node down or not, events of any size
+    /// come back whole, once and in order: across batches, when the same event is sent twice
+    /// (its dedup id), and for a reader that stops anywhere, commits and resumes (it restarts
+    /// the event it was inside from its first chunk). A reader that is not chunked sees the
+    /// chunks as they are stored.
+    async fn large(
+        down: Option<usize>,
+        sizes: Vec<usize>,
+        polls: usize,
+    ) -> Result<(), TestCaseError> {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Cluster::new(dir.path(), down).await;
+        let client = Client::connect(&c.addrs, "tok").unwrap();
+        let mut p = client.producer("big", "w");
+        p.set_chunked(true);
+        for (i, &n) in sizes.iter().enumerate() {
+            p.send(i as u64, format!("id{i}").as_bytes(), &large_payload(i, n));
+        }
+        // the first event again, as a retry of the application sends it
+        p.send(0, b"id0", &large_payload(0, sizes[0]));
+        p.sync().await.unwrap();
+        let want: Vec<Vec<u8>> = (sizes.iter().enumerate())
+            .map(|(i, &n)| large_payload(i, n))
+            .collect();
+        let payloads = |evs: Vec<Event>| {
+            evs.into_iter()
+                .map(|e| e.payload.to_vec())
+                .collect::<Vec<_>>()
+        };
+        let mut all = client.consumer("big", "g", Start::Beginning).await.unwrap();
+        all.set_chunked(true);
+        let got = payloads(drain(&mut all).await);
+        prop_assert_eq!(got.len(), want.len());
+        prop_assert!(got == want, "not the events sent");
+        // a reader that stops after a few small polls, commits, and another that resumes
+        let mut a = client.consumer("big", "h", Start::Beginning).await.unwrap();
+        a.set_chunked(true);
+        let mut first = vec![];
+        for _ in 0..polls {
+            first.extend(a.poll(1).await.unwrap());
+        }
+        a.commit().await.unwrap();
+        let or = Box::new(Start::End);
+        let mut b = client
+            .consumer("big", "h", Start::Committed { or })
+            .await
+            .unwrap();
+        b.set_chunked(true);
+        let both = payloads([first, drain(&mut b).await].concat());
+        prop_assert!(
+            both == want,
+            "{} events over the two readers, {} sent",
+            both.len(),
+            want.len()
+        );
+        // not chunked: the stored events, each with its tag
+        let raw = drain(&mut client.consumer_at("big", Default::default())).await;
+        let cut = sizes.iter().any(|&n| n > precog_client::CHUNK_BYTES);
+        prop_assert_eq!(raw.len() > sizes.len(), cut);
+        prop_assert!(raw.iter().all(|e| e.payload[0] <= 3));
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(6))]
+
+        #[test]
+        fn events_larger_than_a_batch_come_back_whole_once_and_in_order(
+            down in prop::option::of(0usize..3),
+            sizes in prop::collection::vec(prop_oneof![0usize..2_000, 400_000usize..3_500_000], 1..5),
+            polls in 0usize..4,
+        ) {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+            rt.block_on(large(down, sizes, polls))?;
+        }
+    }
 }
