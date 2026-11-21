@@ -252,6 +252,9 @@ deployment bounded by one 3-node cluster's disks.
 | A7 | [#41](https://github.com/aperiodic-io/precog/pull/41) `feat(mesh): TLS on the client and peer transports` | open |
 | A4 | [#42](https://github.com/aperiodic-io/precog/pull/42) `feat(client): events larger than a batch` | open |
 
-Phase 1 is these eight pull requests, stacked in this order. Found on the way and not part of
-it: an append retried on a second node before the first node's copy arrives can be stored with a
-different dedup outcome there (#42 has what was seen); it needs its own reproduction.
+Phase 1 is these eight pull requests, stacked in this order. Seen on the way and not explained:
+on a saturated machine, with megabyte batches sent uncompressed to a test cluster whose peers
+time out after 300 ms and whose repair is off, an append that held a duplicate event stayed
+`Unknown` on one copy for its whole 30 s deadline (#42 has what was seen). A suspicion, not a
+finding: the batch was retried on a second node before the first node's copy arrived and stored
+there with a different dedup outcome. It needs its own reproduction.
