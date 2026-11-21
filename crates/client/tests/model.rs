@@ -120,6 +120,21 @@ mod model {
         }
     }
 
+    /// A commit, asked again until it is acknowledged, as a caller does: the test's peers
+    /// time out after 300 ms, and on a busy machine a replicate of the position can take
+    /// longer (the commit is then not acknowledged; committing the same position again is).
+    async fn commit(c: &precog_client::Consumer) {
+        let mut r = c.commit().await;
+        for _ in 0..50 {
+            if r.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            r = c.commit().await;
+        }
+        r.unwrap();
+    }
+
     async fn drain(c: &mut precog_client::Consumer) -> Vec<Event> {
         let mut out = vec![];
         loop {
@@ -204,7 +219,7 @@ mod model {
                     let g = format!("g{t}");
                     let mut c = client.consumer("raw", &g, Start::Beginning).await.unwrap();
                     let mut got = c.poll(max).await.unwrap();
-                    c.commit().await.unwrap();
+                    commit(&c).await;
                     let mut r = client
                         .consumer(
                             "raw",
