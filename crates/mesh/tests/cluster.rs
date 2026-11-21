@@ -1120,6 +1120,7 @@ mod props_tokens {
                 prefixes: vec!["acme/".into()],
                 read: true,
                 write: true,
+                append_bytes_per_s: None,
             }];
         }
         for i in 0..3 {

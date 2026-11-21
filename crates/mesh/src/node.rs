@@ -216,6 +216,12 @@ pub struct TokenConfig {
     pub read: bool,
     #[serde(default = "yes")]
     pub write: bool,
+    /// At most this many bytes of appends a second through this node, after a burst of one
+    /// second's worth: an append over it waits, and is refused past `LIMIT_MAX_WAIT_NS`
+    /// (`Limiter`). None: no limit. Each node counts on its own: a client that appends
+    /// through all three gets three times this.
+    #[serde(default)]
+    pub append_bytes_per_s: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -295,6 +301,46 @@ struct Traffic {
     requests: AtomicU64,
     sent_bytes: AtomicU64,
     refused: AtomicU64,
+    /// Appends refused for the token's rate, and how long the others waited for it.
+    over_rate: AtomicU64,
+    rate_wait_us: AtomicU64,
+    limit: Option<Limiter>,
+}
+
+/// An idle token saves up this much of its rate, and an append waits at most this long for
+/// its turn: under a client's RPC timeout, so a waiting append is not also retried elsewhere.
+const LIMIT_BURST_NS: u64 = 1_000_000_000;
+const LIMIT_MAX_WAIT_NS: u64 = 500_000_000;
+
+/// A byte rate limit (the generic cell rate algorithm): one time, when the bytes admitted so
+/// far are paid for at the rate. An append goes ahead then, and adds its own bytes' time.
+struct Limiter {
+    rate: u64,
+    paid_at_ns: parking_lot::Mutex<u64>,
+}
+
+impl Limiter {
+    fn new(bytes_per_s: u64) -> Limiter {
+        Limiter {
+            rate: bytes_per_s,
+            paid_at_ns: Default::default(),
+        }
+    }
+
+    /// Admits an append of `bytes` at `now_ns`: how long it waits before it goes ahead. None:
+    /// longer than an append may wait, and nothing is charged.
+    fn admit(&self, bytes: u64, now_ns: u64) -> Option<u64> {
+        let cost = bytes as u128 * 1_000_000_000 / self.rate as u128;
+        let mut paid_at = self.paid_at_ns.lock();
+        // (time unused is credit, up to the burst)
+        let start = (*paid_at).max(now_ns.saturating_sub(LIMIT_BURST_NS));
+        let wait = start.saturating_sub(now_ns);
+        if wait > LIMIT_MAX_WAIT_NS {
+            return None;
+        }
+        *paid_at = start.saturating_add(cost.min(u64::MAX as u128) as u64);
+        Some(wait)
+    }
 }
 
 pub struct Node {
@@ -306,6 +352,8 @@ pub struct Node {
     trimmed: parking_lot::Mutex<BTreeMap<String, u64>>,
     /// Deletes this node accepted (`delete_stream`) that deleted something.
     deletes: AtomicU64,
+    /// The clock the rate limits run on.
+    started: Instant,
     wal: Wal,
     peers: Vec<Arc<Peer>>,
     repair_lock: tokio::sync::Mutex<()>,
@@ -683,6 +731,10 @@ impl Node {
                 !t.prefixes.iter().any(|p| p.is_empty()),
                 "a scoped token's prefix is empty: that is every stream (the unscoped token's)"
             );
+            anyhow::ensure!(
+                t.append_bytes_per_s != Some(0),
+                "a scoped token's append rate is 0: a token that may not write has `write` false"
+            );
             all.push(&t.token);
         }
         std::fs::create_dir_all(&cfg.data_dir)?;
@@ -790,7 +842,14 @@ impl Node {
         store.end_checkpoint(p, synced)?;
         store.set_failpoint(cfg.storage_failpoints.fail_at); // tests: faults past the open
         let node = Arc::new(Node {
-            traffic: (0..=cfg.tokens.len()).map(|_| Traffic::default()).collect(),
+            traffic: std::iter::once(None)
+                .chain(cfg.tokens.iter().map(|t| t.append_bytes_per_s))
+                .map(|rate| Traffic {
+                    limit: rate.map(Limiter::new),
+                    ..Default::default()
+                })
+                .collect(),
+            started: Instant::now(),
             trimmed: Default::default(),
             deletes: AtomicU64::new(0),
             cfg,
@@ -1467,7 +1526,7 @@ impl Node {
         ));
         // per client token, under its prefixes (never the token: a secret); tokens with the
         // same prefixes count together
-        let mut by_token: BTreeMap<String, [u64; 5]> = BTreeMap::new();
+        let mut by_token: BTreeMap<String, [u64; 7]> = BTreeMap::new();
         for (i, t) in self.traffic.iter().enumerate() {
             let name = match i.checked_sub(1) {
                 Some(i) => self.cfg.tokens[i].prefixes.join(","),
@@ -1479,6 +1538,8 @@ impl Node {
                 &t.requests,
                 &t.sent_bytes,
                 &t.refused,
+                &t.over_rate,
+                &t.rate_wait_us,
             ];
             let sum = by_token.entry(name).or_default();
             for (s, v) in sum.iter_mut().zip(all) {
@@ -1491,6 +1552,8 @@ impl Node {
             "requests",
             "sent_bytes",
             "refused",
+            "over_rate",
+            "rate_wait_microseconds",
         ];
         for (i, what) in names.iter().enumerate() {
             out.push_str(&format!("# TYPE precog_token_{what}_total counter\n"));
@@ -1943,6 +2006,22 @@ impl Node {
                     return reject(b.ident);
                 }
                 let len = batch.len() as u64;
+                // the token's rate: the append waits its turn, or is refused before any side
+                // effect with the answer a client retries (`Unknown`, no copy)
+                if let Some((t, l)) = traffic.and_then(|t| Some((t, t.limit.as_ref()?))) {
+                    let Some(wait) = l.admit(len, self.started.elapsed().as_nanos() as u64) else {
+                        t.over_rate.fetch_add(1, Ordering::Relaxed);
+                        let ack = Ack {
+                            status: AckStatus::Unknown,
+                            copies: 0,
+                            nodes: 0,
+                            crc: batch_crc(&batch),
+                        };
+                        return Ok(Frame::new(Kind::Ack, id, ack.encode()));
+                    };
+                    t.rate_wait_us.fetch_add(wait / 1000, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_nanos(wait)).await;
+                }
                 let ack = self.append(copies, batch).await;
                 if let Some(t) = traffic.filter(|_| ack.is_success()) {
                     t.appends.fetch_add(1, Ordering::Relaxed);
@@ -3660,6 +3739,7 @@ mod props_tokens {
             prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
             read,
             write,
+            append_bytes_per_s: None,
         }
     }
 
@@ -3673,7 +3753,7 @@ mod props_tokens {
             read: bool, write: bool,
             stream in "[a_/]{0,5}", kind in 0..3,
         ) {
-            let t = TokenConfig { token: "t".into(), prefixes: prefixes.clone(), read, write };
+            let t = TokenConfig { append_bytes_per_s: None, token: "t".into(), prefixes: prefixes.clone(), read, write };
             let under = prefixes.iter().any(|p| stream.len() >= p.len() && stream[..p.len()] == p[..]);
             let own = stream.len() >= 2 && &stream[..2] == "__";
             let (need, want) = match kind {
@@ -4423,6 +4503,7 @@ mod props_delete {
             prefixes: vec!["acme/".into()],
             read: true,
             write: true,
+            append_bytes_per_s: None,
         }];
         let node = Node::open(c.clone()).await.unwrap();
         for seq in 0..3 {
@@ -4683,6 +4764,7 @@ mod props_metrics {
             prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
             read: true,
             write: true,
+            append_bytes_per_s: None,
         };
         c.tokens = vec![
             token("t0", &["s/"]),
@@ -4978,6 +5060,215 @@ mod props_metrics {
             m.lines().any(|l| l == "precog_stream_deletes_total 1"),
             "{m}"
         );
+    }
+}
+
+/// The append rate limit against the two things it promises: a token's appends leave no faster
+/// than its rate (plus the burst an idle token saves up), and a token within its rate is not
+/// held back.
+#[cfg(test)]
+mod model_limiter {
+    use super::*;
+    use proptest::prelude::*;
+
+    const S: u64 = 1_000_000_000;
+
+    proptest! {
+        /// Why: a rate limit that lets more through than its rate protects no neighbour, and
+        /// one that delays or refuses a token within its rate breaks a tenant that did nothing
+        /// wrong. For any appends at any times: those admitted, at the times they go ahead,
+        /// carry no more bytes over any stretch than the rate allows for it plus one burst;
+        /// none waits longer than the bound; a refusal charges nothing; and an append that
+        /// finds the token's earlier bytes paid for goes ahead at once.
+        #[test]
+        fn admitted_appends_keep_to_the_rate_and_the_patient_are_not_held(
+            rate in prop_oneof![1u64..2_000, 1_000u64..50_000_000],
+            appends in prop::collection::vec((0u64..3 * S, 1u64..9_000_000), 1..60),
+        ) {
+            let l = Limiter::new(rate);
+            let (mut now, mut went) = (0u64, Vec::<(u64, u64)>::new());
+            for (gap, bytes) in appends {
+                now += gap;
+                let before = *l.paid_at_ns.lock();
+                match l.admit(bytes, now) {
+                    Some(wait) => {
+                        prop_assert!(wait <= LIMIT_MAX_WAIT_NS);
+                        // nothing owed: no wait
+                        prop_assert!(before > now || wait == 0, "{} {} {}", before, now, wait);
+                        prop_assert_eq!(wait, before.saturating_sub(now));
+                        went.push((now + wait, bytes));
+                    }
+                    None => {
+                        prop_assert!(before - now > LIMIT_MAX_WAIT_NS);
+                        prop_assert_eq!(*l.paid_at_ns.lock(), before, "a refusal charges nothing");
+                    }
+                }
+            }
+            // every stretch from one admitted append to a later one
+            for i in 0..went.len() {
+                let mut bytes = 0u128;
+                for j in i + 1..went.len() {
+                    bytes += went[j - 1].1 as u128;
+                    let stretch = (went[j].0 - went[i].0 + LIMIT_BURST_NS) as u128;
+                    // (each append's time at the rate is rounded down by under a nanosecond)
+                    let allowed = rate as u128 * (stretch + (j - i) as u128);
+                    prop_assert!(bytes * S as u128 <= allowed, "{} bytes in {} ns", bytes, stretch);
+                }
+            }
+        }
+
+        /// Why: a writer that sends at its rate, however it cuts its bytes into batches, must
+        /// never wait and never be refused: the limit is for the writer over its rate.
+        #[test]
+        fn a_writer_at_its_rate_never_waits(rate in 1_000u64..50_000_000, sizes in prop::collection::vec(1u64..4_000_000, 1..80)) {
+            let l = Limiter::new(rate);
+            let mut now = 5 * S;
+            for bytes in sizes {
+                prop_assert_eq!(l.admit(bytes, now), Some(0));
+                // the next one no sooner than this one's bytes take at the rate
+                now += (bytes as u128 * S as u128).div_ceil(rate as u128) as u64;
+            }
+        }
+    }
+
+    fn config(dir: &std::path::Path) -> NodeConfig {
+        let mut c = NodeConfig::single(0, "a", dir.into(), "tok".into());
+        (c.segment_size, c.peer_token) = (1 << 20, Some("peers".into()));
+        let token = |token: &str, prefix: &str, rate| TokenConfig {
+            token: token.into(),
+            prefixes: vec![prefix.into()],
+            read: true,
+            write: true,
+            append_bytes_per_s: rate,
+        };
+        c.tokens = vec![token("t0", "a/", Some(40_000)), token("t1", "b/", None)];
+        c
+    }
+
+    fn batch(stream: &str, seq: u64) -> Bytes {
+        let log = LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        Batch::encode(&log, seq, &[(seq, &[7u8; 1_000][..])]).unwrap()
+    }
+
+    async fn append(node: &Arc<Node>, ident: Ident, b: Bytes) -> Ack {
+        let f = Frame::new(Kind::Append, 1, encode_append(1, &b));
+        parse_frame_ack(&node.handle(f, ident).await.unwrap()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_token_over_its_rate_waits_then_is_refused_and_its_neighbour_is_not_held() {
+        // Why: one tenant's burst must not become every tenant's latency. A token over its
+        // rate is slowed (its acks wait), and past what an append may wait it is refused
+        // before any side effect, with an answer its client retries; a token without a limit,
+        // on the same node at the same time, is acknowledged as fast as ever.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(config(d.path())).await.unwrap();
+        let size = batch("a/1", 0).len() as u64;
+        // one at a time: its saved-up second goes at once, the rest at its rate (40 kB/s)
+        let start = Instant::now();
+        for seq in 0..60 {
+            assert!(
+                append(&node, Ident::Scoped(0), batch("a/1", seq))
+                    .await
+                    .is_success()
+            );
+        }
+        let took = start.elapsed().as_millis() as u64;
+        let at_rate = (60 * size - 40_000) * 1000 / 40_000;
+        assert!(
+            took >= at_rate * 9 / 10,
+            "{took} ms, at its rate {at_rate} ms"
+        );
+        // its waits are counted, in microseconds: no more than the time it all took (one
+        // append at a time: the waits do not overlap; on a slow disk there is little to wait for)
+        let waited = node.traffic[1].rate_wait_us.load(Ordering::Relaxed);
+        assert!(waited <= took * 1000, "{waited} us waited in {took} ms");
+        // all at once: some wait their turn, the rest are refused and leave nothing behind
+        let held = node.store.totals().0;
+        let burst = (60..260).map(|seq| append(&node, Ident::Scoped(0), batch("a/1", seq)));
+        let neighbour = async {
+            let start = Instant::now();
+            for seq in 0..50 {
+                assert!(
+                    append(&node, Ident::Scoped(1), batch("b/1", seq))
+                        .await
+                        .is_success()
+                );
+            }
+            start.elapsed()
+        };
+        let burst = async {
+            let start = Instant::now();
+            (futures::future::join_all(burst).await, start.elapsed())
+        };
+        let ((acks, took), calm) = tokio::join!(burst, neighbour);
+        let ok = acks.iter().filter(|a| a.is_success()).count() as u64;
+        let refused: Vec<&Ack> = acks.iter().filter(|a| !a.is_success()).collect();
+        // no more went ahead than its rate gives the time they took, and the second it may
+        // have saved up (the appends before, on a slow disk, were under its rate)
+        let most = (took.as_millis() as u64 + 1000) * 40_000 / 1000 / size + 2;
+        assert!(
+            ok >= 10 && ok <= most,
+            "{ok} of 200 went ahead (at most {most})"
+        );
+        assert!(!refused.is_empty() && took.as_millis() >= 400, "{took:?}");
+        assert!(
+            refused
+                .iter()
+                .all(|a| (a.status, a.copies) == (AckStatus::Unknown, 0))
+        );
+        assert_eq!(node.store.totals().0, held + ok + 50);
+        // the neighbour waited for no rate (below), and loosely for nothing else
+        assert!(
+            calm.as_millis() < 5_000,
+            "the neighbour's 50 appends took {calm:?}"
+        );
+        // and it shows: under the token's prefixes
+        let m = node.metrics();
+        let line = |name: &str| {
+            let head = format!("precog_token_{name}{{token=\"a/\"}} ");
+            let v = m.lines().find_map(|l| l.strip_prefix(head.as_str()));
+            v.unwrap_or_else(|| panic!("no {head}"))
+                .parse::<u64>()
+                .unwrap()
+        };
+        assert_eq!(line("over_rate_total"), refused.len() as u64);
+        assert!(line("rate_wait_microseconds_total") >= at_rate * 900);
+        for none in ["over_rate_total", "rate_wait_microseconds_total"] {
+            let line = format!("precog_token_{none}{{token=\"b/\"}} 0");
+            assert!(m.contains(&line), "no {line} in {m}");
+        }
+    }
+
+    #[test]
+    fn an_append_waits_up_to_the_bound_and_is_refused_just_past_it() {
+        // Why: the bound is what a client's RPC timeout is set against: an append that would
+        // wait exactly that long still goes ahead, and one a millisecond later does not.
+        let l = Limiter::new(1_000);
+        let half = LIMIT_MAX_WAIT_NS / 1_000_000; // bytes that take the bound to pay for
+        // (at time 0 a token has saved nothing up)
+        assert_eq!(l.admit(half, 0), Some(0));
+        assert_eq!(l.admit(1, 0), Some(LIMIT_MAX_WAIT_NS));
+        assert_eq!(l.admit(1, 0), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rate_of_zero_is_refused_at_the_open() {
+        // Why: a rate of 0 would refuse every append of the token for ever; a tenant that may
+        // not write is said with `write: false`.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = config(d.path());
+        c.tokens[0].append_bytes_per_s = Some(0);
+        assert!(Node::open(c).await.is_err());
+        let json = r#"{"token":"t","prefixes":["a/"],"append_bytes_per_s":1000}"#;
+        let t: TokenConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(t.append_bytes_per_s, Some(1000));
+        let t: TokenConfig = serde_json::from_str(r#"{"token":"t","prefixes":["a/"]}"#).unwrap();
+        assert_eq!(t.append_bytes_per_s, None);
     }
 }
 
