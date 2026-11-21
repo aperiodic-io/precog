@@ -38,7 +38,16 @@ pub struct NodeConfig {
     pub id: u32,
     pub domain: String,
     pub data_dir: PathBuf,
+    /// The unscoped token: its holder reaches every stream and every request a client can make.
+    /// Peers present it too unless `peer_token` is set.
     pub token: String,
+    /// Tokens confined to stream prefixes and to reading or writing (a tenant's).
+    #[serde(default)]
+    pub tokens: Vec<TokenConfig>,
+    /// What a peer presents. Set it wherever `tokens` are given out, or whoever learns the
+    /// unscoped token can also replicate. Unset: `token`.
+    #[serde(default)]
+    pub peer_token: Option<String>,
     pub listen_tcp: Option<SocketAddr>,
     /// Prometheus `/metrics` and `/health` (503 once storage is fenced) over plain HTTP.
     #[serde(default)]
@@ -111,6 +120,8 @@ impl NodeConfig {
             domain: domain.into(),
             data_dir,
             token,
+            tokens: vec![],
+            peer_token: None,
             listen_tcp: None,
             listen_metrics: None,
             peers: vec![],
@@ -191,6 +202,36 @@ pub fn ordinal(hostname: &str) -> Result<u32> {
         .with_context(|| format!("no ordinal in hostname {hostname:?}"))?;
     n.parse()
         .with_context(|| format!("no ordinal in hostname {hostname:?}"))
+}
+
+/// A client token that reaches only the streams whose name starts with one of `prefixes`, to
+/// read them, write them or both. It never reaches the node's own `__` streams, a request that
+/// is not about one stream (status, repair, a feed of every stream), or replication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenConfig {
+    pub token: String,
+    pub prefixes: Vec<String>,
+    #[serde(default = "yes")]
+    pub read: bool,
+    #[serde(default = "yes")]
+    pub write: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl TokenConfig {
+    fn allows(&self, need: Need<'_>) -> bool {
+        let (stream, may) = match need {
+            Need::Read(s) => (s, self.read),
+            Need::Write(s) => (s, self.write),
+            Need::All => return false,
+        };
+        let reaches = self.prefixes.iter().any(|p| stream.starts_with(p.as_str()));
+        may && reaches && !stream.starts_with("__")
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -279,6 +320,9 @@ pub struct Node {
     classes: bool,
 }
 
+/// Live feeds one connection carries at a time.
+pub const MAX_FEEDS_PER_CONN: usize = 1024;
+
 /// Records of a peer's log per inventory request.
 const INVENTORY_PAGE: u32 = 16 << 10;
 
@@ -317,6 +361,25 @@ fn groups(kept: &[Kept], limit: u64) -> Vec<Vec<u64>> {
 
 /// The internal compacted stream of consumer positions, keyed by group and stream.
 pub const POSITIONS: &str = "__positions";
+
+/// A name as a label's value in `/metrics`: a backslash, a quote and a newline escaped, as the
+/// exposition format reads them back. A group's or a stream's name is a client's to choose.
+fn label(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Most bytes of a reader's position (its cursor, encoded): what one commit may add to every
+/// node's RAM.
+const MAX_POSITION_BYTES: usize = 1 << 20;
 
 fn position_key(group: &str, stream: &str) -> Vec<u8> {
     [group.as_bytes(), b"\0", stream.as_bytes()].concat()
@@ -511,10 +574,39 @@ enum Local {
     Conflict(String),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ident {
+    /// The unscoped token's holder.
     Client,
+    /// The holder of `cfg.tokens[i]`.
+    Scoped(usize),
     Peer(u32),
+}
+
+/// What a request needs of its connection's token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Need<'a> {
+    Read(&'a str),
+    Write(&'a str),
+    /// Not about one stream: no scoped token has it.
+    All,
+}
+
+/// What a control request needs: its stream to read (a commit moves a reader's position, which
+/// is its to read), or everything.
+fn need(c: &Control) -> Need<'_> {
+    match c {
+        Control::Read { stream, .. }
+        | Control::ReadCursor { stream, .. }
+        | Control::CursorAt { stream, .. }
+        | Control::Commit { stream, .. }
+        | Control::Position { stream, .. }
+        | Control::Latest { stream } => Need::Read(stream),
+        Control::FetchLog { log, .. } => Need::Read(&log.stream),
+        Control::Status | Control::Repair | Control::Fetch { .. } | Control::Inventory { .. } => {
+            Need::All
+        }
+    }
 }
 
 impl Node {
@@ -526,6 +618,32 @@ impl Node {
             bail!("stream class {k:?} cannot be compacted: name each compacted stream");
         }
         let classes = cfg.streams.keys().any(|k| k.ends_with('*'));
+        // a config that would not confine a token fails closed: an empty token is anyone's, a
+        // peers' token that is the clients' separates nothing, and with scoped tokens given
+        // out the unscoped one must not make a peer
+        anyhow::ensure!(!cfg.token.is_empty(), "the token is empty");
+        anyhow::ensure!(
+            cfg.peer_token
+                .as_ref()
+                .is_none_or(|p| !p.is_empty() && *p != cfg.token),
+            "the peers' token is empty or the clients' token"
+        );
+        anyhow::ensure!(
+            cfg.tokens.is_empty() || cfg.peer_token.is_some(),
+            "scoped tokens need a peers' token (peer_token): the unscoped token would make a peer"
+        );
+        // a scoped token that is also the unscoped or the peer token would not be confined
+        let mut all = vec![&cfg.token];
+        all.extend(&cfg.peer_token);
+        for t in &cfg.tokens {
+            anyhow::ensure!(!t.token.is_empty(), "a scoped token is empty");
+            anyhow::ensure!(!all.contains(&&t.token), "a scoped token is given twice");
+            anyhow::ensure!(
+                !t.prefixes.iter().any(|p| p.is_empty()),
+                "a scoped token's prefix is empty: that is every stream (the unscoped token's)"
+            );
+            all.push(&t.token);
+        }
         std::fs::create_dir_all(&cfg.data_dir)?;
         let wal = Wal::open(cfg.storage())?;
         let mut dedup = cfg
@@ -744,6 +862,22 @@ impl Node {
             .map(|(l, s)| (l.writer.as_str(), l.epoch, *s))
             .collect();
         let payload = serde_json::to_vec(&entries)?;
+        // before the commit takes its number: one refused after it would leave a sequence of
+        // this node's log that nobody wrote, which feeds and repair then wait for
+        let name = |n: &str| !n.is_empty() && n.len() <= MAX_NAME && !n.contains('\0');
+        anyhow::ensure!(
+            name(group),
+            "a reader group's name is 1 to {MAX_NAME} bytes, none of them NUL"
+        );
+        anyhow::ensure!(
+            name(stream),
+            "a stream's name is 1 to {MAX_NAME} bytes, none of them NUL"
+        );
+        anyhow::ensure!(
+            payload.len() <= MAX_POSITION_BYTES,
+            "a position of {} bytes (at most {MAX_POSITION_BYTES})",
+            payload.len()
+        );
         let seq = self.pos_seq.fetch_add(1, Ordering::Relaxed);
         // the commit time orders commits across nodes (the newest wins everywhere); on this node
         // it never goes back (equal times fall to the sequence). ponytail: commits through two
@@ -1126,6 +1260,7 @@ impl Node {
         }
         out.push_str("# TYPE precog_retention_forced_total counter\n");
         for (stream, n) in self.forced.lock().iter() {
+            let stream = label(stream);
             out.push_str(&format!(
                 "precog_retention_forced_total{{stream=\"{stream}\"}} {n}\n"
             ));
@@ -1166,7 +1301,7 @@ impl Node {
                     )
                 })
                 .sum();
-            let labels = format!("group=\"{group}\",stream=\"{stream}\"");
+            let labels = format!("group=\"{}\",stream=\"{}\"", label(group), label(stream));
             out.push_str(&format!("precog_group_lag_events{{{labels}}} {lag}\n"));
             let at = self.wal.reader.entries(lsn, 1).unwrap_or_else(|e| {
                 tracing::error!("reading the log's index at lsn {lsn}: {e}");
@@ -1272,13 +1407,29 @@ impl Node {
             .send(Frame::new(Kind::Ack, hello.req_id, Bytes::new()))
             .await;
         let per_conn = Arc::new(Semaphore::new(4096));
+        // live feeds are not requests: each is a task that walks the node's log for as long as
+        // its connection lives, so a connection carries a bounded number of them
+        let feeds = Arc::new(Semaphore::new(MAX_FEEDS_PER_CONN));
         loop {
             let f = match read_frame(&mut r, &mut buf).await {
                 Ok(Some(f)) => f,
                 _ => break,
             };
             if f.kind == Kind::Subscribe {
-                tokio::spawn(self.clone().push_loop(f, tx.clone()));
+                let (node, tx, id) = (self.clone(), tx.clone(), f.req_id);
+                match feeds.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(async move {
+                            node.push_loop(f, ident, tx).await;
+                            drop(permit);
+                        });
+                    }
+                    Err(_) => {
+                        let e =
+                            format!("more than {MAX_FEEDS_PER_CONN} live feeds on a connection");
+                        let _ = tx.send(Frame::new(Kind::Error, id, Bytes::from(e))).await;
+                    }
+                }
                 continue;
             }
             let Ok(permit) = per_conn.clone().acquire_owned().await else {
@@ -1303,8 +1454,14 @@ impl Node {
     /// subscription keeps its own cursor into the node's log, so a slow
     /// subscriber only slows its own connection (bounded channel + transport
     /// flow control) and never drops data or blocks writers.
-    async fn push_loop(self: Arc<Self>, req: Frame, tx: mpsc::Sender<Frame>) {
-        let sub: Subscribe = match serde_json::from_slice(&req.body) {
+    async fn push_loop(self: Arc<Self>, req: Frame, ident: Ident, tx: mpsc::Sender<Frame>) {
+        let sub = serde_json::from_slice::<Subscribe>(&req.body)
+            .map_err(anyhow::Error::from)
+            .and_then(|sub| {
+                let need = sub.stream.as_deref().map_or(Need::All, Need::Read);
+                self.allow(ident, need).map(|()| sub)
+            });
+        let sub = match sub {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx
@@ -1421,13 +1578,18 @@ impl Node {
 
     fn authenticate(&self, body: &[u8]) -> Result<Ident> {
         let h: Hello = serde_json::from_slice(body)?;
-        if !constant_time_eq(h.token.as_bytes(), self.cfg.token.as_bytes()) {
-            bail!("bad token");
-        }
+        let is = |t: &str| constant_time_eq(h.token.as_bytes(), t.as_bytes());
         match h.node_id {
-            None => Ok(Ident::Client),
+            None => {
+                // every token is compared: a miss takes as long as a hit
+                let scoped = (self.cfg.tokens.iter().enumerate()).fold(None, |found, (i, t)| {
+                    is(&t.token).then_some(Ident::Scoped(i)).or(found)
+                });
+                (is(&self.cfg.token).then_some(Ident::Client).or(scoped)).context("bad token")
+            }
             Some(id) => {
-                // A token holder may claim any configured peer id.
+                // A holder of the peers' token may claim any configured peer id.
+                anyhow::ensure!(is(self.peer_token()), "bad token");
                 anyhow::ensure!(
                     self.peers.iter().any(|p| p.cfg.id == id),
                     "unknown peer {id}"
@@ -1437,11 +1599,41 @@ impl Node {
         }
     }
 
+    /// What this node's peers present, and it to them.
+    fn peer_token(&self) -> &str {
+        self.cfg.peer_token.as_deref().unwrap_or(&self.cfg.token)
+    }
+
+    /// Whether the connection may do what the request needs. The unscoped token and peers may
+    /// do anything a client can ask (replication has its own check); a scoped token only reads
+    /// or writes, as it is allowed, streams under its prefixes that are not the node's own.
+    fn allow(&self, ident: Ident, need: Need<'_>) -> Result<()> {
+        match ident {
+            Ident::Scoped(i) if !self.cfg.tokens[i].allows(need) => bail!("forbidden: {need:?}"),
+            _ => Ok(()),
+        }
+    }
+
     async fn handle(self: &Arc<Self>, f: Frame, ident: Ident) -> Result<Frame> {
         let id = f.req_id;
         match f.kind {
             Kind::Append => {
                 let (copies, batch) = decode_append(f.body)?;
+                // ponytail: a scoped token's batch is parsed twice (here for its stream, then by
+                // `append`); one that does not parse is rejected there
+                if let Ident::Scoped(_) = ident
+                    && let Ok(b) = Batch::parse(batch.clone())
+                    && let Err(e) = self.allow(ident, Need::Write(&b.id.log.stream))
+                {
+                    tracing::debug!("append refused: {e}");
+                    let ack = Ack {
+                        status: AckStatus::Rejected,
+                        copies: 0,
+                        nodes: 0,
+                        crc: b.ident,
+                    };
+                    return Ok(Frame::new(Kind::Ack, id, ack.encode()));
+                }
                 let ack = self.append(copies, batch).await;
                 Ok(Frame::new(Kind::Ack, id, ack.encode()))
             }
@@ -1459,6 +1651,7 @@ impl Node {
             }
             Kind::Control => {
                 let c: Control = serde_json::from_slice(&f.body)?;
+                self.allow(ident, need(&c))?;
                 if let Control::Fetch { ids } = &c {
                     let mut out = BytesMut::new();
                     let streams: HashSet<&str> =
@@ -1520,7 +1713,7 @@ impl Node {
         }
     }
 
-    async fn control(self: &Arc<Self>, c: Control, _ident: Ident) -> Result<ControlResp> {
+    async fn control(self: &Arc<Self>, c: Control, ident: Ident) -> Result<ControlResp> {
         Ok(match c {
             Control::Status => ControlResp::Status(self.status()),
             Control::Read {
@@ -1568,6 +1761,22 @@ impl Node {
                 stream,
                 cursor,
             } => {
+                // a commit is durable, replicated and kept in RAM, and a token that may only
+                // read can make one: it names only writer logs its stream has here, so it
+                // holds no more than the stream's writers put there
+                if let Ident::Scoped(_) = ident {
+                    let has: HashSet<(String, u64)> =
+                        (self.store.frontiers(Some(&stream)).into_iter())
+                            .map(|f| (f.log.writer, f.log.epoch))
+                            .collect();
+                    let known = cursor
+                        .iter()
+                        .all(|(w, e, _)| has.contains(&(w.clone(), *e)));
+                    anyhow::ensure!(
+                        known && !has.is_empty(),
+                        "a position names only writer logs stream {stream:?} has on this node"
+                    );
+                }
                 self.commit_position(
                     &group,
                     &stream,
@@ -1905,7 +2114,7 @@ impl Node {
         let res: Result<Arc<RpcClient>> = async {
             let c = crate::transport::connect(&p.addr, timeout).await?;
             let hello = Hello {
-                token: self.cfg.token.clone(),
+                token: self.peer_token().into(),
                 node_id: Some(self.cfg.id),
             };
             c.call(
@@ -3010,10 +3219,11 @@ mod props_classes {
             from_start: true,
         };
         let body = Bytes::from(serde_json::to_vec(&sub).unwrap());
-        let feed = tokio::spawn(
-            node.clone()
-                .push_loop(Frame::new(Kind::Subscribe, 7, body), tx),
-        );
+        let feed = tokio::spawn(node.clone().push_loop(
+            Frame::new(Kind::Subscribe, 7, body),
+            Ident::Client,
+            tx,
+        ));
         assert!(rx.recv().await.unwrap().body.is_empty(), "the feed's start");
         write(&node, "s/5", 1, 100).await;
         let pushed = Batch::parse(rx.recv().await.unwrap().body).unwrap();
@@ -3122,6 +3332,683 @@ mod props_classes {
             node.metrics()
                 .contains("precog_retention_forced_total{stream=\"s/*\"}")
         );
+    }
+}
+
+#[cfg(test)]
+mod props_tokens {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn token(token: &str, prefixes: &[&str], read: bool, write: bool) -> TokenConfig {
+        TokenConfig {
+            token: token.into(),
+            prefixes: prefixes.iter().map(|p| p.to_string()).collect(),
+            read,
+            write,
+        }
+    }
+
+    proptest! {
+        /// Why: a tenant's token must reach its own streams and nothing else. Against the rule
+        /// spelled out: only a read or a write, only if the token has that, only of a stream
+        /// under one of its prefixes, never of the node's own streams.
+        #[test]
+        fn a_scoped_token_reaches_only_its_prefixes_to_read_or_write(
+            prefixes in prop::collection::vec("[a_/]{0,3}", 0..4),
+            read: bool, write: bool,
+            stream in "[a_/]{0,5}", kind in 0..3,
+        ) {
+            let t = TokenConfig { token: "t".into(), prefixes: prefixes.clone(), read, write };
+            let under = prefixes.iter().any(|p| stream.len() >= p.len() && stream[..p.len()] == p[..]);
+            let own = stream.len() >= 2 && &stream[..2] == "__";
+            let (need, want) = match kind {
+                0 => (Need::Read(&stream), read && under && !own),
+                1 => (Need::Write(&stream), write && under && !own),
+                _ => (Need::All, false),
+            };
+            prop_assert_eq!(t.allows(need), want);
+        }
+    }
+
+    #[test]
+    fn every_request_about_one_stream_needs_that_stream_and_the_others_everything() {
+        // Why: a request classified wrongly is a hole in every tenant's wall. Each kind of
+        // control request, with what it must need (a new kind does not compile until `need`
+        // names it).
+        let (s, log) = ("acme/1".to_string(), || LogId {
+            stream: "acme/1".into(),
+            writer: "w".into(),
+            epoch: 1,
+        });
+        let read = Need::Read("acme/1");
+        let cases = [
+            (
+                Control::Read {
+                    stream: s.clone(),
+                    from_time_us: 0,
+                    limit: 1,
+                },
+                read,
+            ),
+            (
+                Control::ReadCursor {
+                    stream: s.clone(),
+                    cursor: vec![],
+                    max_bytes: 1,
+                },
+                read,
+            ),
+            (
+                Control::CursorAt {
+                    stream: s.clone(),
+                    time_ms: 0,
+                },
+                read,
+            ),
+            (
+                Control::Commit {
+                    group: "g".into(),
+                    stream: s.clone(),
+                    cursor: vec![],
+                },
+                read,
+            ),
+            (
+                Control::Position {
+                    group: "g".into(),
+                    stream: s.clone(),
+                },
+                read,
+            ),
+            (Control::Latest { stream: s.clone() }, read),
+            (
+                Control::FetchLog {
+                    log: log(),
+                    from_seq: 0,
+                    max_bytes: 1,
+                },
+                read,
+            ),
+            (Control::Status, Need::All),
+            (Control::Repair, Need::All),
+            (
+                Control::Fetch {
+                    ids: vec![BatchId {
+                        log: log(),
+                        first_seq: 0,
+                    }],
+                },
+                Need::All,
+            ),
+            (
+                Control::Inventory {
+                    from: 0,
+                    max: 1,
+                    incarnation: 0,
+                },
+                Need::All,
+            ),
+        ];
+        for (c, want) in &cases {
+            assert_eq!(need(c), *want, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_token_reads_and_writes_unless_its_config_says_otherwise_and_an_older_config_still_reads() {
+        // Why: a config is written by hand. Leaving `read` and `write` out must not make a
+        // token that can do nothing, and a node config from before tokens must still load.
+        let t: TokenConfig = serde_json::from_str(r#"{"token":"t","prefixes":["a/"]}"#).unwrap();
+        assert_eq!(t, token("t", &["a/"], true, true));
+        let t: TokenConfig =
+            serde_json::from_str(r#"{"token":"t","prefixes":["a/"],"write":false}"#).unwrap();
+        assert_eq!(t, token("t", &["a/"], true, false));
+        let c = NodeConfig::single(0, "a", "unused".into(), "tok".into());
+        let mut v = serde_json::to_value(&c).unwrap();
+        for field in ["tokens", "peer_token"] {
+            assert!(v.as_object_mut().unwrap().remove(field).is_some());
+        }
+        let c: NodeConfig = serde_json::from_value(v).unwrap();
+        assert_eq!((c.tokens, c.peer_token), (vec![], None));
+    }
+
+    fn config(dir: &std::path::Path, peer_token: Option<&str>) -> NodeConfig {
+        let mut c = NodeConfig::single(0, "a", dir.into(), "admin".into());
+        c.peer_token = peer_token.map(Into::into);
+        c.tokens = vec![
+            token("acme", &["acme/"], true, true),
+            token("reader", &["acme/", "beta/"], true, false),
+        ];
+        c.peers = vec![PeerConfig {
+            id: 1,
+            domain: "b".into(),
+            addr: "tcp://127.0.0.1:1".parse().unwrap(),
+        }];
+        c.rpc_timeout_ms = 50; // nobody listens there
+        c
+    }
+
+    #[test]
+    fn a_connection_is_who_its_token_says_and_only_the_peers_token_makes_a_peer() {
+        // Why: the handshake decides what every later request may do. A tenant's token must
+        // never make a peer (a peer replicates into any stream), and with a peers' token set
+        // the unscoped one must not either.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let own = rt
+            .block_on(Node::open(config(d1.path(), Some("peers"))))
+            .unwrap();
+        let mut without = config(d2.path(), None);
+        without.tokens = vec![];
+        let shared = rt.block_on(Node::open(without)).unwrap();
+        let pool = [
+            "admin", "peers", "acme", "reader", "other", "", "acm", "acmee",
+        ];
+        proptest!(|(t in 0..pool.len(), node_id in prop::option::of(0u32..3))| {
+            let token = pool[t];
+            let hello = serde_json::to_vec(&Hello { token: token.into(), node_id }).unwrap();
+            for (node, peers) in [(&own, "peers"), (&shared, "admin")] {
+                let scoped = !node.cfg.tokens.is_empty();
+                let want = match (node_id, token) {
+                    (Some(1), t) if t == peers => Some(Ident::Peer(1)),
+                    (Some(_), _) => None,
+                    (None, "admin") => Some(Ident::Client),
+                    (None, "acme") if scoped => Some(Ident::Scoped(0)),
+                    (None, "reader") if scoped => Some(Ident::Scoped(1)),
+                    (None, _) => None,
+                };
+                prop_assert_eq!(node.authenticate(&hello).ok(), want, "{:?} {:?}", token, node_id);
+            }
+        });
+        assert_eq!(own.peer_token(), "peers");
+        assert_eq!(shared.peer_token(), "admin");
+        assert!(own.authenticate(b"not json").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scoped_token_that_is_another_token_is_refused_at_the_open() {
+        // Why: a tenant's token equal to the unscoped or the peers' token would be read as
+        // that one, or the other way round: not confined, or not working.
+        let d = tempfile::tempdir().unwrap();
+        for (dup, why) in [
+            ("admin", "twice"),
+            ("peers", "twice"),
+            ("acme", "twice"),
+            ("", "empty"),
+        ] {
+            let mut c = config(d.path(), Some("peers"));
+            c.tokens.push(token(dup, &["x/"], true, true));
+            let e = Node::open(c).await.err().unwrap().to_string();
+            assert!(e.contains(why), "{dup:?}: {e}");
+        }
+        Node::open(config(d.path(), Some("peers"))).await.unwrap();
+    }
+
+    fn batch(stream: &str, seq: u64) -> Bytes {
+        let log = LogId {
+            stream: stream.into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        Batch::encode(&log, seq, &[(seq, b"x")]).unwrap()
+    }
+
+    async fn append(node: &Arc<Node>, ident: Ident, batch: Bytes) -> Ack {
+        let f = Frame::new(Kind::Append, 1, encode_append(1, &batch));
+        parse_frame_ack(&node.handle(f, ident).await.unwrap()).unwrap()
+    }
+
+    async fn control(node: &Arc<Node>, ident: Ident, c: &Control) -> Result<Frame> {
+        let body = Bytes::from(serde_json::to_vec(c).unwrap());
+        node.handle(Frame::new(Kind::Control, 1, body), ident).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scoped_token_s_requests_stop_at_its_prefixes() {
+        // Why: the wall holds only if every way in checks it: appends, every control request,
+        // live feeds and replication. Each is tried inside and outside the token's scope.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(config(d.path(), Some("peers"))).await.unwrap();
+        let (acme, reader) = (Ident::Scoped(0), Ident::Scoped(1));
+        // appends: its prefix and nothing else; a refusal stores nothing
+        assert!(append(&node, acme, batch("acme/1", 0)).await.is_success());
+        for (ident, stream) in [
+            (acme, "beta/1"),
+            (acme, "acm"),
+            (reader, "acme/1"),
+            (reader, "beta/1"),
+        ] {
+            let b = batch(stream, 7);
+            let ack = append(&node, ident, b.clone()).await;
+            assert_eq!(ack.status, AckStatus::Rejected, "{ident:?} {stream}");
+            assert_eq!((ack.copies, ack.nodes, ack.crc), (0, 0, batch_crc(&b)));
+        }
+        assert!(
+            append(&node, Ident::Client, batch("beta/1", 0))
+                .await
+                .is_success()
+        );
+        assert_eq!(
+            node.store.frontiers(None).len(),
+            2,
+            "acme/1 and beta/1, once each"
+        );
+        // bytes that are no batch are rejected as from anyone
+        let junk = append(&node, acme, Bytes::from_static(b"junk")).await;
+        assert_eq!(junk.status, AckStatus::Rejected);
+        // control requests about a stream
+        let cursor = |stream: &str| Control::ReadCursor {
+            stream: stream.into(),
+            cursor: vec![],
+            max_bytes: 1 << 20,
+        };
+        assert!(
+            !control(&node, acme, &cursor("acme/1"))
+                .await
+                .unwrap()
+                .body
+                .is_empty()
+        );
+        assert!(
+            !control(&node, reader, &cursor("beta/1"))
+                .await
+                .unwrap()
+                .body
+                .is_empty()
+        );
+        let e = control(&node, acme, &cursor("beta/1")).await.err().unwrap();
+        assert!(e.to_string().contains("forbidden"), "{e}");
+        // and those about the node
+        for c in [Control::Status, Control::Repair] {
+            assert!(control(&node, acme, &c).await.is_err(), "{c:?}");
+            assert!(control(&node, Ident::Client, &c).await.is_ok(), "{c:?}");
+            assert!(control(&node, Ident::Peer(1), &c).await.is_ok(), "{c:?}");
+        }
+        // only a peer replicates
+        let rep = || Frame::new(Kind::Replicate, 1, encode_replicate(1, &batch("acme/1", 1)));
+        assert!(node.handle(rep(), acme).await.is_err());
+        assert!(node.handle(rep(), Ident::Client).await.is_err());
+        assert!(node.handle(rep(), Ident::Peer(1)).await.is_ok());
+        // live feeds: one of its streams, not another's, not every stream's
+        for (ident, stream, ok) in [
+            (acme, Some("acme/1"), true),
+            (acme, Some("beta/1"), false),
+            (acme, None, false),
+            (Ident::Client, None, true),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let sub = Subscribe {
+                stream: stream.map(Into::into),
+                from_start: true,
+            };
+            let body = Bytes::from(serde_json::to_vec(&sub).unwrap());
+            let feed = node
+                .clone()
+                .push_loop(Frame::new(Kind::Subscribe, 7, body), ident, tx);
+            let feed = tokio::spawn(feed);
+            let first = rx.recv().await.unwrap();
+            let want = if ok { Kind::Push } else { Kind::Error };
+            assert_eq!(first.kind, want, "{ident:?} {stream:?}");
+            drop(rx);
+            feed.await.unwrap();
+        }
+    }
+
+    /// A label's value as a Prometheus parser reads it back, and what follows its closing quote.
+    fn unescape(s: &str) -> Option<(String, &str)> {
+        let (mut out, mut it) = (String::new(), s.char_indices());
+        while let Some((i, c)) = it.next() {
+            match c {
+                '"' => return Some((out, &s[i + 1..])),
+                '\\' => out.push(match it.next()?.1 {
+                    'n' => '\n',
+                    c @ ('\\' | '"') => c,
+                    _ => return None,
+                }),
+                '\n' => return None,
+                c => out.push(c),
+            }
+        }
+        None
+    }
+
+    proptest! {
+        /// Why: a reader group's name is a tenant's to choose, and it is a label in `/metrics`,
+        /// which every tenant's operator reads. Whatever the name, the label reads back as
+        /// that name and the line ends where it should: a quote or a newline in a name must
+        /// not end the label and start a series of the tenant's own making.
+        #[test]
+        fn a_label_reads_back_as_the_name_it_was_given(name in "[a\"\\\\\n}{ =1]{0,12}") {
+            let line = format!("m{{l=\"{}\"}} 1", label(&name));
+            prop_assert!(!line.contains('\n'), "one line");
+            let (got, rest) = unescape(line.strip_prefix("m{l=\"").unwrap()).unwrap();
+            prop_assert_eq!((got.as_str(), rest), (name.as_str(), "} 1"));
+        }
+    }
+
+    /// Why: the wall is `allow`, called where each kind of request enters. A call missing, or
+    /// made after the request was served (a fetch by ids answers before the other control
+    /// requests are looked at), is a hole no test of `allow` itself would see. Every kind of
+    /// request, as every identity, about a stream inside and outside each scope, through the
+    /// node's own entry points: it is refused exactly when the rule says so.
+    #[test]
+    fn every_request_through_the_node_is_refused_exactly_when_its_token_does_not_reach_it() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let mut c = alone(d.path());
+        c.tokens.push(token("writer", &["beta/"], false, true));
+        c.tokens.push(token("nothing", &[], true, true));
+        let node = rt.block_on(Node::open(c)).unwrap();
+        let streams = ["acme/1", "beta/1", "other/1", "acm", POSITIONS];
+        for s in &streams[..4] {
+            assert!(
+                rt.block_on(append(&node, Ident::Client, batch(s, 0)))
+                    .is_success()
+            );
+        }
+        let seq = AtomicU64::new(1);
+        let log = |s: &str| LogId {
+            stream: s.into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        proptest!(ProptestConfig::with_cases(256), |(who in 0usize..6, what in 0usize..14, at in 0usize..5)| {
+            let stream = streams[at];
+            let ident = [Ident::Scoped(0), Ident::Scoped(1), Ident::Scoped(2), Ident::Scoped(3), Ident::Client, Ident::Peer(1)][who];
+            let s = || stream.to_string();
+            let controls = [
+                Control::Read { stream: s(), from_time_us: 0, limit: 1 },
+                Control::ReadCursor { stream: s(), cursor: vec![], max_bytes: 1 << 10 },
+                Control::CursorAt { stream: s(), time_ms: 0 },
+                Control::Commit { group: "g".into(), stream: s(), cursor: vec![("w".into(), 1, 1)] },
+                Control::Position { group: "g".into(), stream: s() },
+                Control::Latest { stream: s() },
+                Control::FetchLog { log: log(stream), from_seq: 0, max_bytes: 1 << 10 },
+                Control::Fetch { ids: vec![BatchId { log: log(stream), first_seq: 0 }] },
+                Control::Status,
+                Control::Inventory { from: 0, max: 1, incarnation: 0 },
+                Control::Repair,
+            ];
+            // what the rule says, spelled out here and not through `need`
+            let scope = match ident {
+                Ident::Scoped(i) => Some(&node.cfg.tokens[i]),
+                _ => None,
+            };
+            let reaches = |t: &TokenConfig| t.prefixes.iter().any(|p| stream.starts_with(p.as_str())) && !stream.starts_with("__");
+            let may_read = scope.is_none_or(|t| t.read && reaches(t));
+            let may_write = scope.is_none_or(|t| t.write && reaches(t));
+            let forbidden = |r: &Result<Frame>| r.as_ref().is_err_and(|e| e.to_string().starts_with("forbidden"));
+            match what {
+                0..=6 => {
+                    let r = rt.block_on(control(&node, ident, &controls[what]));
+                    prop_assert_eq!(forbidden(&r), !may_read, "{:?} {:?}: {:?}", ident, controls[what], r.err());
+                }
+                7..=10 => {
+                    let r = rt.block_on(control(&node, ident, &controls[what]));
+                    prop_assert_eq!(forbidden(&r), scope.is_some(), "{:?} {:?}", ident, controls[what]);
+                    if let (7, Ok(f)) = (what, &r) {
+                        prop_assert_eq!(f.kind, Kind::Batches);
+                    }
+                }
+                11 => {
+                    // an append: refused before any side effect, or stored
+                    let b = batch(stream, seq.fetch_add(1, Ordering::Relaxed));
+                    let before = node.store.totals().0;
+                    let ack = rt.block_on(append(&node, ident, b));
+                    let own = stream.starts_with("__");
+                    prop_assert_eq!(ack.status == AckStatus::Rejected && node.store.totals().0 == before, !may_write, "{:?} {} {:?}", ident, stream, ack);
+                    prop_assert!(may_write != (ack.status == AckStatus::Rejected) || own, "{:?}", ack);
+                }
+                12 => {
+                    // only a peer replicates, whatever a token reaches
+                    let b = batch(stream, seq.fetch_add(1, Ordering::Relaxed));
+                    let f = Frame::new(Kind::Replicate, 1, encode_replicate(1, &b));
+                    let r = rt.block_on(node.handle(f, ident));
+                    prop_assert_eq!(r.is_ok(), ident == Ident::Peer(1));
+                }
+                _ => {
+                    // a live feed of the stream, or (the node's own) of every stream
+                    let every = at == 4;
+                    let sub = Subscribe { stream: (!every).then(s), from_start: true };
+                    let body = Bytes::from(serde_json::to_vec(&sub).unwrap());
+                    let first = rt.block_on(async {
+                        let (tx, mut rx) = mpsc::channel(8);
+                        let feed = tokio::spawn(node.clone().push_loop(Frame::new(Kind::Subscribe, 7, body), ident, tx));
+                        let first = rx.recv().await.unwrap();
+                        drop(rx);
+                        feed.await.unwrap();
+                        first.kind
+                    });
+                    let ok = if every { scope.is_none() } else { may_read };
+                    prop_assert_eq!(first == Kind::Push, ok, "{:?} {:?}", ident, sub.stream);
+                }
+            }
+        });
+    }
+
+    /// The tokens' node with no peer: what it commits is acknowledged by itself.
+    fn alone(dir: &std::path::Path) -> NodeConfig {
+        let mut c = config(dir, Some("peers"));
+        c.peers = vec![];
+        c
+    }
+
+    fn cursor_of(stream: &str, writer: &str, epoch: u64, next: u64) -> WireCursor {
+        let _ = stream;
+        vec![(writer.into(), epoch, next)]
+    }
+
+    async fn commit(
+        node: &Arc<Node>,
+        ident: Ident,
+        group: &str,
+        stream: &str,
+        c: WireCursor,
+    ) -> Result<Frame> {
+        let c = Control::Commit {
+            group: group.into(),
+            stream: stream.into(),
+            cursor: c,
+        };
+        control(node, ident, &c).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_s_names_stay_inside_their_labels() {
+        // Why: a token that may only read can still commit a reader's position, under a group
+        // name of its choosing, and that name is printed in `/metrics`. A name with a quote
+        // and a newline forged a series (the node fenced, another tenant's lag) or made the
+        // whole scrape unreadable, on every node the commit replicated to.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(alone(d.path())).await.unwrap();
+        assert!(
+            append(&node, Ident::Client, batch("acme/1", 0))
+                .await
+                .is_success()
+        );
+        let evil = "g\"} 1\nprecog_fatal 1\nx{y=\"";
+        let reader = Ident::Scoped(1);
+        commit(
+            &node,
+            reader,
+            evil,
+            "acme/1",
+            cursor_of("acme/1", "w", 1, 0),
+        )
+        .await
+        .unwrap();
+        let m = node.metrics();
+        let fatal: Vec<&str> = m
+            .lines()
+            .filter(|l| l.starts_with("precog_fatal"))
+            .collect();
+        assert_eq!(fatal, ["precog_fatal 0"]);
+        let lag: Vec<&str> = (m
+            .lines()
+            .filter_map(|l| l.strip_prefix("precog_group_lag_events{group=\"")))
+        .collect();
+        assert_eq!(lag.len(), 1, "{m}");
+        let (group, rest) = unescape(lag[0]).unwrap();
+        assert_eq!((group.as_str(), rest), (evil, ",stream=\"acme/1\"} 1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scoped_reader_s_commit_holds_no_more_than_its_stream_does() {
+        // Why: a commit is a durable, replicated record that no retention removes, kept in RAM
+        // on every node. A token that may only read must not be able to make it large: a
+        // cursor of megabytes under a thousand group names was gigabytes on every node, written
+        // again at every pass and loaded at every start. A scoped token's commit names only
+        // writer logs its stream has here, under a group name of a name's length.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(alone(d.path())).await.unwrap();
+        assert!(
+            append(&node, Ident::Client, batch("acme/1", 0))
+                .await
+                .is_success()
+        );
+        let reader = Ident::Scoped(1);
+        let good = || cursor_of("acme/1", "w", 1, 1);
+        commit(&node, reader, "g", "acme/1", good()).await.unwrap();
+        let long = "g".repeat(MAX_NAME + 1);
+        let refused: [(&str, &str, &str, WireCursor); 8] = [
+            (
+                "a writer log the stream does not have",
+                "g",
+                "acme/1",
+                cursor_of("acme/1", "nobody", 1, 1),
+            ),
+            (
+                "another epoch of its writer",
+                "g",
+                "acme/1",
+                cursor_of("acme/1", "w", 2, 1),
+            ),
+            (
+                "a writer name of megabytes",
+                "g",
+                "acme/1",
+                cursor_of("acme/1", &"w".repeat(1 << 20), 1, 1),
+            ),
+            ("a stream nobody wrote", "g", "acme/none", good()),
+            ("a group name too long", &long, "acme/1", good()),
+            ("no group name", "", "acme/1", good()),
+            ("a group name with a NUL", "g\0h", "acme/1", good()),
+            ("a stream name with a NUL", "g", "acme/1\0x", good()),
+        ];
+        for (why, group, stream, c) in refused {
+            let e = commit(&node, reader, group, stream, c).await;
+            assert!(e.is_err(), "{why}");
+        }
+        // what it holds: the one commit, and a group name of the longest length
+        commit(&node, reader, &"g".repeat(MAX_NAME), "acme/1", good())
+            .await
+            .unwrap();
+        assert_eq!(node.latest(POSITIONS).len(), 2);
+        // the names' rules hold for the unscoped token too; its cursor is its own business
+        // (a reader that read a log from another node commits it here before repair brings it)
+        commit(
+            &node,
+            Ident::Client,
+            "g2",
+            "acme/1",
+            cursor_of("acme/1", "nobody", 7, 3),
+        )
+        .await
+        .unwrap();
+        for (group, stream) in [
+            ("", "acme/1"),
+            ("g\0h", "acme/1"),
+            (long.as_str(), "acme/1"),
+            ("g", "acme/1\0x"),
+        ] {
+            assert!(
+                commit(&node, Ident::Client, group, stream, good())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_commit_leaves_no_hole_in_the_node_s_log_of_positions() {
+        // Why: the node numbers its own commits. A commit refused after its number was taken
+        // left a sequence nobody wrote: every live feed of that log then held each later
+        // commit for ever, waiting for it, and repair fetched the log again at every pass.
+        let d = tempfile::tempdir().unwrap();
+        let node = Node::open(alone(d.path())).await.unwrap();
+        assert!(
+            append(&node, Ident::Client, batch("acme/1", 0))
+                .await
+                .is_success()
+        );
+        let c = || cursor_of("acme/1", "w", 1, 1);
+        let huge: WireCursor = (0..40_000).map(|i| ("w".repeat(250), i, 1)).collect();
+        assert!(
+            commit(&node, Ident::Client, "g", &"s".repeat(2_000), c())
+                .await
+                .is_err()
+        );
+        assert!(
+            commit(&node, Ident::Client, "g", "acme/1", huge)
+                .await
+                .is_err()
+        );
+        commit(&node, Ident::Client, "g", "acme/1", c())
+            .await
+            .unwrap();
+        commit(&node, Ident::Client, "h", "acme/1", c())
+            .await
+            .unwrap();
+        let f = node.store.frontier(&node.pos_log);
+        assert_eq!(
+            (f.contiguous, f.high),
+            (2, 2),
+            "two commits, numbered 0 and 1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_that_would_not_confine_a_token_is_refused_at_the_open() {
+        // Why: a config is written by hand, and its mistakes must fail closed. Each of these
+        // read as a working config and gave a token, or anyone, more than was meant.
+        let d = tempfile::tempdir().unwrap();
+        let base = || config(d.path(), Some("peers"));
+        type Change = Box<dyn Fn(&mut NodeConfig)>;
+        let cases: Vec<(&str, Change)> = vec![
+            (
+                "an empty peers' token: anyone is a peer",
+                Box::new(|c| c.peer_token = Some(String::new())),
+            ),
+            (
+                "the peers' token is the clients': no separation",
+                Box::new(|c| c.peer_token = Some(c.token.clone())),
+            ),
+            (
+                "scoped tokens and no peers' token: the unscoped one makes a peer",
+                Box::new(|c| c.peer_token = None),
+            ),
+            (
+                "an empty unscoped token",
+                Box::new(|c| c.token = String::new()),
+            ),
+            (
+                "an empty prefix: every stream",
+                Box::new(|c| c.tokens[0].prefixes = vec![String::new()]),
+            ),
+        ];
+        for (why, change) in cases {
+            let mut c = base();
+            change(&mut c);
+            assert!(Node::open(c).await.is_err(), "{why}");
+        }
+        // a field's name mistyped: not a token that reads and writes after all
+        let typo = r#"{"token":"t","prefixes":["a/"],"writes":false}"#;
+        assert!(serde_json::from_str::<TokenConfig>(typo).is_err());
+        // without scoped tokens the one shared token is the peers' too, as before
+        let mut c = base();
+        (c.tokens, c.peer_token) = (vec![], None);
+        Node::open(c).await.unwrap();
     }
 }
 

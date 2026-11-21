@@ -288,6 +288,67 @@ again it reads nothing), `store::tests::a_trim_with_nothing_to_forget_reads_no_i
 `a_batch_forgotten_while_its_copy_was_being_written_is_never_served_and_holds_nothing_up`, and
 `features/storage.feature` (3 nodes, a class stream through the node cap).
 
+## Tenants: scoped tokens
+
+A node knows three kinds of token (`NodeConfig`):
+
+| Token | Config | Its holder |
+|---|---|---|
+| Unscoped | `token` | Any request a client can make, on every stream. Peers present it too unless a peers' token is set |
+| Peers' | `peer_token` | A peer: it replicates and repairs. Set it wherever scoped tokens are given out, so the unscoped token no longer makes a peer |
+| Scoped | `tokens: [{token, prefixes, read, write}]` | A tenant: it reads, writes or both, only streams whose name starts with one of its prefixes |
+
+A connection's `Hello` decides who it is for good (`Node::authenticate`): a `node_id` with the
+peers' token is a peer; without one, the unscoped token or a scoped one is a client. Every
+configured token is compared, each without stopping at the first byte that differs, so a miss
+takes as long as a hit (a token's length is not hidden).
+
+A config that would not confine a token is refused when the node opens, so its mistakes fail
+closed: an empty token (anyone's), a peers' token that is the clients', scoped tokens without a
+peers' token (the unscoped token would make a peer), a scoped token that is empty or another
+token, an empty prefix (every stream: that is the unscoped token), and a field of a token
+mistyped (`"writes": false` is not a token that reads and writes). A prefix is a prefix of
+bytes: `"acme"` also reaches `acmecorp/...`, so end it with the separator (`"acme/"`).
+
+What a request needs is decided in one place (`need`, `Node::allow`), where requests enter
+(`Node::handle`, `Node::push_loop`):
+
+| Request | Needs |
+|---|---|
+| Append | to write the batch's stream. A refusal is a `Rejected` ack before any side effect, so the client does not retry it on the other nodes |
+| Cursor read, seek, event-time read, a log's batches, latest values, a group's position and its commit, a live feed of one stream | to read that stream |
+| Status, repair, a fetch by batch ids, a peer's inventory, a live feed of every stream | the unscoped token or a peer |
+| Replicate | a peer (as before) |
+
+A scoped token never reaches the node's own `__` streams (reader positions), whatever its
+prefixes. Reader groups are scoped by the stream they are on: a group's name is not a secret.
+
+**A commit is a write a reader makes.** A token that may only read still commits its position,
+and a position is durable, replicated, kept in RAM on every node and removed by no retention.
+So a commit is bounded: a group's name is 1 to 255 bytes with no NUL, a position is at most
+1 MiB encoded, and a scoped token's position names only writer logs its stream has on the node
+(it holds no more than the stream's writers put there; a stream nobody wrote takes no commit).
+These are checked before the commit takes its number in the node's log, so a refused commit
+leaves no sequence nobody wrote. What stays unbounded is the number of groups on a stream: each
+costs a commit's durable append, and nothing removes a group nobody reads with any more.
+
+**`/metrics` is not behind a token.** It is plain HTTP on its own port (`listen_metrics`) and
+names every reader group and stream with its lag: bind it where only the operator's scraper
+reaches. Names are a client's to choose, so they are escaped as label values (`label`): a quote
+or a newline in a group's name stays inside its label.
+
+A connection carries at most 1024 live feeds (`MAX_FEEDS_PER_CONN`): a feed is a task that walks
+the node's log for as long as the connection lives, and the next one is refused.
+
+Not built: tokens issued, expired or revoked without a restart (they are static config), quotas,
+and TLS; the token crosses the network in the clear, as the shared one did.
+
+Tests: `node::props_tokens` (the scope rule as a property; every request kind's need; who a
+connection is, with and without a peers' token; each way in, inside and outside a scope) and
+`props_tokens` in `tests/cluster.rs` (3 nodes over TCP; the feeds a connection carries), and
+`features/tokens.feature` (real node processes: a tenant within its prefix through a node's
+restart, and refused everything outside it).
+
 ## Guarantees (and what is traded away)
 
 What the mesh provides:
@@ -326,7 +387,8 @@ What Iggy's VSR provides and the mesh deliberately does not:
 * Placement is static: every node targets 3 copies, chosen as the first peer per
   distinct domain. There is no controller, membership changes, rebalancing or
   rack/zone awareness beyond labels.
-* Security: one shared token. A token holder can claim any peer id, and there
-  is no per-writer authorization.
+* Security: tokens are static config and cross the network in the clear (no TLS). A scoped
+  token is confined to stream prefixes ("Tenants: scoped tokens"); there is no per-writer
+  authorization within a stream, and no quota.
 * Live subscriptions (`Kind::Subscribe` / `Push`, `client::Subscription`) push each batch once it is durable on the serving node, in local durable order. The client restores per-log order. There is no resume or failover to another node yet. Repair pulls the full inventory after a restart
   (cursor 0), not Merkle ranges.

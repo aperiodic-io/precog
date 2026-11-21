@@ -27,6 +27,7 @@ property or model test runs (below).
 | Stream classes: which config a stream has; the cleaner's properties with the streams' retention from classes | proptest | The lookup against the rule spelled out (own entry, else the longest class prefix); the cleaner's invariants do not depend on how a stream got its retention | `node::props_classes`, `node::props_cleaner` (`classes`) |
 | A stream's own retention: what a trim forgets by age and by bytes, of batches in RAM, absorbed, out of RAM and copied forward, and that a trim with nothing to forget reads no index | proptest, model-based | A read asks for a trim before it is served: it must be exact, and free when nothing is due | `store::model_trim` |
 | The cleaner's copy against a batch forgotten meanwhile by another task (a read's trim, a delete) | TLA+ / TLC | An interleaving across the await of the copy's write | `spec/store/Cleaner.tla` |
+| Scoped tokens: what a token reaches, what each request needs, who a connection is | proptest | The scope rule against the rule spelled out; the handshake against a table of every token as a client and as a peer, with and without a peers' token | `node::props_tokens` |
 | The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
@@ -568,6 +569,9 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   review, not by the first version of this record, which said no interleaving was new). The
   reads of idle streams past their age limit are example tests in `node::props_classes`, on the
   wall clock: the trim they call is what `store::model_trim` checks.
+- **Scoped tokens in TLA+.** Authorization is a pure function of a connection's identity and a
+  request, checked once where requests enter; no interleaving of messages or crashes changes
+  it. `Replication.tla` already assumes what it enforces (only a node replicates).
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.

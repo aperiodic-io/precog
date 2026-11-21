@@ -37,6 +37,8 @@ pub struct Mesh {
     client: Option<Arc<MeshClient>>,
     writers: Vec<WriterState>,
     subs: Vec<(SubLog, Arc<AtomicBool>)>,
+    /// Clients holding a tenant's scoped token, by tenant.
+    tenants: std::collections::HashMap<String, Arc<MeshClient>>,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -220,8 +222,9 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[given(
-    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" retains (\d+) MiB)?(, where idle streams leave RAM)?$"#
+    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" retains (\d+) MiB)?(, where idle streams leave RAM)?(?:, where tenant "(\w+)" holds a token for "([\w/]+)" and peers have their own token)?$"#
 )]
+#[allow(clippy::too_many_arguments)]
 async fn cluster(
     w: &mut Mesh,
     n: usize,
@@ -230,6 +233,8 @@ async fn cluster(
     stream: String,
     stream_mb: String,
     dormant: String,
+    tenant: String,
+    prefix: String,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let base = NEXT_PORT.fetch_add(10, Ordering::Relaxed);
@@ -264,6 +269,11 @@ async fn cluster(
             let mb: u64 = stream_mb.parse().unwrap();
             v["streams"] = serde_json::json!({ stream.clone(): { "retention_bytes": mb << 20 } });
         }
+        if !tenant.is_empty() {
+            // as an operator writes it: `read` and `write` left out
+            v["tokens"] = serde_json::json!([{ "token": format!("tok-{tenant}"), "prefixes": [prefix.clone()] }]);
+            v["peer_token"] = "peers-only".into();
+        }
         std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     }
     let cf: serde_json::Value =
@@ -274,11 +284,18 @@ async fn cluster(
         .iter()
         .map(|a| a.as_str().unwrap().parse().unwrap())
         .collect();
-    let mut mc =
-        Arc::into_inner(MeshClient::new(addrs, cf["token"].as_str().unwrap().into()).unwrap())
-            .unwrap();
+    let mut mc = Arc::into_inner(
+        MeshClient::new(addrs.clone(), cf["token"].as_str().unwrap().into()).unwrap(),
+    )
+    .unwrap();
     mc.rpc_timeout = Duration::from_millis(1500);
     mc.append_deadline = Duration::from_secs(60);
+    if !tenant.is_empty() {
+        let t = MeshClient::new(addrs, format!("tok-{tenant}")).unwrap();
+        let mut t = Arc::into_inner(t).unwrap();
+        (t.rpc_timeout, t.append_deadline) = (mc.rpc_timeout, Duration::from_secs(10));
+        w.tenants.insert(tenant.clone(), Arc::new(t));
+    }
     w.client = Some(Arc::new(mc));
     w.n = n;
     w.dir = Some(dir);
@@ -699,6 +716,155 @@ async fn main() {
         .fail_on_skipped()
         .run_and_exit("tests/acceptance/features")
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// Scoped tokens (features/tokens.feature)
+
+fn tenant_batch(stream: &str, seq: u64, size: usize) -> Bytes {
+    let log = LogId {
+        stream: stream.into(),
+        writer: "tenant-writer".into(),
+        epoch: 1,
+    };
+    Batch::encode(
+        &log,
+        seq,
+        &[(seq, &payload("tenant-writer", seq, size)[..])],
+    )
+    .unwrap()
+}
+
+/// The first sequences of the stream's batches a cursor from its start reads from node `i`,
+/// or the node's refusal.
+async fn tenant_read(mc: &MeshClient, i: usize, stream: &str) -> anyhow::Result<Vec<u64>> {
+    let (mut cursor, mut seqs): (WireCursor, Vec<u64>) = (vec![], vec![]);
+    loop {
+        let req = Control::ReadCursor {
+            stream: stream.into(),
+            cursor: cursor.clone(),
+            max_bytes: 1 << 20,
+        };
+        let f = mc
+            .call(i, Kind::Control, Bytes::from(serde_json::to_vec(&req)?))
+            .await?;
+        anyhow::ensure!(f.kind == Kind::Batches, "unexpected {:?}", f.kind);
+        if f.body.is_empty() {
+            return Ok(seqs);
+        }
+        let mut b = &f.body[..];
+        while b.len() >= 4 {
+            let n = u32::from_le_bytes(b[..4].try_into().unwrap()) as usize;
+            let x = Batch::parse(f.body.slice_ref(&b[4..4 + n]))?;
+            b = &b[4 + n..];
+            seqs.push(x.id.first_seq);
+            cursor = vec![(x.id.log.writer.clone(), x.id.log.epoch, x.end_seq())];
+        }
+    }
+}
+
+#[when(
+    regex = r#"^the tenant "(\w+)" appends (\d+) batches of (\d+) bytes to stream "([\w/-]+)" with (\d+) copies$"#
+)]
+async fn tenant_appends(
+    w: &mut Mesh,
+    tenant: String,
+    n: u64,
+    size: usize,
+    stream: String,
+    copies: u8,
+) {
+    let mc = w.tenants[&tenant].clone();
+    for seq in 0..n {
+        let r = mc
+            .append(
+                seq as usize % w.n,
+                &tenant_batch(&stream, seq, size),
+                copies,
+            )
+            .await;
+        r.unwrap_or_else(|e| panic!("append {seq}: {e}"));
+    }
+}
+
+#[then(regex = r#"^the tenant "(\w+)" reads (\d+) batches of stream "([\w/-]+)" from every node$"#)]
+async fn tenant_reads(w: &mut Mesh, tenant: String, n: u64, stream: String) {
+    let mc = w.tenants[&tenant].clone();
+    for i in 0..w.n {
+        // (a node just restarted takes what it missed from its peers first)
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let got = tenant_read(&mc, i, &stream).await;
+            if got.as_ref().is_ok_and(|s| *s == (0..n).collect::<Vec<_>>()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "node {i}: {got:?}");
+            let _ = w.client().control(i, &Control::Repair).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+#[then(
+    regex = r#"^the tenant "(\w+)" is refused an append to stream "([\w/-]+)" and nothing is stored$"#
+)]
+async fn tenant_refused_append(w: &mut Mesh, tenant: String, stream: String) {
+    let mc = w.tenants[&tenant].clone();
+    for i in 0..w.n {
+        let e = mc.append(i, &tenant_batch(&stream, 0, 100), 1).await;
+        let e = e.expect_err("refused").to_string();
+        assert!(e.contains("refused"), "node {i}: {e}");
+        // (the cluster's own token reads every stream)
+        let held = tenant_read(&w.client(), i, &stream).await.unwrap();
+        assert!(held.is_empty(), "node {i} stored {held:?}");
+    }
+}
+
+#[then(regex = r#"^the tenant "(\w+)" is refused a read and a live feed of stream "([\w/-]+)"$"#)]
+async fn tenant_refused_stream(w: &mut Mesh, tenant: String, stream: String) {
+    let mc = w.tenants[&tenant].clone();
+    for i in 0..w.n {
+        let e = tenant_read(&mc, i, &stream).await.expect_err("refused");
+        assert!(e.to_string().contains("forbidden"), "node {i}: {e}");
+        assert!(
+            mc.subscribe(i, Some(&stream), true).await.is_err(),
+            "node {i}"
+        );
+    }
+}
+
+#[then(
+    regex = r#"^the tenant "(\w+)" is refused the status of every node and a live feed of every stream$"#
+)]
+async fn tenant_refused_node(w: &mut Mesh, tenant: String) {
+    let mc = w.tenants[&tenant].clone();
+    for i in 0..w.n {
+        let e = mc.control(i, &Control::Status).await.expect_err("refused");
+        assert!(e.to_string().contains("forbidden"), "node {i}: {e}");
+        assert!(mc.subscribe(i, None, true).await.is_err(), "node {i}");
+    }
+}
+
+#[then(regex = r#"^no client token makes a peer of node (\d+)$"#)]
+async fn no_client_peer(w: &mut Mesh, node: usize) {
+    let cf: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(w.root().join("cluster.json")).unwrap()).unwrap();
+    let addr: Addr = cf["nodes"][node].as_str().unwrap().parse().unwrap();
+    let shared = cf["token"].as_str().unwrap().to_string();
+    let t = Duration::from_secs(2);
+    let mut tokens: Vec<(String, bool)> = vec![(shared, false), ("peers-only".into(), true)];
+    tokens.extend(w.tenants.keys().map(|k| (format!("tok-{k}"), false)));
+    for (token, ok) in tokens {
+        let conn = precog_mesh::transport::connect(&addr, t).await.unwrap();
+        let hello = Hello {
+            token: token.clone(),
+            node_id: Some(((node + 1) % w.n) as u32),
+        };
+        let r = conn
+            .call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
+            .await;
+        assert_eq!(r.is_ok(), ok, "{token} as a peer");
+    }
 }
 
 #[then(regex = r#"^a cursor reads every batch of stream "([\w/*-]+)" from every node$"#)]

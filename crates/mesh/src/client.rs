@@ -146,6 +146,14 @@ impl MeshClient {
             .await?;
         // The node's empty push: the feed starts no later than this.
         let start = tokio::time::timeout(self.rpc_timeout, rx.recv()).await;
+        if let Ok(Some(f)) = &start
+            && f.kind == Kind::Error
+        {
+            bail!(
+                "node {node} refused the subscription: {}",
+                String::from_utf8_lossy(&f.body)
+            );
+        }
         anyhow::ensure!(
             matches!(&start, Ok(Some(f)) if f.body.is_empty()),
             "node {node} did not confirm the subscription"
