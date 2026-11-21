@@ -183,6 +183,12 @@ impl Dedup {
     pub fn record(&mut self, digests: &[u64], now_s: u64) {
         self.started_s.get_or_insert(now_s);
         self.last_s = self.last_s.max(now_s);
+        // a node that only replicates the stream never checks it: what the window no longer
+        // holds goes here, oldest first (pending is in recording order)
+        let floor = now_s.saturating_sub(self.window_s);
+        while self.pending.front().is_some_and(|e| (e.1 as u64) < floor) {
+            self.pending.pop_front();
+        }
         if self.pending.len() >= self.max_entries {
             // the oldest quarter goes and the window shortens past it (as `sweep` does at the
             // cap), but never this second's ids: within a second the cap is soft there too
@@ -409,6 +415,28 @@ mod tests {
         d.record(&[1, 2, 3, 4], 7);
         d.record(&[5], 7);
         assert_eq!(dups(&mut d, &[1, 5], 7), [true, true]);
+    }
+
+    #[test]
+    fn a_node_that_only_replicates_a_stream_remembers_its_ids_for_the_window_only() {
+        // A client sends a stream to its preferred node, so the other nodes only ever record
+        // it and never check it. Their pending ids must expire with the window as checked ones
+        // do: staging (2026-11-21) held up to the cap (8M ids, ~128 MiB) per replicated stream,
+        // ids hours past any window, a replica's RAM growing until the pod's limit.
+        let mut d = Dedup::new(300, 3, 1 << 30);
+        for t in 0..1000u64 {
+            d.record(&[t * 2, t * 2 + 1], t);
+        }
+        assert_eq!(
+            d.len(),
+            2 * 301,
+            "the window's ids (seconds 699..=999), not all 2000"
+        );
+        assert_eq!(
+            dups(&mut d, &[2 * 699, 2 * 698], 999),
+            [true, false],
+            "a takeover still catches what the window holds"
+        );
     }
 
     #[test]
