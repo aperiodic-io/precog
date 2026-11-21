@@ -1409,3 +1409,235 @@ mod props_delete {
         assert_eq!(held(&n0, "s"), 0);
     }
 }
+
+/// TLS on the client and peer transports (docs/ARCHITECTURE.md, "TLS").
+mod props_tls {
+    use super::*;
+    use precog_mesh::node::TlsConfig;
+    use tokio_rustls::rustls;
+
+    /// A CA and a way to issue a node certificate for 127.0.0.1 and localhost under it: PEMs.
+    struct Pki {
+        ca: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    }
+
+    impl Pki {
+        fn new(name: &str) -> Pki {
+            let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            p.distinguished_name.push(rcgen::DnType::CommonName, name);
+            let key = rcgen::KeyPair::generate().unwrap();
+            Pki {
+                ca: p.self_signed(&key).unwrap(),
+                key,
+            }
+        }
+
+        /// (certificate, key), as PEM.
+        fn issue(&self) -> (String, String) {
+            let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+            let p = rcgen::CertificateParams::new(names).unwrap();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = p.signed_by(&key, &self.ca, &self.key).unwrap();
+            (cert.pem(), key.serialize_pem())
+        }
+    }
+
+    /// The one CA of these tests: a process trusts one set of CAs (`transport::trust`), and
+    /// under `cargo test` the tests share a process.
+    static PKI: std::sync::LazyLock<Pki> = std::sync::LazyLock::new(|| Pki::new("the cluster's"));
+
+    type Change = Box<dyn Fn(&mut NodeConfig)>;
+
+    /// A cluster of `n` nodes that serve and dial TLS, its certificates in its directory.
+    fn tls_cluster(n: u32, pki: &Pki) -> (Cluster, TlsConfig) {
+        let mut c = cluster(n, &["a", "b", "c"][..n as usize]);
+        let dir = c._dir.path().to_path_buf();
+        let (cert, key) = pki.issue();
+        std::fs::write(dir.join("ca.pem"), pki.ca.pem()).unwrap();
+        std::fs::write(dir.join("node.pem"), cert).unwrap();
+        std::fs::write(dir.join("node.key"), key).unwrap();
+        let tls = TlsConfig {
+            cert: dir.join("node.pem"),
+            key: dir.join("node.key"),
+            ca: Some(dir.join("ca.pem")),
+        };
+        let secure = |a: &str| a.replace("tcp://", "tls://");
+        for cfg in &mut c.cfgs {
+            cfg.tls = Some(tls.clone());
+            for p in &mut cfg.peers {
+                p.addr = secure(&p.addr);
+            }
+        }
+        c.addrs = (c.addrs.iter())
+            .map(|a| secure(&a.to_string()).parse().unwrap())
+            .collect();
+        (c, tls)
+    }
+
+    /// A TLS handshake with the node at `addr` as `name`, trusting `ca` (PEM): the certificate
+    /// it served (DER), or why the handshake failed.
+    async fn handshake(addr: &Addr, name: &str, ca: &str) -> Result<Vec<u8>, String> {
+        use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+        let mut roots = rustls::RootCertStore::empty();
+        for c in CertificateDer::pem_slice_iter(ca.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let port = addr.to_string().rsplit_once(':').unwrap().1.to_string();
+        let s = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let name = ServerName::try_from(name.to_string()).unwrap();
+        let c = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+        let s = c.connect(name, s).await.map_err(|e| e.to_string())?;
+        Ok(s.get_ref().1.peer_certificates().unwrap()[0].to_vec())
+    }
+
+    fn der(pem: &str) -> Vec<u8> {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        CertificateDer::from_pem_slice(pem.as_bytes())
+            .unwrap()
+            .to_vec()
+    }
+
+    /// Why: tokens and every event cross the network between clients and nodes and between
+    /// nodes. With TLS on, a client that speaks it and trusts the cluster's CA appends on
+    /// every node and reads what the nodes replicated to each other over TLS; a plain client
+    /// gets nothing, and neither does a client that trusts another CA or asks for another
+    /// name: it must not send its token to whoever answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cluster_over_tls_serves_those_who_trust_it_and_no_plain_client() {
+        let pki = &*PKI;
+        let (c, tls) = tls_cluster(3, pki);
+        let plain: Vec<Addr> = (c.addrs.iter())
+            .map(|a| a.to_string().replace("tls://", "tcp://").parse().unwrap())
+            .collect();
+        let _n = start_all(&c).await;
+        precog_mesh::transport::trust(tls.ca.as_ref().unwrap()).unwrap();
+        let mc = client(&c).await;
+        let mut w = Writer::new(mc.clone(), "s", "w", 1, 0, 3);
+        for i in 0..5u64 {
+            let r = w.append(&[(i, format!("e{i}").as_bytes())]).await.unwrap();
+            assert_eq!(r.ack.copies, 3, "replicated over TLS: {:?}", r.ack);
+        }
+        for node in 0..3 {
+            let q = Control::Read {
+                stream: "s".into(),
+                from_time_us: 0,
+                limit: 100,
+            };
+            let ControlResp::Read { events, .. } = mc.control(node, &q).await.unwrap() else {
+                panic!("node {node}");
+            };
+            assert_eq!(events.len(), 5, "node {node}");
+        }
+        // a plain client: no answer to its hello, on any node
+        let mut clear = Arc::into_inner(MeshClient::new(plain, "secret-token".into()).unwrap());
+        let clear = clear.as_mut().unwrap();
+        (clear.rpc_timeout, clear.append_deadline) =
+            (Duration::from_millis(500), Duration::from_millis(500));
+        assert!(clear.control(0, &Control::Status).await.is_err());
+        // who the client trusts, and whom it asked for
+        let ca = pki.ca.pem();
+        handshake(&c.addrs[0], "localhost", &ca).await.unwrap();
+        handshake(&c.addrs[0], "127.0.0.1", &ca).await.unwrap();
+        let other = Pki::new("another").ca.pem();
+        let e = handshake(&c.addrs[0], "localhost", &other)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("UnknownIssuer") || e.contains("certificate"),
+            "{e}"
+        );
+        let e = handshake(&c.addrs[0], "elsewhere.example", &ca)
+            .await
+            .unwrap_err();
+        assert!(
+            e.contains("NotValidForName") || e.contains("certificate"),
+            "{e}"
+        );
+    }
+
+    /// Why: certificates expire, and a node restart to take a new one is an outage of that
+    /// node. A certificate and key replaced on disk are served to the next connection; one
+    /// half-replaced or damaged leaves the node serving the pair it has, not refusing everyone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_certificate_replaced_on_disk_is_served_and_a_broken_one_is_not() {
+        let pki = &*PKI;
+        let (c, tls) = tls_cluster(1, pki);
+        let _n = start(&c, 0).await;
+        let ca = pki.ca.pem();
+        let served = || handshake(&c.addrs[0], "localhost", &ca);
+        let first = std::fs::read_to_string(&tls.cert).unwrap();
+        assert_eq!(served().await.unwrap(), der(&first));
+        // the next one: its certificate first (the key on disk is still the old one's)
+        let (cert, key) = pki.issue();
+        tokio::time::sleep(Duration::from_millis(20)).await; // (a later modification time)
+        std::fs::write(&tls.cert, &cert).unwrap();
+        assert_eq!(served().await.unwrap(), der(&first), "not half a pair");
+        std::fs::write(&tls.key, &key).unwrap();
+        assert_eq!(served().await.unwrap(), der(&cert));
+        // damaged: the pair it has goes on serving
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(&tls.cert, "not a certificate").unwrap();
+        assert_eq!(served().await.unwrap(), der(&cert));
+        std::fs::remove_file(&tls.key).unwrap();
+        assert_eq!(served().await.unwrap(), der(&cert));
+    }
+
+    /// Why: a config that would send a token or events in the clear, or that cannot work,
+    /// must not start: a node that serves TLS dials its peers with TLS, a `tls://` peer needs
+    /// a CA to check it against, and a certificate that does not read is said at the start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tls_config_that_cannot_hold_is_refused_at_the_open() {
+        let pki = &*PKI;
+        let (c, _) = tls_cluster(2, pki);
+        let cases: Vec<(&str, Change)> = vec![
+            (
+                "a peer in the clear",
+                Box::new(|c| c.peers[0].addr = c.peers[0].addr.replace("tls://", "tcp://")),
+            ),
+            (
+                "a tls peer and no tls of its own",
+                Box::new(|c| c.tls = None),
+            ),
+            (
+                "no CA for its peers",
+                Box::new(|c| c.tls.as_mut().unwrap().ca = None),
+            ),
+            (
+                "a certificate that is not there",
+                Box::new(|c| c.tls.as_mut().unwrap().cert = "/nowhere/node.pem".into()),
+            ),
+            (
+                "a key that is the certificate",
+                Box::new(|c| {
+                    let t = c.tls.as_mut().unwrap();
+                    t.key = t.cert.clone();
+                }),
+            ),
+        ];
+        for (why, change) in cases {
+            let mut cfg = c.cfgs[0].clone();
+            change(&mut cfg);
+            let r = async {
+                let node = Node::open(cfg).await?;
+                node.spawn_listeners().await
+            };
+            assert!(r.await.is_err(), "{why}");
+        }
+        // (a node alone, with no CA: it serves TLS and dials no one)
+        let (one, _) = tls_cluster(1, pki);
+        let mut cfg = one.cfgs[0].clone();
+        cfg.tls.as_mut().unwrap().ca = None;
+        let node = Node::open(cfg).await.unwrap();
+        node.spawn_listeners().await.unwrap();
+    }
+}

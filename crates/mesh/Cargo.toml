@@ -20,6 +20,7 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -28,6 +29,7 @@ gungraun = "0.19.4"
 proptest = "1"
 cucumber = "0.23"
 tempfile = "3"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 # Feature files under tests/acceptance/features driven against real precog-node processes.
 # Not a default test target (minutes, and its runner has no `--list` for nextest):

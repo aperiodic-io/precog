@@ -52,6 +52,9 @@ pub struct NodeConfig {
     /// Prometheus `/metrics` and `/health` (503 once storage is fenced) over plain HTTP.
     #[serde(default)]
     pub listen_metrics: Option<SocketAddr>,
+    /// Serve TLS on `listen_tcp`, and dial peers with it (their addresses are `tls://`).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     pub peers: Vec<PeerConfig>,
     /// Copies the node tries to create for every append (including its own).
     #[serde(default = "three")]
@@ -124,6 +127,7 @@ impl NodeConfig {
             peer_token: None,
             listen_tcp: None,
             listen_metrics: None,
+            tls: None,
             peers: vec![],
             target_copies: three(),
             rpc_timeout_ms: rpc_ms(),
@@ -680,6 +684,18 @@ enum Need<'a> {
     All,
 }
 
+/// A node's TLS: its certificate chain and key (PEM files, read again when they change:
+/// `transport::acceptor`), and the CAs its peers' certificates are checked against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// CA certificates (PEM) for dialing peers. A node with peers needs it.
+    #[serde(default)]
+    pub ca: Option<PathBuf>,
+}
+
 /// What a control request needs: its stream to read (a commit moves a reader's position, which
 /// is its to read), or everything.
 fn need(c: &Control) -> Need<'_> {
@@ -810,10 +826,30 @@ impl Node {
             }
         }
         tracing::info!(node = cfg.id, batches = n, "recovered log");
+        // TLS is all or nothing on a node: it serves it and dials every peer with it, checked
+        // against a CA; a mix would send the peers' token and the events in the clear one way
+        let ca = cfg.tls.as_ref().and_then(|t| t.ca.as_deref());
+        if let Some(ca) = ca {
+            crate::transport::trust(ca)?;
+        }
         let mut peers = Vec::new();
         for p in &cfg.peers {
             anyhow::ensure!(p.id != cfg.id && p.id < 32, "bad peer id {}", p.id);
             let addr: Addr = p.addr.parse()?;
+            anyhow::ensure!(
+                addr.is_tls() == cfg.tls.is_some(),
+                "peer {} is {addr}, and this node {}: both use TLS or neither",
+                p.id,
+                if cfg.tls.is_some() {
+                    "serves TLS"
+                } else {
+                    "has no `tls`"
+                }
+            );
+            anyhow::ensure!(
+                !addr.is_tls() || ca.is_some(),
+                "`tls.ca` is needed to dial peers"
+            );
             peers.push(Arc::new(Peer {
                 cfg: p.clone(),
                 addr,
@@ -1699,7 +1735,12 @@ impl Node {
             let l = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind {addr}"))?;
-            tracing::info!(node = self.cfg.id, "tcp listening on {addr}");
+            let tls = match &self.cfg.tls {
+                Some(t) => Some(crate::transport::acceptor(&t.cert, &t.key)?),
+                None => None,
+            };
+            let how = if tls.is_some() { "tls" } else { "tcp" };
+            tracing::info!(node = self.cfg.id, "{how} listening on {addr}");
             let node = self.clone();
             tokio::spawn(async move {
                 loop {
@@ -1707,9 +1748,20 @@ impl Node {
                         continue;
                     };
                     let _ = s.set_nodelay(true);
-                    let (r, w) = s.into_split();
-                    let node = node.clone();
-                    tokio::spawn(async move { node.serve_conn(Box::new(r), Box::new(w)).await });
+                    let (node, tls) = (node.clone(), tls.clone());
+                    tokio::spawn(async move {
+                        let Some(tls) = tls else {
+                            let (r, w) = s.into_split();
+                            return node.serve_conn(Box::new(r), Box::new(w)).await;
+                        };
+                        // (a client that never finishes its handshake does not keep the task;
+                        // one that does not speak TLS is closed here)
+                        let hello = tokio::time::timeout(Duration::from_secs(5), tls.accept(s));
+                        if let Ok(Ok(s)) = hello.await {
+                            let (r, w) = tokio::io::split(s);
+                            node.serve_conn(Box::new(r), Box::new(w)).await
+                        }
+                    });
                 }
             });
         }

@@ -102,10 +102,16 @@ enum Runtime {
 pub struct ClusterFile {
     pub token: String,
     pub nodes: Vec<String>,
+    /// CA certificates (PEM) the nodes' certificates are checked against, for `tls://` nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<PathBuf>,
 }
 
 pub fn client_from(path: &PathBuf) -> Result<std::sync::Arc<MeshClient>> {
     let c: ClusterFile = serde_json::from_slice(&std::fs::read(path)?)?;
+    if let Some(ca) = &c.ca {
+        precog_mesh::transport::trust(ca)?;
+    }
     let addrs = c
         .nodes
         .iter()
@@ -215,6 +221,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             let cluster = ClusterFile {
                 token,
                 nodes: addrs,
+                ca: None,
             };
             std::fs::write(
                 dir.join("cluster.json"),

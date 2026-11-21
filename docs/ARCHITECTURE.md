@@ -528,6 +528,44 @@ over its rate waits, then is refused and stores nothing, while a token without a
 none) and `features/limits.feature` (real node processes: a tenant slowed, refused and retried
 without losing an append; a writer without a limit beside it).
 
+## TLS
+
+Tokens and every event cross the network between clients and nodes and between nodes. With
+`tls` in a node's config (`cert`, `key`, `ca`: PEM files) the node's listener accepts only TLS
+and the node dials its peers with it; addresses say so (`tls://host:port`), in `peers` and in
+what a client is given. It is rustls with the ring provider (`transport.rs`).
+
+- **Who is checked.** The dialing side checks the server's certificate against the CAs it
+  trusts (`transport::trust`: a node's `tls.ca`; a client's `trust_ca`, or `ca` in the CLI's
+  `cluster.json`) and against the host in the address. Clients and peers are still known by
+  their token, not by a certificate: TLS keeps the token and the events from the network, the
+  token says who is asking.
+- **All or nothing on a node.** A node with `tls` refuses to open with a `tcp://` peer, and one
+  without it with a `tls://` peer: a mix would send the peers' token in the clear one way. A
+  client that does not speak TLS gets no answer (the handshake fails and the connection
+  closes); one that never finishes its handshake is dropped after 5 s.
+- **A certificate is replaced without a restart.** Each handshake looks at the two files'
+  modification times and loads the pair again when either changed (`Reloading`). A pair that
+  does not load, or whose key is not the certificate's (one file replaced, the other not yet),
+  leaves the pair it has serving, and says so in the log. Replace each file with a rename.
+
+Limits.
+- **Not a rolling change.** Turning TLS on changes every address in the cluster at once, as
+  adopting `peer_token` does: plan items P5 and P6 test and write down the procedure.
+- **One set of trusted CAs a process** (`ponytail:` in the code). A node's own `tls.ca`, and a
+  client's, are read once: a new CA takes a restart (a new certificate under the same CA does
+  not).
+- **No client certificates**, and `/metrics` stays plain HTTP on its own port.
+- **The Go client dials `tcp://` only** until plan item C3.
+
+Tests: `transport::props` (an address keeps its scheme, host and port, and nothing else
+parses), `props_tls` in `tests/cluster.rs` (3 nodes over TLS replicate to each other and serve
+a client that trusts the CA; a plain client, another CA and another name get nothing; a
+certificate replaced on disk is served, half a pair or a damaged one is not; configs that
+cannot hold are refused at the open) and `features/tls.feature` (real node processes:
+replication, repair and a restart over TLS, a plain client refused, a certificate replaced
+under a running cluster).
+
 ## Guarantees (and what is traded away)
 
 What the mesh provides:

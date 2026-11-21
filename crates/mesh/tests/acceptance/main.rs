@@ -46,6 +46,11 @@ pub struct Mesh {
     noted: usize,
     /// How long the last timed step took.
     took: Duration,
+    /// The CA of a cluster that serves TLS, the nodes' addresses and the cluster's token.
+    ca: Option<Ca>,
+    addrs: Vec<Addr>,
+    token: String,
+    old_cert: Vec<u8>,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -229,7 +234,7 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[given(
-    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" (?:retains (\d+) MiB|keeps (\d+) seconds))?(, where idle streams leave RAM)?(?:, where tenant "(\w+)" holds a token for "([\w/]+)"(?: at (\d+) KiB a second)? and peers have their own token)?$"#
+    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" (?:retains (\d+) MiB|keeps (\d+) seconds))?(, where idle streams leave RAM)?(, where the nodes serve TLS)?(?:, where tenant "(\w+)" holds a token for "([\w/]+)"(?: at (\d+) KiB a second)? and peers have their own token)?$"#
 )]
 #[allow(clippy::too_many_arguments)]
 async fn cluster(
@@ -241,6 +246,7 @@ async fn cluster(
     stream_mb: String,
     stream_s: String,
     dormant: String,
+    tls: String,
     tenant: String,
     prefix: String,
     rate_kib: String,
@@ -266,11 +272,38 @@ async fn cluster(
         "init: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // TLS: a CA, one certificate for every node (they are all 127.0.0.1), and `tls://` addresses
+    let secure = |v: &mut serde_json::Value| {
+        *v = v.as_str().unwrap().replace("tcp://", "tls://").into();
+    };
+    if !tls.is_empty() {
+        let ca = Ca::new();
+        std::fs::write(dir.path().join("ca.pem"), ca.cert.pem()).unwrap();
+        write_pair(dir.path(), &ca.issue());
+        let p = dir.path().join("cluster.json");
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        v["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .for_each(secure);
+        v["ca"] = dir.path().join("ca.pem").to_str().unwrap().into();
+        std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+        precog_mesh::transport::trust(&dir.path().join("ca.pem")).unwrap();
+        w.ca = Some(ca);
+    }
     for i in 0..n {
         // retention runs often enough for a scenario to see it
         let p = dir.path().join(format!("node-{i}.json"));
         let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         v["retention_interval_ms"] = 200.into();
+        if !tls.is_empty() {
+            let at = |f: &str| dir.path().join(f).to_str().unwrap().to_string();
+            v["tls"] = serde_json::json!({ "cert": at("node.pem"), "key": at("node.key"), "ca": at("ca.pem") });
+            for peer in v["peers"].as_array_mut().unwrap() {
+                secure(&mut peer["addr"]);
+            }
+        }
         if !dormant.is_empty() {
             v["dormant_after_ms"] = 0.into();
         }
@@ -301,6 +334,7 @@ async fn cluster(
         .iter()
         .map(|a| a.as_str().unwrap().parse().unwrap())
         .collect();
+    (w.addrs, w.token) = (addrs.clone(), cf["token"].as_str().unwrap().into());
     let mut mc = Arc::into_inner(
         MeshClient::new(addrs.clone(), cf["token"].as_str().unwrap().into()).unwrap(),
     )
@@ -1235,5 +1269,104 @@ async fn rate_counters(w: &mut Mesh, node: usize, token: String, what: String) {
         "waited for" => assert!(waited > 0),
         "were refused for" => assert!(refused > 0),
         _ => assert_eq!((waited, refused), (0, 0)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TLS (features/tls.feature)
+
+/// A CA that issues the nodes' certificate (for 127.0.0.1 and localhost).
+struct Ca {
+    cert: rcgen::Certificate,
+    key: rcgen::KeyPair,
+}
+
+impl Ca {
+    fn new() -> Ca {
+        let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        p.distinguished_name
+            .push(rcgen::DnType::CommonName, "acceptance");
+        let key = rcgen::KeyPair::generate().unwrap();
+        Ca {
+            cert: p.self_signed(&key).unwrap(),
+            key,
+        }
+    }
+
+    /// (certificate, key), as PEM.
+    fn issue(&self) -> (String, String) {
+        let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+        let p = rcgen::CertificateParams::new(names).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, &self.cert, &self.key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+}
+
+/// Replaces the nodes' certificate and key, each file at once (a rename), the key first.
+fn write_pair(dir: &Path, (cert, key): &(String, String)) {
+    for (name, pem) in [("node.key", key), ("node.pem", cert)] {
+        std::fs::write(dir.join("tmp"), pem).unwrap();
+        std::fs::rename(dir.join("tmp"), dir.join(name)).unwrap();
+    }
+}
+
+/// The certificate node `i` serves to a client that trusts the cluster's CA (DER).
+async fn served_cert(w: &Mesh, i: usize) -> Vec<u8> {
+    use tokio_rustls::rustls;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+    let mut roots = rustls::RootCertStore::empty();
+    let ca = w.ca.as_ref().unwrap().cert.pem();
+    roots
+        .add(CertificateDer::from_pem_slice(ca.as_bytes()).unwrap())
+        .unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let addr = w.addrs[i].to_string();
+    let s = tokio::net::TcpStream::connect(addr.trim_start_matches("tls://"))
+        .await
+        .unwrap();
+    let name = ServerName::try_from("localhost").unwrap();
+    let c = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+    let s = c.connect(name, s).await.unwrap();
+    s.get_ref().1.peer_certificates().unwrap()[0].to_vec()
+}
+
+#[then(regex = r"^a client that does not speak TLS gets no answer from any node$")]
+async fn plain_refused(w: &mut Mesh) {
+    let plain: Vec<Addr> = (w.addrs.iter())
+        .map(|a| a.to_string().replace("tls://", "tcp://").parse().unwrap())
+        .collect();
+    let mut mc = Arc::into_inner(MeshClient::new(plain, w.token.clone()).unwrap()).unwrap();
+    mc.rpc_timeout = Duration::from_millis(1000);
+    for i in 0..w.n {
+        let r = mc.control(i, &Control::Status).await;
+        assert!(r.is_err(), "node {i} answered a plain client: {r:?}");
+    }
+}
+
+#[when(regex = r"^the nodes' certificate is replaced on disk$")]
+async fn replace_cert(w: &mut Mesh) {
+    let before = served_cert(w, 0).await;
+    let pair = w.ca.as_ref().unwrap().issue();
+    tokio::time::sleep(Duration::from_millis(20)).await; // (a later modification time)
+    write_pair(w.dir.as_ref().unwrap().path(), &pair);
+    w.old_cert = before;
+}
+
+#[then(regex = r"^every node serves the new certificate to its next connection$")]
+async fn new_cert_served(w: &mut Mesh) {
+    use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+    let dir = w.dir.as_ref().unwrap().path();
+    let pem = std::fs::read(dir.join("node.pem")).unwrap();
+    let new = CertificateDer::from_pem_slice(&pem).unwrap().to_vec();
+    assert_ne!(new, w.old_cert);
+    for i in 0..w.n {
+        assert_eq!(served_cert(w, i).await, new, "node {i}");
     }
 }
