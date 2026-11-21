@@ -490,6 +490,44 @@ each token's counters; trims and deletes) and `features/metrics.feature` (real n
 as many series at 25 sessions as at 5, a tenant's traffic under its prefix on each node, a
 position gone from every node after its stream's age limit and after a restart).
 
+## Fair shares: an append rate per token
+
+One log and one group commit per node means one tenant's burst is every tenant's latency
+(`results/session-log.md`, "Neighbours"). A token may carry `append_bytes_per_s`.
+
+**The limit** (`Limiter`, in `Node::handle` before anything is stored) is the generic cell rate
+algorithm: one number per token, the time at which the bytes it has been admitted are paid for
+at its rate. An append goes ahead at that time and adds its own bytes' time to it. Time the
+token did not use counts as credit, up to one second's worth (`LIMIT_BURST_NS`), so a token
+within its rate never waits, however it cuts its bytes into batches.
+
+**Over its rate, an append waits** for its turn: its ack is later, which is what slows a writer
+that sends one batch after another. An append that would wait longer than half a second
+(`LIMIT_MAX_WAIT_NS`, under a client's RPC timeout) is refused before any side effect and
+charged nothing, with the answer a client already retries (`Unknown`, no copy): the SDK's and
+the mesh client's retry loops need no change. What a token can have waiting on a node is so
+bounded by half a second of its rate.
+
+**It shows** in `/metrics`: `precog_token_rate_wait_microseconds_total` and
+`precog_token_over_rate_total`, under the token's prefixes.
+
+Limits.
+- **Per node.** Each node counts on its own, and a client refused on one retries on the next:
+  a tenant gets up to three times its rate. A cluster-wide rate needs the control plane; until
+  then configure a third of what the tenant is sold.
+- **A rate bounds bytes, not what one batch costs the others.** A single large batch still
+  holds the node's group commit while it is written; `results/session-log.md` has what a rate
+  buys beside 1 MiB and 4 MiB events. Smaller batches (plan item A4 splits large events) are
+  what bounds that.
+- Reads and live feeds are not limited, nor is the unscoped token or a peer.
+- Rates are static config, as tokens are.
+
+Tests: `node::model_limiter` (properties: what is admitted keeps to the rate plus one burst over
+every stretch, a refusal charges nothing, a writer at its rate never waits; on a node, a token
+over its rate waits, then is refused and stores nothing, while a token without a rate is held by
+none) and `features/limits.feature` (real node processes: a tenant slowed, refused and retried
+without losing an append; a writer without a limit beside it).
+
 ## Guarantees (and what is traded away)
 
 What the mesh provides:

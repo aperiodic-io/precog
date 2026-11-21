@@ -43,6 +43,30 @@ VM's disk).
 
 The small writer shares the node's one group commit with the large ones.
 
+## Neighbours, with a rate on the large writers' token (plan item A5)
+
+Measured on the branch that adds `append_bytes_per_s`, with the probe that is now in the
+repository: `bench/session/neighbours.sh 10 4096` (`crates/mesh/examples/neighbours.rs`). Three
+nodes in one process, each on a runtime thread of its own, 256 MiB segments, the same small
+writer as above, and two writers of large events through one scoped token. The same VM; 10 s a
+case; the alone and the limited 4 MiB cases were run three and two times (the range is given).
+This probe's "alone" is not the table above's: its nodes and its client share one process.
+
+| | ack p50 | ack p99 | ack max | small appends in 10 s | the large writers got |
+|---|---:|---:|---:|---:|---:|
+| alone | 0.9 ms | 12.6–14.3 ms | 30–63 ms | 2001 | |
+| beside 2 writers of 1 MiB events, no rate | 6.8 ms | 56.6 ms | 1165 ms | 691 | 135 MiB/s |
+| the same, 4 MiB/s on their token | 0.9 ms | 13.8 ms | 71 ms | 2001 | 4.3 MiB/s |
+| beside 2 writers of 4 MiB events, no rate | 29.6 ms | 1018 ms | 1238 ms | 185 | 131 MiB/s |
+| the same, 4 MiB/s on their token | 1.0 ms | 18.6–19.2 ms | 62–77 ms | 1998–2001 | 12.8–13.6 MiB/s |
+| the same, 16 MiB/s on their token | 0.9 ms | 18.1 ms | 59 ms | 1998 | 16.8 MiB/s |
+
+With the rate the small writer's p99 stays within 1.5x of its p99 alone and it loses no append
+slot. The rate is per node and a refused append is retried on the next node: 4 MiB events at
+4 MiB/s (each costs a second, more than an append may wait) got about three times the rate.
+Each 4 MiB batch still holds the group commit while it is written, which is the difference
+between 13 ms and 19 ms at the p99.
+
 ## Sessions
 
 64 sessions × 50 LLM calls, 16 sessions in flight, one stream per session, one event per call,

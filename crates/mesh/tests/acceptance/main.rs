@@ -44,6 +44,8 @@ pub struct Mesh {
     /// Where node 0's metrics listen, and a number of series a scenario noted.
     metrics_port: u16,
     noted: usize,
+    /// How long the last timed step took.
+    took: Duration,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -227,7 +229,7 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[given(
-    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" (?:retains (\d+) MiB|keeps (\d+) seconds))?(, where idle streams leave RAM)?(?:, where tenant "(\w+)" holds a token for "([\w/]+)" and peers have their own token)?$"#
+    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" (?:retains (\d+) MiB|keeps (\d+) seconds))?(, where idle streams leave RAM)?(?:, where tenant "(\w+)" holds a token for "([\w/]+)"(?: at (\d+) KiB a second)? and peers have their own token)?$"#
 )]
 #[allow(clippy::too_many_arguments)]
 async fn cluster(
@@ -241,6 +243,7 @@ async fn cluster(
     dormant: String,
     tenant: String,
     prefix: String,
+    rate_kib: String,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let base = NEXT_PORT.fetch_add(10, Ordering::Relaxed);
@@ -283,6 +286,9 @@ async fn cluster(
             // as an operator writes it: `read` and `write` left out
             v["tokens"] = serde_json::json!([{ "token": format!("tok-{tenant}"), "prefixes": [prefix.clone()] }]);
             v["peer_token"] = "peers-only".into();
+            if let Ok(kib) = rate_kib.parse::<u64>() {
+                v["tokens"][0]["append_bytes_per_s"] = (kib << 10).into();
+            }
         }
         std::fs::write(&p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     }
@@ -1160,5 +1166,74 @@ async fn positions_expire(w: &mut Mesh, secs: u64, prefix: String) {
         }
         assert!(Instant::now() < deadline, "still held: {held:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A tenant's append rate (features/limits.feature)
+
+#[when(
+    regex = r#"^the tenant "(\w+)" appends (\d+) batches of (\d+) bytes to stream "([\w/-]+)" through node (\d+), (one at a time|all at once)$"#
+)]
+async fn tenant_appends_through(
+    w: &mut Mesh,
+    tenant: String,
+    n: u64,
+    size: usize,
+    stream: String,
+    node: usize,
+    how: String,
+) {
+    let mc = w.tenants[&tenant].clone();
+    let start = Instant::now();
+    let one = |seq: u64| {
+        let (mc, b) = (mc.clone(), tenant_batch(&stream, seq, size));
+        async move { mc.append(node, &b, 2).await }
+    };
+    if how == "one at a time" {
+        for seq in 0..n {
+            one(seq)
+                .await
+                .unwrap_or_else(|e| panic!("append {seq}: {e}"));
+        }
+    } else {
+        // (an append refused for the rate is retried by the client, here and on the other nodes)
+        let all = (0..n).map(|seq| tokio::spawn(one(seq)));
+        for (seq, r) in all.collect::<Vec<_>>().into_iter().enumerate() {
+            r.await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("append {seq}: {e}"));
+        }
+    }
+    w.took = start.elapsed();
+}
+
+#[then(regex = r"^that took at least (\d+) ms$")]
+async fn took_at_least(w: &mut Mesh, ms: u128) {
+    assert!(w.took.as_millis() >= ms, "{:?}", w.took);
+}
+
+/// A per-token counter of a node's metrics.
+async fn token_counter(w: &Mesh, node: usize, what: &str, token: &str) -> u64 {
+    let m = scrape(w, node).await;
+    let head = format!("precog_token_{what}{{token=\"{token}\"}} ");
+    let v = series_of(&m)
+        .into_iter()
+        .find_map(|l| l.strip_prefix(head.as_str()));
+    v.unwrap_or_else(|| panic!("no {head:?} in\n{m}"))
+        .parse()
+        .unwrap()
+}
+
+#[then(
+    regex = r#"^node (\d+)'s metrics count appends under "([\w/*]+)" that (waited for|were refused for|neither waited for nor were refused for) (?:its|a) rate$"#
+)]
+async fn rate_counters(w: &mut Mesh, node: usize, token: String, what: String) {
+    let waited = token_counter(w, node, "rate_wait_microseconds_total", &token).await;
+    let refused = token_counter(w, node, "over_rate_total", &token).await;
+    match what.as_str() {
+        "waited for" => assert!(waited > 0),
+        "were refused for" => assert!(refused > 0),
+        _ => assert_eq!((waited, refused), (0, 0)),
     }
 }
