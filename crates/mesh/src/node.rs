@@ -4575,12 +4575,13 @@ mod props_delete {
         );
         let new = vec![(b"k".to_vec(), Bytes::from_static(b"new"))];
         assert_eq!(node.latest("kv"), new);
+        // (a writer at the floor's own epoch is the new stream's)
         assert!(
-            node.append(1, keyed("ev", 5, 0, 1, b"new"))
+            node.append(1, keyed("ev", 2, 0, 1, b"new"))
                 .await
                 .is_success()
         );
-        assert_eq!((seqs(&node, "ev"), dropped(&node)), (vec![(5, 0)], 1));
+        assert_eq!((seqs(&node, "ev"), dropped(&node)), (vec![(2, 0)], 1));
         // a batch of the deleted writer, durable after the delete, changes no value
         node.compacted_durable(&Batch::parse(keyed("kv", 1, 1, 950, b"late")).unwrap(), 0);
         assert_eq!(node.latest("kv"), new);
@@ -4596,6 +4597,9 @@ mod props_delete {
                 .is_success()
         );
         assert_eq!((seqs(&node, "ev2"), dropped(&node)), (vec![(5, 0)], 0));
+        // and the new stream's ids are known again: its event sent twice is dropped
+        node.append(1, keyed("ev", 2, 1, 1, b"new")).await;
+        assert_eq!(dropped(&node), 1);
     }
 }
 

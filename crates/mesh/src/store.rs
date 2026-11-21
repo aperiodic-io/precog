@@ -5734,6 +5734,9 @@ mod model_delete {
         let db = s.db.share();
         drop(s);
         let s = Store::open(log.reader(), db).unwrap();
+        // (a stream whose summary already holds its floor is not loaded to learn so)
+        let in_ram = s.streams_in_ram();
+        assert!(!in_ram.contains(&"elsewhere".to_string()), "{in_ram:?}");
         assert_eq!(
             (s.floor("s"), s.tail(0, Some("s"), 1 << 20).0.len()),
             (2, 0)
