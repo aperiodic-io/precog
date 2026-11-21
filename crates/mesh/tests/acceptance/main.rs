@@ -954,12 +954,28 @@ async fn retry_refused(w: &mut Mesh, stream: String) {
     }
 }
 
+#[then(regex = r#"^a client's own delete record for stream "([\w/-]+)" is refused by every node$"#)]
+async fn forged_delete_refused(w: &mut Mesh, stream: String) {
+    // as a node writes a delete (the floors' stream), with the highest floor there is
+    let log = LogId {
+        stream: precog_mesh::store::FLOORS.into(),
+        writer: "client".into(),
+        epoch: 1,
+    };
+    let e = precog_mesh::store::encode_floor(&stream, u64::MAX);
+    let b = Batch::encode(&log, 0, &[(0, &e[..])]).unwrap();
+    for i in 0..w.n {
+        let r = w.client().append(i, &b, 1).await;
+        assert!(r.is_err(), "node {i} took a client's delete record: {r:?}");
+    }
+}
+
 #[when(
     regex = r#"^a writer that starts after the delete appends (\d+) batches of (\d+) bytes to stream "([\w/-]+)" with (\d+) copies$"#
 )]
 async fn append_after_delete(w: &mut Mesh, n: u64, size: usize, stream: String, copies: u8) {
     let i = new_writer(w, size, copies);
-    // a producer's epoch is its clock when it starts: at or above the delete's floor
+    // an epoch at the delete's floor: the lowest a writer of the new stream can have
     (w.writers[i].epoch, w.writers[i].stream) = (w.floors[&stream], stream);
     w.append(i, n).await;
 }

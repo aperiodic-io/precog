@@ -146,14 +146,18 @@ The cold tier for sealed segments (S2-PLAN C5) and the control plane with cells 
 
 - A delete is an **epoch floor** for the stream: every writer log of it with a lower epoch is
   deleted, the ones the deleting node never saw included (a list of logs and sequences, the
-  first design, cannot say that: a node that was down holds logs nobody listed). A producer's
-  epoch is its clock, so a writer that starts after the delete writes a new stream of the name.
+  first design, cannot say that: a node that was down holds logs nobody listed). The floor is
+  just above the epochs the nodes hold (no clock: an epoch is its writer's choice), so a writer
+  with an epoch at or above it writes a new stream of the name.
 - The floor is a record of the node's own `__floors` stream: it replicates and is repaired as
   any batch is, and each node applies it when it becomes durable there.
 - The model (`spec/mesh/Delete.tla`, written before the code) shows that a batch in flight at
   the delete, a node down during it and a restart all end deleted, and which rules that takes:
   drop a batch below the floor when it becomes durable, and keep the floor with the stream's
-  summary so a restart has it. Details in `docs/ARCHITECTURE.md`, "Deleting a stream".
+  summary so a restart has it. A review of the code then found what the node keeps outside
+  its log (a compacted stream's values, dedup ids), a replacement written across a delete, and a
+  record stored without being applied; each has its test and, where it is an interleaving, its
+  counterexample config. Details and limits in `docs/ARCHITECTURE.md`, "Deleting a stream".
 
 ## 5. How the work lands
 

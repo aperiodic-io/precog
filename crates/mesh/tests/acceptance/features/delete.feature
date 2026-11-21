@@ -42,3 +42,12 @@ Feature: A deleted stream is gone from every node, for good
     And a cursor reads every batch of stream "other/session-9" from every node
     When the tenant "acme" deletes stream "acme/session-1" through node 2
     Then stream "acme/session-1" holds no batch on any node
+
+  Scenario: Only a delete request deletes: a client cannot write a node's delete records
+    Given a 3-node cluster with 1 MiB segments
+    When a writer appends 10 batches of 500 bytes to stream "session-1" with 3 copies
+    Then a client's own delete record for stream "session-1" is refused by every node
+    When repair has run on every node
+    Then a cursor reads every batch of stream "session-1" from every node
+    When node 1 is killed and restarted
+    Then a cursor reads every batch of stream "session-1" from every node

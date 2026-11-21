@@ -247,7 +247,7 @@ mod model {
 
     /// Why: a deleted stream must read as empty through the SDK on a cluster, with a node down
     /// or not, while the name stays usable: what a producer created after the delete sends is
-    /// read, what one created before it sends is refused.
+    /// read, what one that wrote before it sends is refused.
     async fn delete(down: Option<usize>, before: u8, after: u8) -> Result<(), TestCaseError> {
         let dir = tempfile::tempdir().unwrap();
         let c = Cluster::new(dir.path(), down).await;
@@ -276,16 +276,18 @@ mod model {
         };
         prop_assert_eq!(all("sessions/1").await.len(), 0);
         prop_assert_eq!(all("sessions/2").await.len(), before as usize);
-        // the producer from before the delete is refused; one created now is not
+        // the producer from before the delete is refused, if the stream held anything of it
+        // (a writer no node had seen yet writes the new stream); one created now is not
         old.send(99, &[], b"late");
-        prop_assert!(old.sync().await.is_err());
+        prop_assert_eq!(old.sync().await.is_err(), before > 0);
+        prop_assert_eq!(floor > 0, before > 0);
         let mut new = client.producer("sessions/1", "w");
         for i in 0..after {
             new.send(i as u64, &[], &[i]);
         }
         new.sync().await.unwrap();
         let got = all("sessions/1").await;
-        prop_assert_eq!(got.len(), after as usize);
+        prop_assert_eq!(got.len(), after as usize + (before == 0) as usize);
         prop_assert!(got.iter().all(|e| e.epoch >= floor));
         Ok(())
     }

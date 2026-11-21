@@ -217,6 +217,13 @@ impl Batch {
         Ok(b.freeze())
     }
 
+    /// The stream a batch's bytes name, from its header alone: nothing else is validated
+    /// (`parse`). None: too short to name one.
+    pub fn stream_of(bytes: &[u8]) -> Option<&[u8]> {
+        let n = u16::from_le_bytes(bytes.get(4..6)?.try_into().ok()?) as usize;
+        bytes.get(6..6 + n)
+    }
+
     /// Parses and fully validates (checksum, structure, bounds) a batch.
     pub fn parse(bytes: Bytes) -> Result<Batch> {
         ensure!(bytes.len() <= MAX_BATCH_BYTES, "batch too large");

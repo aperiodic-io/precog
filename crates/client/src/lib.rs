@@ -201,8 +201,9 @@ impl Client {
     }
 
     /// Deletes the stream: every writer log of it there is, on every node, for good. Returns
-    /// the epoch it is deleted below. A producer created after this (its epoch is the clock)
-    /// writes a new stream of the name; one created before is refused.
+    /// the epoch it is deleted below (0: there was nothing of it to delete). A producer created
+    /// after this (its epoch is the clock, above any before it) writes a new stream of the
+    /// name; one created before is refused.
     pub async fn delete(&self, stream: &str) -> Result<u64> {
         let c = Control::Delete {
             stream: stream.into(),
