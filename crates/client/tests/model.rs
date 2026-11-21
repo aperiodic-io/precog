@@ -376,7 +376,7 @@ mod model {
         for _ in 0..polls {
             first.extend(a.poll(1).await.unwrap());
         }
-        a.commit().await.unwrap();
+        commit(&a).await;
         let or = Box::new(Start::End);
         let mut b = client
             .consumer("big", "h", Start::Committed { or })
