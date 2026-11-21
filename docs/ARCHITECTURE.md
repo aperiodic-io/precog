@@ -254,6 +254,7 @@ A class may have millions of streams, most of them idle on disk, so nothing walk
 | When | What is trimmed |
 |---|---|
 | Every retention pass | The streams in RAM (`Store::streams_in_ram`). A stream grows only by appends, which put it in RAM, so every stream over its bytes is among them |
+| When the node starts | The streams its replay loaded, before the start's checkpoint covers them (`Node::open`). After that checkpoint a restart replays nothing of them, so one left over its bytes would sit on disk, out of every pass's sight, until it is read or written (a counterexample of `props_cleaner`: a crash between a start and its first pass's checkpoint) |
 | Before a read is served (`Node::expire`: a cursor read, a seek, the event-time read, a fetch of one log or by batch ids, a live feed of one stream) | That stream, loaded if it was idle, to its bytes and its age limit. Nothing past a stream's age limit is served, whether a pass saw it or not. This holds for a stream named in the config too |
 | Before the node cap drops a segment (`Node::class_streams`) | The class streams with batches in that segment, which its index names. What they still retain is copied forward like a named stream's |
 
