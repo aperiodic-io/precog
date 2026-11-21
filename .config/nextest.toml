@@ -1,0 +1,6 @@
+# A test that asserts on wall-clock time runs with nothing beside it: next to the memory tests
+# (tens of seconds of CPU and disk each) its restart of 4,000 streams took 0.27 s on a CI
+# runner, against 0.06 to 0.09 s alone, and it allows 0.2 s.
+[[profile.default.overrides]]
+filter = 'test(a_restart_does_not_rebuild_dormant_streams_so_it_costs_the_same_for_more_of_them)'
+threads-required = "num-cpus"
