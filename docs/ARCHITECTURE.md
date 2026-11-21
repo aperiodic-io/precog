@@ -293,8 +293,10 @@ on two (2 of 3; frontiers outlive their batches, so a log deleted before still c
 that cannot ask that many refuses the delete.
 
 **It replicates as a record.** The delete is an event of the node's own stream `__floors`
-(`store::FLOORS`: the epoch, then the stream's name), acknowledged on a majority like a
-reader's position, replicated and repaired like any batch. Each node applies it when the record
+(`store::FLOORS`: the epoch, then the stream's name), replicated and repaired like any batch.
+The delete returns once every node the accepting node reaches has applied it (a reader asks any
+node, and one a moment behind would still serve the stream); with a node down, once a majority
+has. Each node applies it when the record
 becomes durable there (`Inner::settle`, under the lock the record is indexed under):
 
 | Rule | Where | Without it (the model's counterexample) |

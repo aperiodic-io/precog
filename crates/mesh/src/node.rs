@@ -858,15 +858,20 @@ impl Node {
         Ok(())
     }
 
+    /// The nodes that take a copy of what this node appends: itself and its targets.
+    fn copies(&self) -> u8 {
+        (1 + self.targets().len()) as u8
+    }
+
     /// The copies the node's own records (reader positions, deletes) are acknowledged at.
     fn majority(&self) -> u8 {
-        (1 + self.targets().len()).min(2) as u8
+        self.copies().min(2)
     }
 
     /// Deletes the stream: every writer log of it with an epoch below the one returned, on
     /// every node, for good (spec/mesh/Delete.tla). The delete is a record of the floors'
-    /// stream, durable on a majority before this returns; each node applies it when it becomes
-    /// durable there (`Store`: it forgets what it holds of those logs and takes nothing of
+    /// stream, durable on a majority, and on every node this one reaches, before this returns;
+    /// each node applies it when it becomes durable there (`Store`: it forgets what it holds of those logs and takes nothing of
     /// them again), repair included, so a node that was down is brought along and cannot hand
     /// the stream back.
     ///
@@ -905,9 +910,15 @@ impl Node {
         let seq = self.floor_seq.fetch_add(1, Ordering::Relaxed);
         let event = encode_floor(stream, epoch);
         let b = Batch::encode(&self.floor_log, seq, &[(0, &event)])?;
-        let ack = self.append(self.majority(), b).await;
-        anyhow::ensure!(ack.is_success(), "delete not acknowledged: {ack:?}");
-        // here at once (the ack may be two peers' while this node's copy is still being written)
+        // every node it can reach has applied the delete when this returns (a reader asks any
+        // node, and one a moment behind would still serve the stream); with a node down, a
+        // majority holds it and repair brings that node along
+        let ack = self.append(self.copies(), b).await;
+        anyhow::ensure!(
+            ack.copies >= self.majority(),
+            "delete not acknowledged: {ack:?}"
+        );
+        // here at once (the copies may be the peers' while this node's is still being written)
         self.store.set_floor(stream, epoch);
         Ok(epoch)
     }
@@ -3661,8 +3672,10 @@ mod props_delete {
         ] {
             let dir = d.path().join(format!("n{}", peers.len()));
             let mut c = NodeConfig::single(0, "a", dir, "tok".into());
+            let all = 1 + peers.len() as u8;
             (c.peers, c.segment_size) = (peers, 1 << 20);
-            assert_eq!(Node::open(c).await.unwrap().majority(), want);
+            let node = Node::open(c).await.unwrap();
+            assert_eq!((node.copies(), node.majority()), (all, want));
         }
     }
 

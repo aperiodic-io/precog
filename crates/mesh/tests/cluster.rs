@@ -1317,6 +1317,30 @@ mod props_delete {
         }
     }
 
+    /// Why: a reader asks any node, and the SDK's asks them all before it calls a stream read
+    /// to its end. A delete acknowledged while one reachable node had not applied it yet would
+    /// leave the stream readable there for a moment: with every node up, a delete returns
+    /// only once every node has it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn with_every_node_up_a_delete_returns_once_every_node_has_applied_it() {
+        let c = cluster(3, &["a", "b", "c"]);
+        let nodes = [start(&c, 0).await, start(&c, 1).await, start(&c, 2).await];
+        let mc = client(&c).await;
+        for round in 0..20u64 {
+            let stream = format!("s{round}");
+            let r = mc.append(0, &batch(&stream, 5, 0), 3).await.unwrap();
+            assert!(r.ack.is_success());
+            let floor = deleted(&mc, (round % 3) as usize, &stream).await;
+            for (i, n) in nodes.iter().enumerate() {
+                assert_eq!(
+                    (n.store.floor(&stream), held(n, &stream)),
+                    (floor, 0),
+                    "node {i}"
+                );
+            }
+        }
+    }
+
     /// Why: a delete's floor must be above every acknowledged batch's writer log, so the node
     /// asks enough nodes that one of them holds any batch acknowledged on two. Alone, it
     /// cannot know, and must refuse rather than delete less than was asked.
