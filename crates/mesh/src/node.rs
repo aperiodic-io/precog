@@ -755,6 +755,17 @@ impl Node {
             }));
         }
         let cfg_id = cfg.id;
+        // a class's streams the replay loaded, trimmed before this start's checkpoint covers
+        // them: a later start replays nothing of them, and a pass trims only the class's
+        // streams in RAM, so one over its retention would stay so on disk until read or written
+        if classes {
+            let now = crate::store::now_ms();
+            for name in store.streams_in_ram() {
+                if let Some((_, s)) = cfg.stream(&name) {
+                    store.trim_stream(&name, s.retention_bytes, s.retention_ms, now);
+                }
+            }
+        }
         // this boot, on disk before any peer follows it
         let incarnation = rand::random::<u64>().max(1);
         store.boot(incarnation, wal.reader.next_lsn());
