@@ -239,6 +239,40 @@ volume is about what streams retain beyond the newest segments per cap's worth w
 RAM: the copies of a pass stay in RAM as the active segment's batches do, until absorbed; the
 old records' LSNs are held until their segment is dropped (the same pass).
 
+## Stream classes: retention for streams no config names
+
+A stream per agent session cannot be named in a node's config. A `streams` key ending in `*` is a
+**class**: it configures every stream whose name starts with what is before the `*`
+(`"acme/*": {"retention_ms": 2592000000}` is every stream named `acme/...`). One function decides
+(`NodeConfig::stream`): a stream's own entry, else the class with the longest prefix it starts
+with, else none. No class covers a stream named `__...` (the node's own, such as reader
+positions). A class cannot be `compacted` (a compacted stream's newest values are kept in RAM
+per configured name): the node refuses to open.
+
+A class may have millions of streams, most of them idle on disk, so nothing walks them:
+
+| When | What is trimmed |
+|---|---|
+| Every retention pass | The streams in RAM (`Store::streams_in_ram`). A stream grows only by appends, which put it in RAM, so every stream over its bytes is among them |
+| Before a read is served (`Node::expire`: a cursor read, a seek, the event-time read, a repair fetch of one log, a live feed of one stream) | That stream, loaded if it was idle. Nothing past a stream's age limit is served, whether a pass saw it or not. This holds for a stream named in the config too |
+| Before the node cap drops a segment (`Node::class_streams`) | The class streams with batches in that segment, which its index names. What they still retain is copied forward like a named stream's |
+
+A trim with nothing to forget reads no index (`Store::trim_stream`: the stream's bytes and the
+oldest each absorbed segment may hold of it are in RAM), so a read pays for expiry only when
+something expired.
+
+Limits. A live feed of every stream is in log order and does not load idle streams: it can serve a
+batch past its class's age limit until that stream is next read or its segment is dropped. When
+streams retain more than the node cap, the cap wins as before, cutting the stream furthest over
+its share; that loop asks every stream being cut for its bytes each round, so it is quadratic in
+their number. `precog_retention_forced_total` counts a class's cuts under the class's key, one
+series however many streams it has.
+
+Tests: `node::props_classes` (the lookup against the rule; every read of an idle stream past its
+age limit; a pass that loads no idle stream; the metric), `node::props_cleaner` rerun with the
+streams' retention from classes, `store::tests::a_trim_with_nothing_to_forget_reads_no_index`,
+and `features/storage.feature` (3 nodes, a class stream through the node cap).
+
 ## Guarantees (and what is traded away)
 
 What the mesh provides:

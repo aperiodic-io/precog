@@ -1486,10 +1486,27 @@ impl Store {
     ) -> usize {
         let mut g = self.inner.lock();
         self.wake(&mut g, stream, false);
+        // nothing to forget: not over its bytes, and even the oldest it may hold is young
+        // enough. Known without reading an index, so a read can ask before it is served.
+        let due = g.streams.get(stream).is_some_and(|s| {
+            let oldest = (s.cold.values().filter(|c| c.batches > 0).map(|c| c.min.0))
+                .chain(s.order.values().copied())
+                .min();
+            max_bytes.is_some_and(|m| s.bytes > m)
+                || max_age_ms.is_some_and(|a| oldest.is_some_and(|t| now_ms.saturating_sub(t) > a))
+        });
+        if !due {
+            return 0;
+        }
         g.trim_while(&self.reader, stream, |bytes, x| {
             max_bytes.is_some_and(|m| bytes > m)
                 || max_age_ms.is_some_and(|a| now_ms.saturating_sub(x.time) > a)
         })
+    }
+
+    /// The names of the streams in RAM.
+    pub fn streams_in_ram(&self) -> Vec<String> {
+        self.inner.lock().streams.keys().cloned().collect()
     }
 
     /// After a rebuild from the log (an older node's data directory, `<data_dir>/floors`):
@@ -4334,6 +4351,46 @@ mod tests {
         };
         assert!(t.s.get(&id("a", 1)).is_none(), "a/1 (1020) went second");
         assert!(t.s.get(&id("b", 0)).is_some(), "b/0 (1030) stays");
+    }
+
+    #[test]
+    fn a_trim_with_nothing_to_forget_reads_no_index() {
+        // Why: a read of a stream with a retention asks for a trim before it is served
+        // (`Node::expire`), so a trim with nothing to forget must cost no index read. That the
+        // stream is within its bytes and its oldest batch young enough is known from RAM: its
+        // bytes, and the oldest each absorbed segment may still hold of it.
+        let mut t = store_with(4096 + 1100);
+        for i in 0..12u64 {
+            let evs: Vec<(u64, &[u8])> = (0..3).map(|j| (3 * i + j, &[5u8; 40][..])).collect();
+            let x = Batch::parse(Batch::encode(&w("s", "w"), 3 * i, &evs).unwrap()).unwrap();
+            t.s.reserve(&x);
+            t.durable_at(&x, 1_000 + 10 * i);
+        }
+        t.s.absorb();
+        assert_eq!(t.log.reader().sealed(), [(0, 4), (4, 8)], "two absorbed");
+        let reads = |t: &T| t.s.inner.lock().reads.get();
+        let (bytes, r0) = (t.s.stream_bytes("s"), reads(&t));
+        // exactly its bytes, and its oldest (logged at 1000) exactly its age limit old
+        assert_eq!(t.s.trim_stream("s", Some(bytes), Some(500), 1_500), 0);
+        assert_eq!(t.s.trim_stream("s", Some(bytes), None, 9_999), 0);
+        assert_eq!(t.s.trim_stream("s", None, Some(500), 1_500), 0);
+        assert_eq!(reads(&t), r0, "nothing to forget: no index read");
+        // a millisecond later the first segment's four are too old: its part is then empty
+        assert_eq!(t.s.trim_stream("s", None, Some(500), 1_531), 4);
+        let r1 = reads(&t);
+        assert!(r1 > r0, "forgetting absorbed batches reads their index");
+        // the oldest left was logged at 1040: an emptied segment's bound no longer counts
+        assert_eq!(t.s.trim_stream("s", None, Some(500), 1_540), 0);
+        assert_eq!(reads(&t), r1);
+        assert_eq!(t.s.trim_stream("s", None, Some(500), 1_541), 1);
+        // a byte over: the oldest goes
+        let bytes = t.s.stream_bytes("s");
+        assert_eq!(t.s.trim_stream("s", Some(bytes - 1), None, 0), 1);
+        // a stream the node does not have
+        assert_eq!(t.s.trim_stream("none", Some(0), Some(0), 9_999), 0);
+        let mut ram = t.s.streams_in_ram();
+        ram.sort();
+        assert_eq!(ram, ["s"]);
     }
 
     /// A store with one sealed segment of four three-event batches of s/w (seq 0, 3, 6, 9,

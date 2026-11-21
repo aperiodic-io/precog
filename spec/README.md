@@ -24,6 +24,7 @@ property or model test runs (below).
 | The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
 | The WAL's write-caching gate: callers write under the log's lock, a roll or retention diverts them to the WAL thread | TLA+ / TLC | Its bugs are interleavings of worker threads and the WAL thread over two locks and a queue | `spec/wal/WalGate.tla` |
 | The segment cleaner: each stream's own retention under the node cap, through slow batches and restarts | proptest | After every pass: the log within the cap, every log the newest suffix of what was written to it (no hole, once, byte for byte), a stream within its own retention (and within one batch of it unless the cap cut it) | `node::props_cleaner` |
+| Stream classes: which config a stream has; the cleaner's properties with the streams' retention from classes; reads of idle streams past their age limit | proptest | The lookup against the rule spelled out (own entry, else the longest class prefix); the cleaner's invariants do not depend on how a stream got its retention | `node::props_classes`, `node::props_cleaner` (`classes`) |
 | The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
@@ -545,6 +546,10 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   (`a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`) and
   `props_majority` in `crates/mesh/tests/cluster.rs`. A model of copy, replacement and crash
   interleavings is the next extension of `SegmentLog.tla`.
+- **Stream classes in TLA+.** A class changes which streams a node trims and copies forward,
+  on one node, by a pure function of the stream's name: no message, crash or interleaving is
+  new. The cleaner it feeds is checked at the code (above), and the age limit at a read is one
+  call before the read under the store's lock.
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.

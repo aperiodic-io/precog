@@ -190,6 +190,6 @@ The cold tier for sealed segments (S2-PLAN C5) and the control plane with cells 
 | ID | Pull request | State |
 |---|---|---|
 | Plan | this document | open |
-| A1 | stream classes | in progress |
+| A1 | `feat(mesh): stream classes` | open |
 | A2 | scoped tokens | next |
 | A3 | stream delete | next |

@@ -220,7 +220,7 @@ fn patch(path: &Path, offset: u64, bytes: &[u8]) {
 // ---------------------------------------------------------------------------
 
 #[given(
-    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "(\w+)" retains (\d+) MiB)?(, where idle streams leave RAM)?$"#
+    regex = r#"^a (\d+)-node cluster with (\d+) MiB segments(?: and (\d+) MiB retention)?(?:, where stream "([\w/*-]+)" retains (\d+) MiB)?(, where idle streams leave RAM)?$"#
 )]
 async fn cluster(
     w: &mut Mesh,
@@ -325,7 +325,7 @@ fn new_writer(w: &mut Mesh, size: usize, copies: u8) -> usize {
 }
 
 #[when(
-    regex = r#"^a writer appends (\d+) batches of (\d+) bytes(?: to stream "(\w+)")? with (\d+) cop(?:y|ies)$"#
+    regex = r#"^a writer appends (\d+) batches of (\d+) bytes(?: to stream "([\w/*-]+)")? with (\d+) cop(?:y|ies)$"#
 )]
 async fn append(w: &mut Mesh, n: u64, size: usize, stream: String, copies: u8) {
     let i = new_writer(w, size, copies);
@@ -701,7 +701,7 @@ async fn main() {
         .await;
 }
 
-#[then(regex = r#"^a cursor reads every batch of stream "(\w+)" from every node$"#)]
+#[then(regex = r#"^a cursor reads every batch of stream "([\w/*-]+)" from every node$"#)]
 async fn cursor_reads_all(w: &mut Mesh, stream: String) {
     let ws = w.writers.iter().find(|x| x.stream == stream).unwrap();
     for i in 0..w.n {
@@ -737,7 +737,7 @@ async fn cursor_reads_all(w: &mut Mesh, stream: String) {
     }
 }
 
-#[then(regex = r#"^the oldest batch of stream "(\w+)" is gone from every node$"#)]
+#[then(regex = r#"^the oldest batch of stream "([\w/*-]+)" is gone from every node$"#)]
 async fn oldest_gone_everywhere(w: &mut Mesh, stream: String) {
     let ws = w.writers.iter().find(|x| x.stream == stream).unwrap();
     for i in 0..w.n {

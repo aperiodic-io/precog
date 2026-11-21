@@ -35,6 +35,14 @@ Feature: A node's log keeps every acknowledged batch through crashes, damage and
     Then the oldest batch of stream "high" is gone from every node
     And a cursor reads every batch of stream "low" from every node
 
+  Scenario: A session stream keeps its class's retention on every node while the node cap turns over
+    Given a 3-node cluster with 1 MiB segments and 4 MiB retention, where stream "acme/*" retains 2 MiB
+    When a writer appends 300 batches of 2000 bytes to stream "acme/session-1" with 3 copies
+    And a writer appends 8000 batches of 2000 bytes to stream "other/session-2" with 2 copies
+    And retention has run on every node
+    Then the oldest batch of stream "other/session-2" is gone from every node
+    And a cursor reads every batch of stream "acme/session-1" from every node
+
   Scenario: A torn final write is truncated and the node carries on
     Given a 1-node cluster with 4 MiB segments
     When a writer appends 200 batches of 2000 bytes with 1 copy
