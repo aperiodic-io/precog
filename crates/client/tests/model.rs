@@ -335,8 +335,6 @@ mod model {
         let client = Client::connect(&c.addrs, "tok").unwrap();
         let mut p = client.producer("big", "w");
         p.set_chunked(true);
-        // (as sent or compressed: the chunks are the same events either way)
-        p.set_compression(down.is_some());
         for (i, &n) in sizes.iter().enumerate() {
             p.send(i as u64, format!("id{i}").as_bytes(), &large_payload(i, n));
         }
@@ -400,6 +398,7 @@ mod model {
         plain.sync().await.unwrap();
         let mut chunked = client.producer("mixed", "chunked");
         chunked.set_chunked(true);
+        chunked.set_compression(false); // (as sent: the chunks are the same events either way)
         chunked.put(1, b"key", b"a value");
         chunked.send(2, &[], b"an event");
         chunked.sync().await.unwrap();
