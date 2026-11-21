@@ -4171,7 +4171,7 @@ mod props_delete {
         // for writers that start after it and other streams are untouched.
         let d = tempfile::tempdir().unwrap();
         let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
-        c.segment_size = 1 << 20;
+        (c.segment_size, c.peer_token) = (1 << 20, Some("peers".into()));
         c.tokens = vec![TokenConfig {
             token: "acme".into(),
             prefixes: vec!["acme/".into()],
