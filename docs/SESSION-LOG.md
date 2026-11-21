@@ -79,7 +79,7 @@ against real node processes for what it promises.
 | A6 | **Bounded metrics and positions.** Reader lag per class in place of per stream for a class's streams (streams the config names keep their own series); counters per token (bytes and requests in and out, refusals: the basis for metering), per class (trims) and for deletes; names escaped in labels; a reader position expires after its class's age limit | `/metrics` has the same number of series at 10 streams and at 1M; positions older than their stream's age limit are gone after a pass (`features/metrics.feature`) | Property tests: the series set against the rule spelled out, position expiry against a reference through restarts |
 | A5 | **Fair shares of the log.** A byte rate limit per token at the accepting node: an append over it waits, and is refused past a bound. The neighbour probe moves into the repo first (part of P1), since this row is measured by it | The neighbour test's small writer stays within 3x its p99 alone (measured: within 1.5x, results, "Neighbours, with a rate"); a token over its rate is delayed, not its neighbours (`features/limits.feature`) | Property tests of the limiter (what is admitted keeps to the rate over every stretch; a writer at its rate never waits). The neighbour test is reproducible from `bench/session/neighbours.sh` and not a perf-gate case: a p99 on a shared runner is not steady enough for a 15% gate |
 | A7 | **TLS.** rustls on the client and peer transports (`tls://` addresses), certificates from files, read again when they change | A cluster over TLS replicates, repairs and restarts (`features/tls.feature`; the whole suite is not run twice); a plain client is refused; a certificate replaced on disk is served to new connections without a restart, and a broken one leaves the old one serving | Acceptance scenarios for each (the handshake is the library's); a property test of address parsing |
-| A4 | **Events above a batch.** The SDK splits one event over several batches and its reader puts it back together; the batch cap stays (decision below) | A 64 MiB event round-trips through kills and retries; a reader resuming inside it restarts at its first chunk; a reader without the feature sees the chunks as events | Property test of the chunk codec (round trip, damage refused) and of the reader against a reference |
+| A4 | **Events above a batch.** The SDK splits one event over several batches and its reader puts it back together; the batch cap stays (decision below) | A 64 MiB event round-trips through a node's restart (`features/large.feature`); a reader resuming inside an event restarts at its first chunk; a reader without the feature sees the chunks as events | Property tests of the chunk codec and the reader (round trip at any chunk size, any start, any chunks missing); the SDK's cluster model |
 
 A4's decision: chunk in the SDK, do not raise the cap. An 8,000 KiB batch already takes 41 ms to
 acknowledge alone and holds the node's one group commit while it is written (results, "Event
@@ -247,4 +247,14 @@ deployment bounded by one 3-node cluster's disks.
 | A1 | [#33](https://github.com/aperiodic-io/precog/pull/33) `feat(mesh): stream classes` | open |
 | A2 | [#34](https://github.com/aperiodic-io/precog/pull/34) `feat(mesh): scoped tokens` | open |
 | A3 | [#35](https://github.com/aperiodic-io/precog/pull/35) `feat(mesh): stream delete` | open |
-| A6, A5, A7, A4 | in that order | next |
+| A6 | [#39](https://github.com/aperiodic-io/precog/pull/39) `feat(mesh): metrics and reader positions that do not grow with the sessions` | open |
+| A5 | [#40](https://github.com/aperiodic-io/precog/pull/40) `feat(mesh): an append rate per token` | open |
+| A7 | [#41](https://github.com/aperiodic-io/precog/pull/41) `feat(mesh): TLS on the client and peer transports` | open |
+| A4 | [#42](https://github.com/aperiodic-io/precog/pull/42) `feat(client): events larger than a batch` | open |
+
+Phase 1 is these eight pull requests, stacked in this order. Seen on the way and not explained:
+on a saturated machine, with megabyte batches sent uncompressed to a test cluster whose peers
+time out after 300 ms and whose repair is off, an append that held a duplicate event stayed
+`Unknown` on one copy for its whole 30 s deadline (#42 has what was seen). A suspicion, not a
+finding: the batch was retried on a second node before the first node's copy arrived and stored
+there with a different dedup outcome. It needs its own reproduction.

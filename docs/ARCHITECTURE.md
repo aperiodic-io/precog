@@ -566,6 +566,49 @@ cannot hold are refused at the open) and `features/tls.feature` (real node proce
 replication, repair and a restart over TLS, a plain client refused, a certificate replaced
 under a running cluster).
 
+## Events larger than a batch
+
+A batch is at most 8 MiB (`MAX_BATCH_BYTES` in `proto.rs`), and one that size holds the node's
+group commit for tens of milliseconds while it is written. The broker's cap stays; the SDK cuts
+large events instead (`crates/client`, `Producer::set_chunked`, `Consumer::set_chunked`).
+
+- **On the wire and on disk, a large event is several events** of its writer log, in sequence,
+  each at most 512 KiB (`CHUNK_BYTES`) with a one-byte tag in front: whole, first, middle or
+  last chunk. The broker stores, replicates, repairs and trims them as any events. A chunked
+  producer sends what it has buffered as batches of about 1 MiB, up to 8 in flight.
+- **A chunked consumer yields an event only whole**, with its first chunk's sequence and time.
+  Chunks whose first it did not see are passed over (it started inside the event, or retention
+  cut it), and an event with a chunk missing is dropped (a producer that died between two
+  chunks never ends its event). It never joins the head of one event to the tail of another:
+  chunks of one event have consecutive sequence numbers.
+- **Its position is at an event's start.** `cursor` and `commit` give no later than the first
+  chunk of an event not yet yielded, so a consumer that resumes reads that event from its
+  start, and none twice.
+- **Dedup.** The event's dedup id goes on its first chunk only; the others have none, so the
+  broker does not take them for copies of the first. An event sent twice loses its second first
+  chunk at the broker, and the consumer passes over the rest.
+- **Bounds.** A consumer holds one event per writer log in memory while it is being put
+  together, at most 256 MiB (`MAX_EVENT_BYTES`); a larger one is passed over and reported as an
+  error by the next `poll`, as is an event without a tag (the stream is not chunked).
+
+Limits.
+- **Opt-in, per stream, at both ends.** A consumer that is not chunked sees the tagged chunks
+  as events; a chunked consumer on a stream that is not refuses its events. Nothing on the
+  broker says which streams are chunked.
+- **An event is not atomic on the broker**: its chunks are acknowledged batch by batch, and a
+  reader sees it only when its last chunk is durable. Retention by bytes counts chunks.
+- **Not for compacted streams** (a `put` is tagged and never cut: the newest value of a key
+  is one event), and not in the Go client.
+- The bytes of a 64 MiB event are in the producer's memory twice while it is sent (the
+  caller's and the buffered chunks), and once in the consumer's.
+
+Tests: `precog-client`'s `props` (any events round-trip in chunks of any size; a reader from
+anywhere yields whole events and resumes at an event's start; whatever chunks are missing, it
+yields only events that were sent; the bound), `model` (a 3-node cluster with a node down or
+not: events of up to 3.5 MiB whole, once and in order, a duplicate dropped, a reader that
+commits and resumes, a reader that is not chunked) and `features/large.feature` (real node
+processes: a 64 MiB event through a node's restart).
+
 ## Guarantees (and what is traded away)
 
 What the mesh provides:

@@ -51,6 +51,8 @@ pub struct Mesh {
     addrs: Vec<Addr>,
     token: String,
     old_cert: Vec<u8>,
+    /// The sizes of the large events a scenario sent.
+    large: Vec<usize>,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -1369,4 +1371,107 @@ async fn new_cert_served(w: &mut Mesh) {
     for i in 0..w.n {
         assert_eq!(served_cert(w, i).await, new, "node {i}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Events larger than a batch, through the SDK (features/large.feature)
+
+/// The bytes of the `i`th large event of a scenario.
+fn large_event(i: usize, n: usize) -> Vec<u8> {
+    (0..n).map(|j| (i * 31 + j / 4093) as u8).collect()
+}
+
+fn sdk(w: &Mesh) -> precog_client::Client {
+    let nodes: Vec<String> = w.addrs.iter().map(|a| a.to_string()).collect();
+    precog_client::Client::connect(&nodes, &w.token).unwrap()
+}
+
+#[when(
+    regex = r#"^the SDK sends events of ([\d, ]+) KiB to stream "([\w/-]+)" as a chunked producer$"#
+)]
+async fn sdk_sends(w: &mut Mesh, sizes: String, stream: String) {
+    w.large = (sizes.split(", ").map(|s| s.parse::<usize>().unwrap() << 10)).collect();
+    let mut p = sdk(w).producer(&stream, "sdk-writer");
+    // (as sent: a megabyte a batch on the wire and on disk, so a reader's poll ends mid-stream)
+    p.set_compression(false);
+    p.set_chunked(true);
+    for (i, &n) in w.large.iter().enumerate() {
+        p.send(
+            i as u64,
+            format!("event-{i}").as_bytes(),
+            &large_event(i, n),
+        );
+    }
+    p.sync().await.unwrap();
+}
+
+/// Every event a chunked reader gets from `cursor` on, and where it then stands.
+async fn sdk_read(
+    w: &Mesh,
+    stream: &str,
+    cursor: precog_client::Cursor,
+    polls: Option<usize>,
+) -> (Vec<Vec<u8>>, precog_client::Cursor) {
+    let mut c = sdk(w).consumer_at(stream, cursor);
+    c.set_chunked(true);
+    let mut out = vec![];
+    for _ in 0..polls.unwrap_or(usize::MAX) {
+        let evs = c.poll(1 << 20).await.unwrap();
+        if evs.is_empty() && polls.is_none() {
+            break;
+        }
+        out.extend(evs.into_iter().map(|e| e.payload.to_vec()));
+    }
+    (out, c.cursor().clone())
+}
+
+#[then(
+    regex = r#"^a chunked SDK reader reads those events from stream "([\w/-]+)", byte for byte$"#
+)]
+async fn sdk_reads_all(w: &mut Mesh, stream: String) {
+    let (got, _) = sdk_read(w, &stream, Default::default(), None).await;
+    assert_eq!(got.len(), w.large.len());
+    for (i, e) in got.iter().enumerate() {
+        assert!(
+            *e == large_event(i, w.large[i]),
+            "event {i}: {} bytes",
+            e.len()
+        );
+    }
+}
+
+#[then(
+    regex = r#"^a chunked SDK reader that stops after its first poll and resumes from its position reads every event of stream "([\w/-]+)" once$"#
+)]
+async fn sdk_resumes(w: &mut Mesh, stream: String) {
+    // the first poll ends with the first event; by then the reader holds the next one's first
+    // chunk (they share a batch), and its position is that event's start
+    let (some, at) = sdk_read(w, &stream, Default::default(), Some(1)).await;
+    assert_eq!(some.len(), 1, "the first event, and no other yet");
+    let (rest, _) = sdk_read(w, &stream, at, None).await;
+    let got = [some, rest].concat();
+    assert_eq!(got.len(), w.large.len());
+    for (i, e) in got.iter().enumerate() {
+        assert!(
+            *e == large_event(i, w.large[i]),
+            "event {i}: {} bytes",
+            e.len()
+        );
+    }
+}
+
+#[then(
+    regex = r#"^a reader that is not chunked sees more than (\d+) events in stream "([\w/-]+)"$"#
+)]
+async fn raw_reader(w: &mut Mesh, n: usize, stream: String) {
+    let mut c = sdk(w).consumer_at(&stream, Default::default());
+    let mut seen = 0;
+    loop {
+        let evs = c.poll(4 << 20).await.unwrap();
+        if evs.is_empty() {
+            break;
+        }
+        seen += evs.len();
+    }
+    assert!(seen > n, "{seen}");
 }

@@ -33,6 +33,7 @@ property or model test runs (below).
 | Metrics and positions that do not grow with the sessions: which series a scrape has, and when a reader's position expires | proptest, model-based | The series against the rule spelled out (per class, per named stream, per token); positions against a reference of commit times and age limits, through restarts | `node::props_metrics` |
 | A token's append rate: what is admitted, what waits, what is refused | proptest | For any appends at any times, what is admitted carries no more over any stretch than the rate allows plus one burst; a refusal charges nothing; a writer at its rate never waits | `node::model_limiter` |
 | TLS: which addresses parse and how they are dialed; who a node serves; a certificate replaced on disk | proptest, examples | An address keeps its scheme, host and port and nothing else parses (property); 3 nodes over TLS, a plain client, another CA and another name refused, half a pair not served (examples: the handshake itself is rustls's) | `transport::props`, `props_tls` in `tests/cluster.rs` |
+| Events larger than a batch: the SDK's chunk codec and the reader's reassembly | proptest, model-based | Any events round-trip in chunks of any size; a reader from any position yields exactly the events that begin at or after it and resumes at an event's start; whatever chunks are missing it yields only events that were sent, in order; on a cluster against the events sent | `precog-client`: `props`, `model` |
 | The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
@@ -627,6 +628,10 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   rustls's and are not verified here; what is ours is which side uses TLS, with which roots and
   name, and when a certificate is loaded again, and those are tested by example, not modelled:
   the reload is one lock around a pair and two file times.
+- **Chunked events in TLA+ or Kani.** A chunk's tag is one byte and the reassembly is a state
+  machine over one writer log's events in sequence order, which the broker already delivers;
+  its properties are checked for every input shape by the property tests. No new message, no
+  new interleaving.
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.
