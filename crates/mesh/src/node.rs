@@ -818,9 +818,14 @@ impl Node {
                 .trim_stream(name, s.retention_bytes, s.retention_ms, now);
         }
         // a class's streams: those in RAM (a stream grows only by appends, which put it there);
-        // an idle one is trimmed when a read loads it (`expire`) and when the cleaner meets it
-        for name in self.store.streams_in_ram() {
-            self.expire(&name, now);
+        // an idle one is trimmed when a read loads it (`expire`) and when the cleaner meets it.
+        // (The streams the config names were trimmed above; with no class there is no other.)
+        if self.classes {
+            for name in self.store.streams_in_ram() {
+                if !self.cfg.streams.contains_key(&name) {
+                    self.expire(&name, now);
+                }
+            }
         }
         self.retain_segments(now).await?;
         // what changed goes to disk; then unused streams leave RAM
@@ -926,9 +931,13 @@ impl Node {
                 .chain(of_classes.iter().map(|s| s.as_str()))
                 .collect();
             let own: Vec<&str> = own.into_iter().collect();
-            for (stream, v) in self.store.retained(&[s.base], &own, min_time) {
-                cost += v.iter().map(|k| k.cost).sum::<u64>();
-                keep.entry(stream).or_default().extend(v);
+            // a few hundred streams at a time: `retained` reads their index runs under the
+            // store's lock, and a segment may hold a class's streams by the hundred thousand
+            for some in own.chunks(256) {
+                for (stream, v) in self.store.retained(&[s.base], some, min_time) {
+                    cost += v.iter().map(|k| k.cost).sum::<u64>();
+                    keep.entry(stream).or_default().extend(v);
+                }
             }
             left -= s.bytes;
             n += 1;
@@ -966,6 +975,10 @@ impl Node {
     /// `budget` bytes, cuts the oldest batches of the stream furthest over its share of the cap.
     /// Every stream with a retention of its own has an equal share, so that is the one
     /// retaining the most bytes; cut it down to the next one, then both, and so on. Counts them.
+    /// ponytail: each round asks every stream still kept for its bytes and cuts one down to the
+    /// next, so it is quadratic in the streams being cut. Fine for the handful a config names;
+    /// with a class's streams by the thousand, size the cap above what they retain (a
+    /// per-class byte quota would keep them from reaching it: docs/SESSION-LOG.md).
     fn fit(&self, keep: &mut HashMap<String, Vec<Kept>>, budget: u64) {
         let limit = self.copy_limit();
         let mut cost: u64 = keep.values().flatten().map(|k| k.cost).sum();
@@ -1437,6 +1450,11 @@ impl Node {
                 let c: Control = serde_json::from_slice(&f.body)?;
                 if let Control::Fetch { ids } = &c {
                     let mut out = BytesMut::new();
+                    let streams: HashSet<&str> =
+                        ids.iter().map(|i| i.log.stream.as_str()).collect();
+                    for stream in streams {
+                        self.expire(stream, crate::store::now_ms());
+                    }
                     for bid in ids {
                         if let Some(b) = self.store.get(bid) {
                             if out.len() + b.bytes.len() > MAX_FRAME_BYTES - 1024 {
@@ -2893,13 +2911,13 @@ mod props_classes {
         // nothing past its age limit is served, whether its retention is its own or a class's.
         let d = tempfile::tempdir().unwrap();
         let old = StreamConfig {
-            retention_ms: Some(40),
+            retention_ms: Some(1_000),
             ..Default::default()
         };
         let mut c = config(&d, &[("s/*", old.clone()), ("named", old)]);
         (c.dormant_after_ms, c.hot_streams_bytes) = (0, 0);
         let node = Node::open(c).await.unwrap();
-        let streams = ["s/1", "s/2", "s/3", "s/4", "s/5", "named", "free"];
+        let streams = ["s/1", "s/2", "s/3", "s/4", "s/5", "s/6", "named", "free"];
         for s in streams {
             write(&node, s, 0, 100).await;
         }
@@ -2913,7 +2931,25 @@ mod props_classes {
             ["filler"],
             "the others idle on disk"
         );
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // (the pass forgot nothing: what follows is the reads' doing, not the pass's)
+        assert_eq!(
+            node.store.totals().0,
+            streams.len() as u64 + 8,
+            "all retained"
+        );
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert_eq!(
+            node.store.totals().0,
+            streams.len() as u64 + 8,
+            "idle: nothing trims them"
+        );
+        let by_id = Control::Fetch {
+            ids: vec![BatchId {
+                log: log("s/6"),
+                first_seq: 0,
+            }],
+        };
+        assert_eq!(batches(&node, &by_id).await, [0u64; 0]);
         let cursor = |stream: &str| Control::ReadCursor {
             stream: stream.into(),
             cursor: vec![],

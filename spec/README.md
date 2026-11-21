@@ -24,7 +24,9 @@ property or model test runs (below).
 | The WAL: group commit, ack order, a failed fsync | proptest, model-based | Grouping and the fsync rule at the code | `wal::model` |
 | The WAL's write-caching gate: callers write under the log's lock, a roll or retention diverts them to the WAL thread | TLA+ / TLC | Its bugs are interleavings of worker threads and the WAL thread over two locks and a queue | `spec/wal/WalGate.tla` |
 | The segment cleaner: each stream's own retention under the node cap, through slow batches and restarts | proptest | After every pass: the log within the cap, every log the newest suffix of what was written to it (no hole, once, byte for byte), a stream within its own retention (and within one batch of it unless the cap cut it) | `node::props_cleaner` |
-| Stream classes: which config a stream has; the cleaner's properties with the streams' retention from classes; reads of idle streams past their age limit | proptest | The lookup against the rule spelled out (own entry, else the longest class prefix); the cleaner's invariants do not depend on how a stream got its retention | `node::props_classes`, `node::props_cleaner` (`classes`) |
+| Stream classes: which config a stream has; the cleaner's properties with the streams' retention from classes | proptest | The lookup against the rule spelled out (own entry, else the longest class prefix); the cleaner's invariants do not depend on how a stream got its retention | `node::props_classes`, `node::props_cleaner` (`classes`) |
+| A stream's own retention: what a trim forgets by age and by bytes, of batches in RAM, absorbed, out of RAM and copied forward, and that a trim with nothing to forget reads no index | proptest, model-based | A read asks for a trim before it is served: it must be exact, and free when nothing is due | `store::model_trim` |
+| The cleaner's copy against a batch forgotten meanwhile by another task (a read's trim, a delete) | TLA+ / TLC | An interleaving across the await of the copy's write | `spec/store/Cleaner.tla` |
 | The dedup window and its cap; an idle stream's index swept | proptest, model-based | Against a map of each id's last-kept second | `dedup::model` |
 | Restarts: a compacted stream's newest values, an older node's data directory rebuilt with its floors | proptest | | `node::props_restart` |
 | The whole path (SDK, mesh client, RPC, node, store, WAL) on a 3-node cluster, one node down then repairing | proptest, model-based | Reads, resumes, ends and latest values against what was acked | `crates/client/tests/model.rs` |
@@ -233,6 +235,20 @@ Not a dormancy bug, left as it is: a stream's retention floor compares (append t
 LSN) across its logs, so a batch logged in the same millisecond as a forgotten one with a lower
 sequence, or written before it and marked durable after, is hidden once absorbed (on main too);
 the twin model gives batches distinct append times and absorbs at a restart.
+
+## The cleaner's copy and a batch forgotten meanwhile: `spec/store/Cleaner.tla`
+
+`Node::copy_forward` checks a batch is retained (`Store::retains`), awaits its copy's write, then
+tells the store (`Store::moved`). One batch, its old record and its copy; another task may forget
+the batch at any step.
+
+| Config | Checks |
+|---|---|
+| `MC_cleaner` | `TaskLives` (the retention task does not die), `ServedOnce`, `ForgottenIsNotServed`, `NothingHeldUp` (the store knows what is at the copy's LSN, so `contiguous` passes it) |
+| `MC_cleaner_strict` | expects `TaskLives` to fail: `moved` requiring the batch to be retained still, as it did while only the retention task forgot batches |
+
+At the code: `store::tests::a_batch_forgotten_while_its_copy_was_being_written_is_never_served_and_holds_nothing_up`.
+Not in the model: a crash between the copy and `moved` (the failpoint tests of `node::props_cleaner`).
 
 ## Repair by following a peer's log: `spec/mesh/Inventory.tla`
 
@@ -546,10 +562,12 @@ gap is pushed in sequence. Test: `a_live_feed_that_joins_behind_a_gap_delivers_e
   (`a_crash_anywhere_between_copy_and_delete_keeps_every_retained_batch_once`) and
   `props_majority` in `crates/mesh/tests/cluster.rs`. A model of copy, replacement and crash
   interleavings is the next extension of `SegmentLog.tla`.
-- **Stream classes in TLA+.** A class changes which streams a node trims and copies forward,
-  on one node, by a pure function of the stream's name: no message, crash or interleaving is
-  new. The cleaner it feeds is checked at the code (above), and the age limit at a read is one
-  call before the read under the store's lock.
+- **Stream classes' lookup in TLA+.** Which config a stream has is a pure function of its name.
+  What classes did add is an interleaving: a read now trims its stream from the reader's task,
+  between the cleaner's check and its copy's write (`spec/store/Cleaner.tla`, below; found in
+  review, not by the first version of this record, which said no interleaving was new). The
+  reads of idle streams past their age limit are example tests in `node::props_classes`, on the
+  wall clock: the trim they call is what `store::model_trim` checks.
 - **The mesh codecs under Kani.** They are built on `bytes::Bytes` and anyhow errors; even a
   10-byte `Ack::decode` did not finish in 300 s (atomics, vtables and allocation behind them).
   Property tests above cover them instead, at much larger sizes.

@@ -198,6 +198,10 @@ struct StreamLog {
     logs: BTreeSet<u32>,
     /// Its durable batches in RAM by LSN: append time ms, for its own retention.
     order: BTreeMap<Lsn, u64>,
+    /// At most the append time of the oldest of them (`hold`, `Inner::trim_while`): whether an
+    /// age limit has anything to forget is known without walking them. A copy forward keeps
+    /// its old time at a later LSN, so the first of them is not the oldest.
+    ram_oldest: u64,
     /// Its batches per absorbed segment.
     cold: BTreeMap<Lsn, ColdStream>,
     /// Its own retention forgot every one of its batches below this: it trims oldest first.
@@ -207,6 +211,17 @@ struct StreamLog {
     used: u64,
     /// Changed since its summary was last written.
     dirty: bool,
+}
+
+impl StreamLog {
+    /// A durable batch enters RAM at `lsn`, logged at `time`.
+    fn hold(&mut self, lsn: Lsn, time: u64) {
+        self.ram_oldest = match self.order.is_empty() {
+            true => time,
+            false => self.ram_oldest.min(time),
+        };
+        self.order.insert(lsn, time);
+    }
 }
 
 /// A stream's batches still retained in one absorbed segment.
@@ -449,7 +464,7 @@ impl Inner {
         // a segment dropped since may have trimmed the log up to it
         let at_contig = first == l.contig.max(l.trimmed);
         self.order.insert(e.lsn, (ix, new.len, first));
-        self.stream_mut(ix).order.insert(e.lsn, e.meta.time_ms);
+        self.stream_mut(ix).hold(e.lsn, e.meta.time_ms);
         if at_contig {
             self.advance(r, ix);
         }
@@ -712,7 +727,7 @@ impl Inner {
             .streams
             .get_mut(&l.id.stream)
             .expect("a log joins its stream when reserved");
-        s.order.insert(lsn, time_ms);
+        s.hold(lsn, time_ms);
         s.bytes += e.len as u64;
         s.dirty = true;
         // only a batch at the log's contiguous end can move it
@@ -967,6 +982,11 @@ impl Inner {
                 .iter()
                 .map(|(&lsn, &time)| (time, self.order[&lsn].2, lsn))
                 .min();
+            // (exact from here: the bound `hold` keeps goes stale when the oldest are absorbed)
+            if let Some(oldest) = ram {
+                self.streams.get_mut(stream).unwrap().ram_oldest = oldest.0;
+            }
+            let s = &self.streams[stream];
             let mut parts: Vec<(Age, Option<Lsn>)> = s
                 .cold
                 .iter()
@@ -1008,16 +1028,26 @@ impl Inner {
             let before = n;
             let mut raised = false;
             for x in recs {
-                if bound.is_some_and(|b| (x.time, x.first, x.lsn) >= b) {
-                    if let Some(base) = base {
-                        let s = self.streams.get_mut(stream).unwrap();
-                        s.cold.get_mut(&base).unwrap().min = (x.time, x.first, x.lsn);
-                        s.dirty = true;
-                        raised = true;
+                // where it stops, at another part's turn or at a batch within the limits, is
+                // the oldest this part still holds: known from now on, so a trim with nothing
+                // to forget does not read this part's index to find that out again
+                let s = self.streams.get_mut(stream).unwrap();
+                let (turn, age) = (
+                    bound.is_some_and(|b| (x.time, x.first, x.lsn) >= b),
+                    (x.time, x.first, x.lsn),
+                );
+                if turn || !over(s.bytes, &x) {
+                    match base {
+                        Some(base) => {
+                            raised = turn && s.cold[&base].min < age;
+                            s.cold.get_mut(&base).unwrap().min = age;
+                            s.dirty = true;
+                        }
+                        None => s.ram_oldest = x.time,
                     }
-                    break;
-                }
-                if !over(self.streams[stream].bytes, &x) {
+                    if turn {
+                        break;
+                    }
                     break 'parts;
                 }
                 // forgotten oldest first: everything older is gone too
@@ -1489,11 +1519,15 @@ impl Store {
         // nothing to forget: not over its bytes, and even the oldest it may hold is young
         // enough. Known without reading an index, so a read can ask before it is served.
         let due = g.streams.get(stream).is_some_and(|s| {
-            let oldest = (s.cold.values().filter(|c| c.batches > 0).map(|c| c.min.0))
-                .chain(s.order.values().copied())
-                .min();
+            // the oldest it may hold: per absorbed segment, and of its batches in RAM
+            let oldest = || {
+                (s.cold.values().filter(|c| c.batches > 0).map(|c| c.min.0))
+                    .chain((!s.order.is_empty()).then_some(s.ram_oldest))
+                    .min()
+            };
             max_bytes.is_some_and(|m| s.bytes > m)
-                || max_age_ms.is_some_and(|a| oldest.is_some_and(|t| now_ms.saturating_sub(t) > a))
+                || max_age_ms
+                    .is_some_and(|a| oldest().is_some_and(|t| now_ms.saturating_sub(t) > a))
         });
         if !due {
             return 0;
@@ -1603,17 +1637,23 @@ impl Store {
     }
 
     /// Batches the cleaner copied forward: each (old LSN, new LSN, its record's metadata,
-    /// payload length), each of a batch it `retains`. A copy keeps the batch's identity and
-    /// bytes and takes its place; the old record is never served again.
+    /// payload length), each of a batch it saw `retains` before it wrote the copy. A copy keeps
+    /// the batch's identity and bytes and takes its place; the old record is never served
+    /// again. A batch forgotten in between has no place to take: its copy is dead.
     pub fn moved<'a>(&self, copies: impl IntoIterator<Item = (Lsn, Lsn, &'a Meta, u32)>) {
         let mut g = self.inner.lock();
         let inner = &mut *g;
         let mut new = vec![];
         for (old, lsn, m, len) in copies {
             self.wake_key(inner, &m.key);
-            let ix = inner
-                .live(old, m)
-                .expect("a copy is of a retained batch: Node::copy_forward checks, under its lock");
+            // forgotten since the cleaner checked, while it awaited the copy's write (a read's
+            // trim of its stream, from another task): the copy is in the log and is never
+            // served, and `contiguous` steps over it (spec/store/Cleaner.tla, Tolerant)
+            let Some(ix) = inner.live(old, m) else {
+                inner.dead.insert(lsn);
+                inner.superseded.insert(lsn);
+                continue;
+            };
             inner.dead.insert(old);
             let l = &mut inner.logs[ix as usize];
             let s = inner.streams.get_mut(&l.id.stream).unwrap();
@@ -1624,7 +1664,7 @@ impl Store {
                 cs.bytes -= len as u64;
                 untotal(&mut inner.segs, base, m.count as u64, len as u64);
             }
-            s.order.insert(lsn, m.time_ms);
+            s.hold(lsn, m.time_ms);
             let e = Entry {
                 lsn,
                 count: m.count,
@@ -4021,6 +4061,64 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_forgotten_while_its_copy_was_being_written_is_never_served_and_holds_nothing_up() {
+        // Why: the cleaner checks that a batch is still retained, writes its copy, and only
+        // then tells the store. A read trims its stream before it is served, from another task,
+        // while that write is awaited. The store was told of a copy of a batch it no longer
+        // held and panicked: the node's retention task died (no more passes), and the copies
+        // after it were never registered, so `contiguous` stopped there and readers saw
+        // nothing new until a restart. Such a copy is in the log and is never served.
+        let mut t = store_with(TINY);
+        for seq in 0..4 {
+            let x = on("s", "w", seq);
+            t.s.reserve(&x);
+            t.durable(&x);
+        }
+        t.s.absorb();
+        let base = t.log.segments().0[0].base;
+        let kept: Vec<Kept> =
+            t.s.retained(&[base], ALL, 0)
+                .into_values()
+                .flatten()
+                .collect();
+        assert!(kept.len() >= 2, "{kept:?}");
+        // the cleaner: each still retained, its copy written
+        let copies: Vec<(Lsn, Lsn, Meta, u32)> = (kept.iter())
+            .map(|k| {
+                let r = t.log.reader().read(k.lsn).unwrap().unwrap();
+                assert!(t.s.retains(k.lsn, &r.meta));
+                let lsn = t.log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
+                (k.lsn, lsn, r.meta, r.payload.len() as u32)
+            })
+            .collect();
+        // meanwhile a read's trim forgot all but the newest batch
+        let one = on("s", "w", 0).bytes.len() as u64;
+        assert_eq!(t.s.trim_stream("s", Some(one), None, 0), 3);
+        let before = t.s.totals();
+        t.s.moved(copies.iter().map(|c| (c.0, c.1, &c.2, c.3)));
+        assert_eq!(
+            t.s.totals(),
+            before,
+            "a copy of a forgotten batch counts for nothing"
+        );
+        let x = on("s", "w", 4);
+        t.s.reserve(&x);
+        t.durable(&x);
+        assert_eq!(t.s.live_start(None).0, t.log.next_lsn(), "contiguous");
+        let (got, _) = t.s.tail(0, Some("s"), 1 << 20);
+        let mut seqs: Vec<u64> = got.iter().map(|b| b.id.first_seq).collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            [3, 4],
+            "each once: the one still retained, and the new one"
+        );
+        for seq in 0..3 {
+            assert!(t.s.get(&on("s", "w", seq).id).is_none(), "{seq}");
+        }
+    }
+
+    #[test]
     fn a_copy_wakes_live_feeds_waiting_on_what_was_logged_after_it() {
         // Why: a batch logged after a copy is marked durable while `contiguous` still waits at
         // the copy, so its wake-up finds nothing to serve. Taking the copy in moves `contiguous`
@@ -4375,8 +4473,21 @@ mod tests {
         assert_eq!(t.s.trim_stream("s", Some(bytes), None, 9_999), 0);
         assert_eq!(t.s.trim_stream("s", None, Some(500), 1_500), 0);
         assert_eq!(reads(&t), r0, "nothing to forget: no index read");
-        // a millisecond later the first segment's four are too old: its part is then empty
-        assert_eq!(t.s.trim_stream("s", None, Some(500), 1_531), 4);
+        // two of the first segment's four are too old, two are not: where the trim stopped is
+        // known from then on, and asking again reads nothing
+        assert_eq!(t.s.trim_stream("s", None, Some(500), 1_511), 2);
+        let r = reads(&t);
+        for _ in 0..3 {
+            assert_eq!(t.s.trim_stream("s", None, Some(500), 1_511), 0);
+            assert_eq!(
+                t.s.trim_stream("s", None, Some(500), 1_520),
+                0,
+                "1020 is exactly at it"
+            );
+        }
+        assert_eq!(reads(&t), r, "nothing more to forget: no index read");
+        // then the segment's other two are too old: its part is then empty
+        assert_eq!(t.s.trim_stream("s", None, Some(500), 1_531), 2);
         let r1 = reads(&t);
         assert!(r1 > r0, "forgetting absorbed batches reads their index");
         // the oldest left was logged at 1040: an emptied segment's bound no longer counts
@@ -5122,6 +5233,194 @@ mod model {
                 prop_assert_eq!(s.totals().0 as usize, durable);
             }
         }
+    }
+}
+
+/// Model-based test of a stream's own retention (`Store::trim_stream`) against a reference: its
+/// batches oldest first, and what an age limit or a byte limit forgets of them.
+#[cfg(test)]
+mod model_trim {
+    use super::*;
+    use crate::proto::{batch_crc, encode_log_key};
+    use precog_storage::record::Meta;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        /// a batch logged this many ms after the last
+        Append(u64),
+        Absorb,
+        /// a checkpoint, then every stream that can leaves RAM
+        Doze,
+        /// forget what is older than this, at a time this long after the newest batch's
+        Age(u64, u64),
+        /// forget the oldest while the stream holds more than this many batches' bytes
+        Bytes(u64),
+        /// the cleaner copies the oldest batch of the oldest sealed segment forward; `true`:
+        /// a read's trim forgets the whole stream while the copy is being written
+        Copy(bool),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                6 => (0u64..30).prop_map(Op::Append),
+                2 => Just(Op::Absorb),
+                2 => Just(Op::Doze),
+                3 => (0u64..120, 0u64..60).prop_map(|(a, n)| Op::Age(a, n)),
+                2 => (0u64..12).prop_map(Op::Bytes),
+                3 => any::<bool>().prop_map(Op::Copy),
+            ],
+            1..40,
+        )
+    }
+
+    /// Why: a read asks for a trim before it is served, so a trim must forget exactly what the
+    /// limits say (never a batch within them, always every batch past them, wherever it is: in
+    /// RAM, in a sealed segment, out of RAM, copied forward with its old time), and must know
+    /// when nothing is due without reading an index again: asked twice, the second answer is
+    /// none and costs no index read. And a batch a trim forgets while the cleaner writes its
+    /// copy is not served from the copy, and holds no reader up.
+    fn run(ops: Vec<Op>) -> Result<(), TestCaseError> {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = precog_storage::Config::new(dir.path().join("log"));
+        (c.segment_size, c.spares) = (4096 + 400, 0);
+        let mut log = precog_storage::Log::open(c).unwrap();
+        let db = Db::open(&dir.path().join("streams.redb"), 1 << 20).unwrap();
+        let s = Store::open(log.reader(), db).unwrap();
+        let id = LogId {
+            stream: "s".into(),
+            writer: "w".into(),
+            epoch: 1,
+        };
+        // the reference: (append time, sequence) retained, oldest first
+        let mut held: std::collections::VecDeque<(u64, u64)> = Default::default();
+        let (mut time, mut seq, mut size) = (1_000u64, 0u64, 0u64);
+        let reads = |s: &Store| s.inner.lock().reads.get();
+        for op in ops {
+            let trim = match op {
+                Op::Append(dt) => {
+                    time += dt;
+                    let b =
+                        Batch::parse(Batch::encode(&id, seq, &[(seq, &[7u8; 30][..])]).unwrap())
+                            .unwrap();
+                    size = b.bytes.len() as u64;
+                    prop_assert!(matches!(s.reserve(&b), Reserve::New));
+                    let m = Meta {
+                        key: encode_log_key(&id),
+                        first_seq: seq,
+                        count: 1,
+                        tag: batch_crc(&b.bytes),
+                        time_ms: time,
+                    };
+                    let lsn = log.append(&[(m, &b.bytes[..])]).unwrap();
+                    s.mark_durable(&b, lsn);
+                    held.push_back((time, seq));
+                    seq += 1;
+                    None
+                }
+                Op::Absorb => {
+                    s.absorb();
+                    None
+                }
+                Op::Doze => {
+                    s.absorb();
+                    s.checkpoint().unwrap();
+                    s.evict(
+                        Dormancy {
+                            idle_ms: 0,
+                            budget: 0,
+                        },
+                        0,
+                    );
+                    None
+                }
+                Op::Copy(raced) => {
+                    s.absorb();
+                    let sealed = log.segments().0;
+                    let kept: Vec<Kept> = (sealed.iter().filter(|g| g.end <= s.absorbed_end()))
+                        .flat_map(|g| s.retained(&[g.base], &["s"], 0).into_values().flatten())
+                        .take(1)
+                        .collect();
+                    for k in kept {
+                        let r = log.reader().read(k.lsn).unwrap().unwrap();
+                        prop_assert!(s.retains(k.lsn, &r.meta));
+                        let lsn = log.append(&[(r.meta.clone(), &r.payload[..])]).unwrap();
+                        if raced {
+                            prop_assert_eq!(s.trim_stream("s", Some(0), None, 0), held.len());
+                            held.clear();
+                        }
+                        s.moved([(k.lsn, lsn, &r.meta, r.payload.len() as u32)]);
+                    }
+                    None
+                }
+                Op::Age(max, later) => Some((None, Some(max), time + later)),
+                Op::Bytes(n) => Some((Some(n * size), None, 0)),
+            };
+            if let Some((bytes, age, now)) = trim {
+                let mut gone = 0;
+                while let Some(&(t, _)) = held.front() {
+                    let over = bytes.is_some_and(|m| held.len() as u64 * size > m)
+                        || age.is_some_and(|a| now.saturating_sub(t) > a);
+                    if !over {
+                        break;
+                    }
+                    held.pop_front();
+                    gone += 1;
+                }
+                prop_assert_eq!(
+                    s.trim_stream("s", bytes, age, now),
+                    gone,
+                    "{:?} {:?} at {}",
+                    bytes,
+                    age,
+                    now
+                );
+                let r = reads(&s);
+                prop_assert_eq!(s.trim_stream("s", bytes, age, now), 0, "asked again");
+                prop_assert_eq!(reads(&s), r, "asked again: no index read");
+            }
+            let mut served: Vec<u64> = (s.tail(0, Some("s"), 1 << 20).0.iter())
+                .map(|b| b.id.first_seq)
+                .collect();
+            served.sort_unstable();
+            prop_assert_eq!(served, held.iter().map(|x| x.1).collect::<Vec<_>>());
+            prop_assert_eq!(s.stream_bytes("s"), held.len() as u64 * size);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(96))]
+
+        #[test]
+        fn a_trim_forgets_exactly_what_its_limits_say_and_asked_again_reads_nothing(ops in ops()) {
+            run(ops)?;
+        }
+    }
+
+    /// The paths the model reaches only now and then, each time.
+    #[test]
+    fn a_trim_races_the_cleaner_and_stops_inside_a_segment() {
+        use Op::*;
+        let filled = || (0..10).map(|_| Append(10));
+        // a batch forgotten while its copy is written, then more appended and read
+        run(filled()
+            .chain([Copy(true), Append(1), Append(1), Absorb, Bytes(1)])
+            .collect())
+        .unwrap();
+        // a copy forward, then age limits that stop inside a sealed segment, asked again
+        run(filled()
+            .chain([
+                Copy(false),
+                Age(75, 0),
+                Age(75, 0),
+                Doze,
+                Age(30, 0),
+                Bytes(2),
+            ])
+            .collect())
+        .unwrap();
     }
 }
 
