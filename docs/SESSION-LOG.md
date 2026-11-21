@@ -63,7 +63,7 @@ formal check the PR adds, in the same PR (AGENTS.md).
 |---|---|---|---|
 | A1 | **Stream classes.** A `streams` key ending in `*` configures every stream with that prefix; the longest match wins, an exact name wins over any class. Retention passes trim the class's streams in RAM, a stream is trimmed before a read serves it, and the cleaner copies forward what class streams retain | Two tenants' session streams keep exactly their class's retention on one node, through the node cap, idle streams and restarts; a pass costs nothing per idle stream | Property tests: class lookup against a reference; a store with classes against one with every stream named; the cleaner's properties rerun with classes |
 | A2 | **Scoped tokens.** Tokens in the node config, each with stream prefixes and `read`/`write`; a separate peer token; the shared token keeps working as an unscoped one | A tenant token cannot read, write, tail, commit or list another prefix, and cannot replicate; acceptance scenarios on 3 nodes | Property tests: the scope rule against the rule spelled out, every request kind's need, who a connection is; 3 nodes over TCP |
-| A3 | **Stream delete.** `Control::Delete` writes a tombstone the mesh replicates and repair follows; a node with the tombstone refuses older batches of the stream | A stream deleted while a node is down is deleted there after repair and never returns; a new stream of the same name works | TLA+: a `Delete` action in `Replication.tla` with `DeletedStaysDeleted`; model test of the store with deletes |
+| A3 | **Stream delete.** `Control::Delete` sets the stream's epoch floor, a record the mesh replicates and repair follows; a node with the floor forgets and refuses the stream's writer logs below it | A stream deleted while a node is down is deleted there after repair and never returns; a new stream of the same name works | TLA+: a `Delete` action in `Replication.tla` with `DeletedStaysDeleted`; model test of the store with deletes |
 | A4 | **Events above a batch.** A client-side chunking of one event over several batches, reassembled by the reader, or a raised cap if measurement allows it | A 64 MiB event round-trips; a reader resuming inside it restarts at its first chunk | Property test of the chunk codec and the reader |
 | A5 | **Fair shares of the log.** Per-token byte rate limits at the accepting node, and group commits that take a bounded share from one connection | The neighbour test's small writer stays within 3x its p99 alone | Model test of the limiter; the neighbour test as a perf-gate case |
 | A6 | **Bounded metrics.** Per-class and per-token series in place of per-stream ones, with the per-stream ones opt-in by exact name | `/metrics` has the same number of series at 10 streams and at 1M | Property test of the series set |
@@ -144,13 +144,16 @@ The cold tier for sealed segments (S2-PLAN C5) and the control plane with cells 
 
 ### A3 Stream delete
 
-- A delete is a record in the stream's own writer logs' place: a tombstone batch in an internal
-  stream (as reader-group positions are), carrying the stream and, per writer log, the sequence
-  below which everything is deleted. It replicates and repairs as any batch does.
-- A node applying it trims the stream to those frontiers and keeps them as each log's `trimmed`
-  floor, which already refuses re-ingest of older sequences.
-- The model must show that a batch in flight at the delete, a node down during it, and a restart
-  from a checkpoint all end deleted.
+- A delete is an **epoch floor** for the stream: every writer log of it with a lower epoch is
+  deleted, the ones the deleting node never saw included (a list of logs and sequences, the
+  first design, cannot say that: a node that was down holds logs nobody listed). A producer's
+  epoch is its clock, so a writer that starts after the delete writes a new stream of the name.
+- The floor is a record of the node's own `__floors` stream: it replicates and is repaired as
+  any batch is, and each node applies it when it becomes durable there.
+- The model (`spec/mesh/Delete.tla`, written before the code) shows that a batch in flight at
+  the delete, a node down during it and a restart all end deleted, and which rules that takes:
+  drop a batch below the floor when it becomes durable, and keep the floor with the stream's
+  summary so a restart has it. Details in `docs/ARCHITECTURE.md`, "Deleting a stream".
 
 ## 5. How the work lands
 
@@ -192,4 +195,4 @@ The cold tier for sealed segments (S2-PLAN C5) and the control plane with cells 
 | Plan | this document | open |
 | A1 | `feat(mesh): stream classes` | open |
 | A2 | `feat(mesh): scoped tokens` | open |
-| A3 | stream delete | next |
+| A3 | `feat(mesh): stream delete` | open |

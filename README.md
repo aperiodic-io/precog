@@ -30,6 +30,7 @@ Only what live-ingestion uses is built.
 | **Lag and health**: `/metrics` (`precog_group_lag_events`, `precog_group_commit_age_seconds`) and `/health` | Redpanda's metrics endpoint |
 | **Kubernetes deployment**: StatefulSet config from DNS peers, the node id from the pod's ordinal, image `ghcr.io/aperiodic-io/precog` | the Redpanda StatefulSet |
 | **Scoped tokens**: a token confined to stream prefixes, to read, write or both; a separate token for peers | ACLs by topic prefix |
+| **Stream delete** (`Client::delete`): every writer log of the stream, on every node, for good; a node that was down cannot hand it back | `rpk topic delete` |
 
 Deliberately not built: users, TLS, quotas (tokens are static config), a Kafka-compatible API,
 transactions, and membership changes beyond the 3 configured nodes.

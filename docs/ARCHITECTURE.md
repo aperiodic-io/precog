@@ -273,6 +273,68 @@ age limit; a pass that loads no idle stream; the metric), `node::props_cleaner` 
 streams' retention from classes, `store::tests::a_trim_with_nothing_to_forget_reads_no_index`,
 and `features/storage.feature` (3 nodes, a class stream through the node cap).
 
+## Deleting a stream
+
+`Control::Delete {stream}` (`Client::delete`) deletes every writer log of the stream there is, on
+every node, for good. It needs a token that may write the stream. The design was model-checked
+before it was built (`spec/mesh/Delete.tla`), and three of its rules are there because the model
+found what goes wrong without them.
+
+**A delete is an epoch floor.** A writer log is `(stream, writer, epoch)`, and a producer's epoch
+is its clock when it started. Deleting a stream sets its floor: every writer log of it with a
+lower epoch is deleted, the ones the deleting node has never seen included. A list of what to
+delete could not say that: a node that was down holds logs nobody listed. A writer that starts
+after the delete has an epoch above the floor and writes a new stream of the same name; one
+that started before is refused.
+
+**The floor** (`Node::delete_stream`, `delete_floor`) is at least the node's clock, and above
+every epoch that enough nodes hold of the stream for one of them to hold any batch acknowledged
+on two (2 of 3; frontiers outlive their batches, so a log deleted before still counts). A node
+that cannot ask that many refuses the delete.
+
+**It replicates as a record.** The delete is an event of the node's own stream `__floors`
+(`store::FLOORS`: the epoch, then the stream's name), acknowledged on a majority like a
+reader's position, replicated and repaired like any batch. Each node applies it when the record
+becomes durable there (`Inner::settle`, under the lock the record is indexed under):
+
+| Rule | Where | Without it (the model's counterexample) |
+|---|---|---|
+| Forget what the node holds of the logs below the floor: batches in RAM, in absorbed segments, of a stream out of RAM | `Inner::set_floor` | |
+| Refuse a batch below the floor when it is handed to the node: a client's retry, a replica, a repair (`Reserve::Expired`) | `Store::reserve` | the client is not told (`MC_delete_norefuse` with the next rule also off: a peer that was down hands the stream back) |
+| Drop a batch below the floor when it becomes durable: one reserved before the floor arrived | `Inner::settle` | `MC_delete_norecheck`: the batch is indexed after its log was deleted |
+| A restart settles what it replays as when it became durable; the floor is in the stream's summary with its totals, so a restart finds both or neither | `Store::open`, `StreamSum::epoch_floor` | `MC_delete_noreapply`: the log brings the batches back |
+
+Nothing below a floor is served, by rule, not by a list of what was forgotten: `Inner::run` (reads
+of absorbed segments), `Inner::live` and `Store::tail` (a stream out of RAM: from its summary)
+check the stream's floor.
+
+A deleted stream costs its summary on disk (the floor, and its logs' frontiers) and nothing in
+RAM once idle. The summary's format is version 3; a version 2 summary reads as a stream never
+deleted (`summary::OLDEST`).
+
+Limits.
+- **Bytes stay on disk until their segments are dropped** (the node cap or age limit): a delete
+  is logical, like a retention trim. Nothing of them is served or copied forward.
+- **A node away longer than its peers keep the delete's record** (the log's retention) does not
+  learn of it from repair, and goes on serving what it holds of the stream. Its peers refuse
+  what it offers. Replace such a node empty.
+- **After a disk loss**, the nodes asked may not hold an acknowledged batch's log, and the floor
+  can fall below it (`MC_delete_lostdisk_acked`), as `Client::end` can be short then. The clock
+  covers every writer that started before the delete with a clock no faster than the node's.
+- **A node whose summary of the stream does not read** (a failing disk) does not apply the
+  delete, and says so in its log: a floor written without the summary would lose the stream's
+  logs. An index that does not read leaves its batches' bytes counted until the segment is
+  dropped; nothing of them is served.
+- A writer log with the last epoch (`u64::MAX`) cannot be deleted. The node's own `__` streams
+  cannot be deleted.
+- The Go client has no `Delete` yet.
+
+Tests: `store::model_delete` (against a reference, through the floors' stream, with streams
+leaving RAM and restarts), `store::model_dormant` (deletes on the twin stores),
+`summary::props` (version 2 still reads), `node::props_delete` (the floor; one node, a restart, a
+scoped token), and `props_delete` in `tests/cluster.rs` (3 nodes over TCP: a node down during
+the delete, a node alone).
+
 ## Tenants: scoped tokens
 
 A node knows three kinds of token (`NodeConfig`):

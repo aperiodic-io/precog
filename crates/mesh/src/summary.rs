@@ -20,7 +20,11 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const CHECKPOINT: &str = "checkpoint";
 
 /// The format of a stream's summary and of the checkpoint; bumped on any change.
-pub const VERSION: u8 = 2;
+/// 3: a stream's summary has its epoch floor (`Store::set_floor`: a deleted stream).
+pub const VERSION: u8 = 3;
+/// The oldest version still read: a version 2 summary is a stream never deleted, and the
+/// checkpoint did not change.
+const OLDEST: u8 = 2;
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -42,6 +46,8 @@ pub struct LogSum {
 pub struct StreamSum {
     pub floor: Age,
     pub bytes: u64,
+    /// Its writer logs with a lower epoch are deleted (0: never deleted).
+    pub epoch_floor: u64,
     pub cold: Vec<(Lsn, ColdStream)>,
     pub logs: Vec<LogSum>,
 }
@@ -137,14 +143,14 @@ impl<'a> R<'a> {
     }
 }
 
-/// The value's body after its checksum and version are checked.
-fn open(b: &[u8]) -> Option<R<'_>> {
+/// The value's version and its body, after its checksum and version are checked.
+fn open(b: &[u8]) -> Option<(u8, R<'_>)> {
     let (body, crc) = b.split_at_checked(b.len().checked_sub(4)?)?;
     if crc32c::crc32c(body) != u32::from_le_bytes(crc.try_into().ok()?) {
         return None;
     }
     let (&v, rest) = body.split_first()?;
-    (v == VERSION).then_some(R(rest))
+    (OLDEST..=VERSION).contains(&v).then_some((v, R(rest)))
 }
 
 pub fn encode_stream(s: &StreamSum) -> Vec<u8> {
@@ -153,6 +159,7 @@ pub fn encode_stream(s: &StreamSum) -> Vec<u8> {
     w.0.push(VERSION);
     w.age(s.floor);
     w.u64(s.bytes);
+    w.u64(s.epoch_floor);
     w.u64(s.cold.len() as u64);
     for (base, c) in &s.cold {
         for x in [*base, c.end, c.batches, c.events, c.bytes, c.max_time] {
@@ -177,10 +184,11 @@ pub fn encode_stream(s: &StreamSum) -> Vec<u8> {
 }
 
 pub fn decode_stream(b: &[u8]) -> Option<StreamSum> {
-    let mut r = open(b)?;
+    let (version, mut r) = open(b)?;
     let mut s = StreamSum {
         floor: r.age()?,
         bytes: r.u64()?,
+        epoch_floor: if version == OLDEST { 0 } else { r.u64()? },
         ..Default::default()
     };
     for _ in 0..r.u64()? {
@@ -259,7 +267,7 @@ pub fn encode_checkpoint(c: &Checkpoint) -> Vec<u8> {
 }
 
 pub fn decode_checkpoint(b: &[u8]) -> Option<Checkpoint> {
-    let mut r = open(b)?;
+    let (_, mut r) = open(b)?;
     let mut c = Checkpoint {
         cold_end: r.u64()?,
         contiguous: r.u64()?,
@@ -505,12 +513,14 @@ mod props {
         (
             age(),
             any::<u64>(),
+            any::<u64>(),
             prop::collection::vec(cold, 0..4),
             prop::collection::vec(log, 0..4),
         )
-            .prop_map(|(floor, bytes, cold, logs)| StreamSum {
+            .prop_map(|(floor, bytes, epoch_floor, cold, logs)| StreamSum {
                 floor,
                 bytes,
+                epoch_floor,
                 cold,
                 logs,
             })
@@ -585,6 +595,40 @@ mod props {
             }
         }
 
+        /// Why: a node upgraded in place opens the summaries its older version wrote. A version 2
+        /// summary (no epoch floor) must read as that stream, never deleted; any other version
+        /// is refused, loudly, not read as something else.
+        #[test]
+        fn a_version_2_summary_still_reads_and_no_other_version_does(s in stream(), other: u8) {
+            let s = StreamSum { epoch_floor: 0, ..s };
+            let v3 = encode_stream(&s);
+            // as version 2 wrote it: the same, without the floor's byte after the bytes
+            let mut at = W(vec![]);
+            at.age(s.floor);
+            at.u64(s.bytes);
+            let at = 1 + at.0.len();
+            let seal = |version: u8, body: &[u8]| {
+                let mut v = [&[version][..], body].concat();
+                let c = crc32c::crc32c(&v);
+                v.extend_from_slice(&c.to_le_bytes());
+                v
+            };
+            let body = &v3[1..v3.len() - 4];
+            prop_assert_eq!(body[at - 1], 0, "the floor");
+            let old = [&body[..at - 1], &body[at..]].concat();
+            prop_assert_eq!(decode_stream(&seal(2, &old)), Some(s.clone()));
+            prop_assert_eq!(decode_stream(&seal(3, body)), Some(s));
+            // the checkpoint did not change between them
+            let c = encode_checkpoint(&Checkpoint::default());
+            let c = &c[1..c.len() - 4];
+            prop_assert_eq!(decode_checkpoint(&seal(2, c)), Some(Checkpoint::default()));
+            if other != 2 && other != 3 {
+                prop_assert_eq!(decode_stream(&seal(other, &old)), None);
+                prop_assert_eq!(decode_stream(&seal(other, body)), None);
+                prop_assert_eq!(decode_checkpoint(&seal(other, c)), None);
+            }
+        }
+
         /// Why: a node opens values another version wrote. Whatever the bytes, the decoders
         /// answer or refuse; they never panic or allocate what the bytes merely claim.
         #[test]
@@ -641,6 +685,7 @@ mod props {
         let s = StreamSum {
             floor: (t, 0, lsn),
             bytes: 64,
+            epoch_floor: 0,
             cold: vec![(
                 lsn - 1000,
                 ColdStream {
