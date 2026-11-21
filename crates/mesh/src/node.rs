@@ -4734,6 +4734,53 @@ mod props_delete {
         node.append(1, keyed("ev", 2, 1, 1, b"new")).await;
         assert_eq!(dropped(&node), 1);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_learns_of_a_delete_from_its_record_forgets_values_and_dedup_ids_too() {
+        // Why: only the node that accepts a delete runs `delete_stream`. Every other node
+        // learns of it when the delete's record becomes durable there (a replica, repair): it
+        // must forget the same things then, or it serves a deleted compacted stream's values
+        // and drops the new stream's events as duplicates, for as long as it runs.
+        let d = tempfile::tempdir().unwrap();
+        let mut c = NodeConfig::single(0, "a", d.path().into(), "tok".into());
+        c.segment_size = 1 << 20;
+        let compacted = StreamConfig {
+            compacted: true,
+            ..Default::default()
+        };
+        c.streams.insert("kv".into(), compacted);
+        let keyed = |stream: &str, epoch, seq| {
+            let log = LogId {
+                stream: stream.into(),
+                writer: "w".into(),
+                epoch,
+            };
+            Batch::encode_keyed(&log, seq, &[(seq, b"k", b"v")]).unwrap()
+        };
+        let node = Node::open(c).await.unwrap();
+        for stream in ["kv", "ev"] {
+            assert!(node.append(1, keyed(stream, 1, 0)).await.is_success());
+        }
+        assert_eq!(node.latest("kv").len(), 1);
+        // the delete's record, as a peer that accepted the delete replicates it
+        let floors = LogId {
+            stream: FLOORS.into(),
+            writer: "node-1".into(),
+            epoch: 1,
+        };
+        let events = [encode_floor("kv", 2), encode_floor("ev", 2)];
+        let events: Vec<(u64, &[u8])> = events.iter().map(|e| (0, &e[..])).collect();
+        let record = Batch::encode(&floors, 0, &events).unwrap();
+        let f = Frame::new(Kind::Replicate, 1, encode_replicate(1, &record));
+        let ack = parse_frame_ack(&node.handle(f, Ident::Peer(1)).await.unwrap()).unwrap();
+        assert!(ack.is_success(), "{ack:?}");
+        assert_eq!((node.store.floor("kv"), node.store.floor("ev")), (2, 2));
+        assert_eq!(node.latest("kv"), vec![]);
+        // the new stream's event with the old one's id is stored, not dropped
+        assert!(node.append(1, keyed("ev", 2, 0)).await.is_success());
+        let dropped = node.dedup_dropped.load(Ordering::Relaxed);
+        assert_eq!((seqs(&node, "ev"), dropped), (vec![(2, 0)], 0));
+    }
 }
 
 #[cfg(test)]
