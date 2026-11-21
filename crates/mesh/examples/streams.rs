@@ -7,7 +7,9 @@
 //!
 //! `dormant` (1): streams leave RAM at once (`dormant_after_ms` 0) and a retention pass runs
 //! every 100k streams, as the node's every 10 s; the numbers are then the dormant streams' cost.
-//! Without it the node keeps its defaults (a stream leaves RAM after 10 minutes unused).
+//! Without it the node keeps its defaults (a stream leaves RAM after 10 minutes unused, or
+//! sooner past its 256 MiB budget), and a retention pass runs every `retention_interval_ms` (10
+//! s) during the load, as `serve` runs them.
 
 use precog_mesh::node::{Node, NodeConfig};
 use precog_mesh::proto::{Batch, LogId};
@@ -73,6 +75,20 @@ async fn main() -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (mut done, mut pass) = (0, 0.0);
+    // what `serve` runs: a retention pass every interval (dormant runs its own, below)
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let passes = (!dormant).then(|| {
+        let (node, stop) = (node.clone(), stop.clone());
+        tokio::spawn(async move {
+            let every = std::time::Duration::from_millis(node.cfg.retention_interval_ms);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(every) => node.apply_retention().await.unwrap(),
+                    _ = stop.notified() => return, // between passes, never inside one
+                }
+            }
+        })
+    });
     while done < count {
         let upto = if dormant {
             (done + 100_000).min(count)
@@ -108,6 +124,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let rate = count as f64 / t.elapsed().as_secs_f64();
+    if let Some(p) = passes {
+        stop.notify_one();
+        p.await?;
+    }
     node.apply_retention().await?; // what the node's retention pass does every 10 s
     let (rss, heap, peak) = (
         rss_mib(),

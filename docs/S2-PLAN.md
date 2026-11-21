@@ -83,7 +83,7 @@ election, local-disk latency, and no dependency on an object store.
 | F9 | REST/JSON/protobuf surface; SDKs in 4 languages; CLI | Native TCP protocol; Rust and Go SDKs; CLI | ❌ POC: REST subset over Precog |
 | F10 | Access tokens (scoped, auto-prefix, expiry, revocation), 429 quotas | One shared token; peer auth only | ❌ control plane |
 | F11 | Durability on object storage; storage classes; cheap unlimited retention | Node-local disks, k of n nodes fsynced (or write caching) | ❌ POC: S3 group commit; tier not built |
-| F12 | Unlimited streams; dormant streams cost no memory | Per-log maps in RAM on every node, rebuilt at start | ❌ measured (§4.4) |
+| F12 | Unlimited streams; dormant streams cost no memory | Dormant streams on disk (#29): a summary per stream in redb, loaded on use; 10M streams in ~600 MiB of heap, restart under 1 s | 🟡 the active segment pins its streams in RAM (§3.5) |
 | F13 | Usage metering per basin/stream, metrics API, dashboard | Prometheus `/metrics` per node, per reader group lag | 🟡 |
 | F14 | Stream encryption (`aegis-256`, `aes-256-gcm`, client-held key) | none (TLS planned, M7) | ❌ |
 | F15 | Elastic, multi-cell, placement by `cop`, stream migration between channels | Static membership; every node targets 3 copies; control plane planned (M4) | ❌ M4 |
@@ -174,17 +174,38 @@ same design would sit at tens of ms, which is S2's 400 ms budget for Standard wi
 The real constraint is the PUT bill (§5): an object WAL has to aggregate across all streams on a
 node (S2's channels do exactly that), and the flush interval trades latency against dollars.
 
-### 3.5 F12: unlimited streams (measured)
+### 3.5 F12: unlimited streams (built in #29, measured)
 
-Every Precog node keeps, per writer log, a `BTreeMap` of batches, contiguous frontiers, and the
-stream's LSN order, and rebuilds them at start from index files. S2 keeps a dormant stream as
-metadata plus segments, and s2-lite keeps it as SlateDB keys. The probe creates N streams with
-one record each. At 1M streams a Precog node holds 3.8 GiB (3.9 KB per stream) and takes 8.9 s to restart,
-rebuilding every stream. s2-lite holds 2.1 GiB while they are hot, but only **44 MiB after a
-restart** (1.3 s), because it loads streams lazily. The POC gateway adds ~8.8 KB per stream in its
-streamer tasks (`results/s2.md`). Needs: per-log index on disk (the plan's risk table already names
-redb or index files), an LRU of hot logs, and repair that compares stream summaries instead of
-every log's frontier. Cost 6–10 weeks. It replaces the internal index; the API is unchanged.
+Before #29 every Precog node kept, per writer log, a `BTreeMap` of batches, contiguous frontiers and the
+stream's LSN order, and rebuilt them at start from index files: at 1M streams 3.8 GiB (3.9 KB per stream)
+and an 8.9 s restart, against s2-lite's **44 MiB after a restart** (1.3 s), which loads streams lazily
+(`results/s2.md`).
+
+**Built (#29, C7).** A stream leaves RAM after 10 minutes unused, or least recently used first past a
+256 MiB budget, once its summary is written and none of its batches is in RAM: retention floor, totals per
+absorbed segment, and per writer log its frontier and sequence range per segment (62 bytes for a stream
+of one log in one segment). Summaries live in one redb database per node (`<data_dir>/streams.redb`);
+a checkpoint there says up to where they cover the log, so a restart replays only the log past it. A use
+loads the stream back (~40 µs at 10M). Repair follows each peer's log from a cursor
+(`Control::Inventory`) instead of walking every log's frontier. TLA+ (`spec/store/Dormant.tla`,
+`spec/mesh/Inventory.tla`) and model tests cover eviction against checkpoints, repair and crashes. Store
+alternatives measured first (`results/dormant-store.md`): LMDB, fjall, RocksDB, SQLite, an append log.
+
+**Measured** (`results/s2.md`, "Dormant streams on disk"; one process, 4 vCPU):
+
+| | before #29 | after |
+|---|---:|---:|
+| 1M streams, 16 MiB segments: heap / restart | 2,185 MiB / 5.4 s | 532 MiB / 0.44 s |
+| 10M streams, 16 MiB segments: heap (peak) / restart | out of RAM (~22 GB) | 603 MiB (1.6 GB) / 0.61 s |
+| 10M streams, 256 MiB segments: heap (peak) / restart | out of RAM | 615 MiB (4.7 GB) / 0.87 s |
+| 1M streams, 256 MiB segments (nothing sealed): heap / restart | 1,469 MiB / 4.0 s | 1,685 MiB / 6.3 s |
+| Ingest (`bench/compare`, 3 nodes, write caching): records/s, CPU per record | 484k, 1.61 us | 484k, 1.66 us |
+
+**Open.** A stream's batches leave RAM when their segment seals, so the active segment pins every stream
+written since it opened: at the default 256 MiB that is over a million small streams, a 4.7 GB peak at
+10M (S5 asks 2 GiB), and with nothing sealed #29 costs heap and restart time instead of saving them. Next:
+seal (or index) the active segment when the streams it pins exceed the budget. Creating streams is 5-35%
+slower (a summary per new stream, the pass under the store's lock).
 
 ### 3.6 F10, F13: tenancy and metering
 
