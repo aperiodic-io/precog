@@ -5176,6 +5176,13 @@ mod model_limiter {
             took >= at_rate * 9 / 10,
             "{took} ms, at its rate {at_rate} ms"
         );
+        // its waits are counted, in microseconds: about what its rate made it wait, and no
+        // more than the time it all took (one append at a time: the waits do not overlap)
+        let waited = node.traffic[1].rate_wait_us.load(Ordering::Relaxed);
+        assert!(
+            waited >= at_rate * 900 && waited <= took * 1000,
+            "{waited} us waited in {took} ms"
+        );
         // all at once: some wait their turn, the rest are refused and leave nothing behind
         let held = node.store.totals().0;
         let burst = (60..260).map(|seq| append(&node, Ident::Scoped(0), batch("a/1", seq)));
@@ -5231,6 +5238,18 @@ mod model_limiter {
             let line = format!("precog_token_{none}{{token=\"b/\"}} 0");
             assert!(m.contains(&line), "no {line} in {m}");
         }
+    }
+
+    #[test]
+    fn an_append_waits_up_to_the_bound_and_is_refused_just_past_it() {
+        // Why: the bound is what a client's RPC timeout is set against: an append that would
+        // wait exactly that long still goes ahead, and one a millisecond later does not.
+        let l = Limiter::new(1_000);
+        let half = LIMIT_MAX_WAIT_NS / 1_000_000; // bytes that take the bound to pay for
+        // (at time 0 a token has saved nothing up)
+        assert_eq!(l.admit(half, 0), Some(0));
+        assert_eq!(l.admit(1, 0), Some(LIMIT_MAX_WAIT_NS));
+        assert_eq!(l.admit(1, 0), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
