@@ -6,16 +6,19 @@ stream per agent session, events of kilobytes to megabytes. Measured on main at 
 ## Setup
 
 One 4-vCPU VM, 15 GiB. Three `precog-node serve` processes on loopback from
-`precog-node init --nodes 3 --segment-mb 256`: the defaults, so one runtime thread per node and
-an fsync before every ack. Every append is acknowledged on 2 of 3 nodes. The client is the mesh
+`precog-node init --nodes 3 --segment-mb 256`: the defaults but for the segment size (1 GiB by
+default; 256 MiB so that segments seal during a run), so one runtime thread per node and an
+fsync before every ack. Every append is acknowledged on 2 of 3 nodes. The client is the mesh
 client (`MeshClient::append`), one event per batch unless noted.
 
-The probe that produced these numbers is not in the repository yet (plan item P1 puts it in
-`bench/session`).
+**Not reproducible from the repository yet.** The probe that produced these numbers is not in
+it (plan item P1 puts it in `bench/session`), so read them as one measurement, not a baseline a
+later change can be compared with.
 
 ## Event sizes
 
-One writer, one append in flight, incompressible payloads, 30 appends per size.
+One writer, one append in flight, incompressible payloads, 30 appends per size: with 30 samples
+the p99 column is the slowest append but one.
 
 | Event | ack p50 | ack p99 | MiB/s |
 |---:|---:|---:|---:|
@@ -65,9 +68,16 @@ back to the chain's first event and decoded forward in 9.3 ms (p50 of 32, max 10
 ## Caveats
 
 - **One VM.** The three nodes share one disk and 4 vCPUs with the client, so "2 of 3" is not
-  independent hardware and the large writers saturate the disk all three write to.
-- **Synthetic text** compresses worse than real prompts (zstd gets about 1.7x on it): the
-  whole-request ratios are a floor. agentwire measured 105x on public agent traces
-  (its README, "Storing logs and traces").
+  independent hardware. In the neighbour test the disk is what saturates (about 150 MB/s written
+  three times over); in the session test at 16 sessions in flight it is the 4 vCPUs the client
+  and the three nodes share, so its calls/s are this VM's, not the broker's limit.
+- **Synthetic text** compresses worse than real prompts (zstd gets about 1.7x on it), which
+  understates lz4 and zstd here. agentwire measured 105x on public agent traces (its README,
+  "Storing logs and traces").
+- **The AWD1 rows are its best case**: every request repeats the whole conversation so far byte
+  for byte, and one writer per stream sends them in order. A client that edits or truncates
+  earlier messages, or several writers interleaving in one stream, shares less. The 350 MB to
+  7.6 MB ratio is this workload's, not a promise.
 - **The neighbour test is the extreme case**: two writers at the disk's throughput.
-- **A few runs each.** The run-to-run spread on this VM is up to about 20%.
+- **A few runs each**, 30 appends per event size, 2,001 or fewer per neighbour row, 3,200 calls
+  per session row. The run-to-run spread on this VM is up to about 20%.
