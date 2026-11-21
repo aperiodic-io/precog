@@ -1420,13 +1420,11 @@ impl Store {
                     inner.logs[ix as usize].batches.insert(first, new);
                     inner.join(ix);
                     inner.index(r, e.lsn, ix, first, new, e.meta.time_ms);
-                    // as when it became durable: deleted with its log, or a floor to raise (a
-                    // delete that does not read is not passed over: the node does not start)
-                    let floors = match log.stream == FLOORS {
-                        true => Some(s.floors_at(e.lsn)?),
-                        false => None,
-                    };
-                    inner.settle(&s.db, r, &log, e.lsn, || floors);
+                    // as when it became durable: deleted with its log. (A floors' record is
+                    // applied once the replay is done, with those below the checkpoint:
+                    // `reapply_floors`; what it deletes of the batches replayed after it goes
+                    // then.)
+                    inner.settle(&s.db, r, &log, e.lsn, || None);
                 }
             }
             inner.absorb(r, end);
@@ -5622,9 +5620,11 @@ mod model_delete {
         let dir = tempfile::tempdir().unwrap();
         let (_log, s) = dormant(&dir, 12);
         let before = s.stream_bytes("s");
+        let mut indexes = vec![];
         for e in std::fs::read_dir(dir.path().join("log")).unwrap() {
             let p = e.unwrap().path();
             if p.extension().is_some_and(|x| x == "idx") {
+                indexes.push((p.clone(), std::fs::read(&p).unwrap()));
                 std::fs::File::options()
                     .write(true)
                     .open(p)
@@ -5642,6 +5642,15 @@ mod model_delete {
             assert!(s.get(&batch("s", 1, seq).id).is_none());
             assert!(matches!(s.reserve(&batch("s", 1, seq)), Reserve::Expired));
         }
+        // the indexes read again (the fault was passing): the batches the delete could not
+        // forget are still not served, by the reads that walk a segment's index off the lock
+        for (p, bytes) in indexes {
+            std::fs::write(p, bytes).unwrap();
+        }
+        assert_eq!(s.read("s", 0, 1000).0.len(), 0, "the event-time read");
+        assert_eq!(s.read_cursor("s", &Cursor::new(), 1 << 20).0.len(), 0);
+        assert_eq!(s.tail(0, Some("s"), 1 << 20).0.len(), 0);
+        assert_eq!(s.read("filler", 0, 1000).0.len(), 8, "the index reads");
     }
 
     #[test]
