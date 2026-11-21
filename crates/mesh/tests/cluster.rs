@@ -1102,97 +1102,103 @@ async fn pass(n: &Node) -> (u64, Vec<String>) {
         .expect("a repair pass ends")
 }
 
-/// Why: tenants share a cluster. A tenant's token must work on every node for its own streams
-/// (appends durable on a majority, reads, a live feed), reach nothing else, and never pass for
-/// a peer, while the nodes go on replicating among themselves with their own token.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_tenant_s_token_reaches_its_streams_on_every_node_and_only_peers_replicate() {
-    let mut c = cluster(3, &["a", "b", "c"]);
-    for cfg in &mut c.cfgs {
-        cfg.peer_token = Some("peers".into());
-        cfg.tokens = vec![precog_mesh::node::TokenConfig {
-            token: "acme".into(),
-            prefixes: vec!["acme/".into()],
-            read: true,
-            write: true,
-        }];
-    }
-    for i in 0..3 {
-        start(&c, i).await;
-    }
-    let with = |token: &str| {
-        let mc = MeshClient::new(c.addrs.clone(), token.into()).unwrap();
-        let mut mc = Arc::into_inner(mc).unwrap();
-        mc.rpc_timeout = Duration::from_millis(2000);
-        mc.append_deadline = Duration::from_secs(3);
-        Arc::new(mc)
-    };
-    let (tenant, admin) = (with("acme"), with("secret-token"));
-    let batch = |stream: &str| {
-        let log = LogId {
-            stream: stream.into(),
-            writer: "w".into(),
-            epoch: 1,
-        };
-        Batch::encode(&log, 0, &[(1, b"x")]).unwrap()
-    };
-    let cursor = |stream: &str| Control::ReadCursor {
-        stream: stream.into(),
-        cursor: vec![],
-        max_bytes: 1 << 20,
-    };
-    let read = |mc: Arc<MeshClient>, node: usize, stream: &str| {
-        let body = Bytes::from(serde_json::to_vec(&cursor(stream)).unwrap());
-        async move { mc.call(node, Kind::Control, body).await }
-    };
-    // its own stream, through any node: durable on two, so the nodes replicated it
-    for node in 0..3 {
-        let mut feed = tenant.subscribe(node, Some("acme/s"), true).await.unwrap();
-        if node == 0 {
-            let r = tenant.append(node, &batch("acme/s"), 2).await.unwrap();
-            assert!(r.ack.copies >= 2, "{:?}", r.ack);
-            admin.control(0, &Control::Repair).await.unwrap();
-            admin.control(1, &Control::Repair).await.unwrap();
-            admin.control(2, &Control::Repair).await.unwrap();
+/// Scoped tokens on a cluster (a property-test module by name: the formal-coverage gate counts
+/// what it runs, the connection's identity reaching a live feed among it).
+mod props_tokens {
+    use super::*;
+
+    /// Why: tenants share a cluster. A tenant's token must work on every node for its own streams
+    /// (appends durable on a majority, reads, a live feed), reach nothing else, and never pass for
+    /// a peer, while the nodes go on replicating among themselves with their own token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tenant_s_token_reaches_its_streams_on_every_node_and_only_peers_replicate() {
+        let mut c = cluster(3, &["a", "b", "c"]);
+        for cfg in &mut c.cfgs {
+            cfg.peer_token = Some("peers".into());
+            cfg.tokens = vec![precog_mesh::node::TokenConfig {
+                token: "acme".into(),
+                prefixes: vec!["acme/".into()],
+                read: true,
+                write: true,
+            }];
         }
-        let got = read(tenant.clone(), node, "acme/s").await.unwrap();
-        assert_eq!(got.kind, Kind::Batches);
-        assert!(!got.body.is_empty(), "node {node}");
-        let pushed = tokio::time::timeout(Duration::from_secs(2), feed.next()).await;
-        assert_eq!(pushed.unwrap().unwrap().unwrap().id.log.stream, "acme/s");
-    }
-    // another's stream: refused at once, not retried until the deadline, and not stored
-    let t = std::time::Instant::now();
-    assert!(tenant.append(0, &batch("other/s"), 2).await.is_err());
-    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-    assert!(
-        admin.append(0, &batch("other/s"), 2).await.is_ok(),
-        "new to the node"
-    );
-    assert!(read(tenant.clone(), 0, "other/s").await.is_err());
-    assert!(tenant.subscribe(0, Some("other/s"), true).await.is_err());
-    assert!(tenant.subscribe(0, None, true).await.is_err());
-    assert!(tenant.control(0, &Control::Status).await.is_err());
-    assert!(status(&admin, 0).await.batches >= 2);
-    // no client token makes a peer, and no token at all gets in
-    let t = Duration::from_secs(2);
-    for (token, node_id, ok) in [
-        ("peers", Some(1), true),
-        ("acme", Some(1), false),
-        ("secret-token", Some(1), false),
-        ("peers", None, false),
-        ("nobody", None, false),
-    ] {
-        let conn = precog_mesh::transport::connect(&c.addrs[0], t)
-            .await
-            .unwrap();
-        let hello = Hello {
-            token: token.into(),
-            node_id,
+        for i in 0..3 {
+            start(&c, i).await;
+        }
+        let with = |token: &str| {
+            let mc = MeshClient::new(c.addrs.clone(), token.into()).unwrap();
+            let mut mc = Arc::into_inner(mc).unwrap();
+            mc.rpc_timeout = Duration::from_millis(2000);
+            mc.append_deadline = Duration::from_secs(3);
+            Arc::new(mc)
         };
-        let r = conn
-            .call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
-            .await;
-        assert_eq!(r.is_ok(), ok, "{token} as {node_id:?}");
+        let (tenant, admin) = (with("acme"), with("secret-token"));
+        let batch = |stream: &str| {
+            let log = LogId {
+                stream: stream.into(),
+                writer: "w".into(),
+                epoch: 1,
+            };
+            Batch::encode(&log, 0, &[(1, b"x")]).unwrap()
+        };
+        let cursor = |stream: &str| Control::ReadCursor {
+            stream: stream.into(),
+            cursor: vec![],
+            max_bytes: 1 << 20,
+        };
+        let read = |mc: Arc<MeshClient>, node: usize, stream: &str| {
+            let body = Bytes::from(serde_json::to_vec(&cursor(stream)).unwrap());
+            async move { mc.call(node, Kind::Control, body).await }
+        };
+        // its own stream, through any node: durable on two, so the nodes replicated it
+        for node in 0..3 {
+            let mut feed = tenant.subscribe(node, Some("acme/s"), true).await.unwrap();
+            if node == 0 {
+                let r = tenant.append(node, &batch("acme/s"), 2).await.unwrap();
+                assert!(r.ack.copies >= 2, "{:?}", r.ack);
+                admin.control(0, &Control::Repair).await.unwrap();
+                admin.control(1, &Control::Repair).await.unwrap();
+                admin.control(2, &Control::Repair).await.unwrap();
+            }
+            let got = read(tenant.clone(), node, "acme/s").await.unwrap();
+            assert_eq!(got.kind, Kind::Batches);
+            assert!(!got.body.is_empty(), "node {node}");
+            let pushed = tokio::time::timeout(Duration::from_secs(2), feed.next()).await;
+            assert_eq!(pushed.unwrap().unwrap().unwrap().id.log.stream, "acme/s");
+        }
+        // another's stream: refused at once, not retried until the deadline, and not stored
+        let t = std::time::Instant::now();
+        assert!(tenant.append(0, &batch("other/s"), 2).await.is_err());
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        assert!(
+            admin.append(0, &batch("other/s"), 2).await.is_ok(),
+            "new to the node"
+        );
+        assert!(read(tenant.clone(), 0, "other/s").await.is_err());
+        assert!(tenant.subscribe(0, Some("other/s"), true).await.is_err());
+        assert!(tenant.subscribe(0, None, true).await.is_err());
+        assert!(tenant.control(0, &Control::Status).await.is_err());
+        assert!(status(&admin, 0).await.batches >= 2);
+        // no client token makes a peer, and no token at all gets in
+        let t = Duration::from_secs(2);
+        for (token, node_id, ok) in [
+            ("peers", Some(1), true),
+            ("acme", Some(1), false),
+            ("secret-token", Some(1), false),
+            ("peers", None, false),
+            ("nobody", None, false),
+        ] {
+            let conn = precog_mesh::transport::connect(&c.addrs[0], t)
+                .await
+                .unwrap();
+            let hello = Hello {
+                token: token.into(),
+                node_id,
+            };
+            let r = conn
+                .call(Kind::Hello, serde_json::to_vec(&hello).unwrap().into(), t)
+                .await;
+            assert_eq!(r.is_ok(), ok, "{token} as {node_id:?}");
+        }
     }
 }
